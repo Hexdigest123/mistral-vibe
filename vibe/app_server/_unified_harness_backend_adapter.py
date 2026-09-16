@@ -55,6 +55,7 @@ from mistralai_vibe_local_harness.vibe import (
     MCPAuthorizationSnapshot as HarnessMCPAuthorizationSnapshot,
     MCPHTTPTransportPolicy as HarnessMCPHTTPTransportPolicy,
     MCPRouteSnapshot as HarnessMCPRouteSnapshot,
+    MCPToolFilter,
     RequestSentTelemetry,
     ResolvedConnector as HarnessResolvedConnector,
     ResolvedConnectorCatalog as HarnessResolvedConnectorCatalog,
@@ -1885,7 +1886,10 @@ class UnifiedHarnessBackendHostAdapter:
         mcp_authorization_adapter.update_plugin_server_names(context.mcp_catalog)
         context = replace(context, mcp_authorization_adapter=mcp_authorization_adapter)
         self._host.configure_mcp(
-            _harness_mcp_catalog(context.mcp_catalog),
+            _harness_mcp_catalog(
+                context.mcp_catalog,
+                _mcp_tool_filter(context.config_orchestrator.config),
+            ),
             mcp_authorization_adapter,
             cache_root=context.mcp_cache_root,
             http_transport_policy=HarnessMCPHTTPTransportPolicy(
@@ -1947,7 +1951,9 @@ class _UnifiedHarnessMCPAdapter:
         )
         snapshot = await _harness_call(
             self._session.reconfigure_mcp(
-                _harness_mcp_catalog(configuration),
+                _harness_mcp_catalog(
+                    configuration, _mcp_tool_filter(self.mcp_config_orchestrator.config)
+                ),
                 force_remote_discovery=force_remote_discovery,
             )
         )
@@ -5935,7 +5941,19 @@ def _turn_queue_event_envelope(
     )
 
 
-def _harness_mcp_catalog(catalog: ResolvedMCPCatalog) -> HarnessResolvedMCPCatalog:
+def _mcp_tool_filter(config: VibeConfigSchema) -> MCPToolFilter | None:
+    # The same global globs the connector catalogue reads; empty lists leave
+    # every route published, so no filter rides the catalog at all.
+    enabled = tuple(config.enabled_tools)
+    disabled = tuple(config.disabled_tools)
+    if not enabled and not disabled:
+        return None
+    return MCPToolFilter(enabled_globs=enabled, disabled_globs=disabled)
+
+
+def _harness_mcp_catalog(
+    catalog: ResolvedMCPCatalog, tool_filter: MCPToolFilter | None
+) -> HarnessResolvedMCPCatalog:
     return HarnessResolvedMCPCatalog(
         revision=catalog.revision,
         servers=tuple(
@@ -5962,6 +5980,7 @@ def _harness_mcp_catalog(catalog: ResolvedMCPCatalog) -> HarnessResolvedMCPCatal
             )
             for server in catalog.servers
         ),
+        tool_filter=tool_filter,
     )
 
 

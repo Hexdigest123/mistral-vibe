@@ -529,6 +529,112 @@ async def test_a_builtin_with_no_tool_behind_it_is_left_to_the_mode(
     assert outcome.decision == "ask"
 
 
+@pytest.mark.asyncio
+async def test_a_provided_tool_asks_by_default(tmp_path: Path) -> None:
+    """*Prepare*: A resolver over the ordinary catalogue, nothing configured for
+    an MCP tool.
+    *Do*: Resolve a provided-tool route name.
+    *Assert*: It asks. The default permission is the whole verdict for a tool
+    with no call-scoped rules, and answering "allow" off the default would run
+    a call nothing vouched for.
+    """
+    # Prepare
+    resolver, _ = _resolver(tmp_path)
+
+    # Do
+    outcome = await resolver.resolve("mcp_linear.get_issue", {"id": "VIBE-1"})
+
+    # Assert
+    assert outcome.decision == "ask"
+    assert outcome.required_permissions == ()
+
+
+@pytest.mark.asyncio
+async def test_an_always_configured_provided_tool_runs(tmp_path: Path) -> None:
+    """*Prepare*: A resolver with an MCP tool configured ``always``.
+    *Do*: Resolve its route name.
+    *Assert*: It allows -- the same permission a configured builtin answers.
+    """
+    # Prepare
+    resolver, _ = _resolver(
+        tmp_path, **{"mcp_linear.get_issue": {"permission": "always"}}
+    )
+
+    # Do
+    outcome = await resolver.resolve("mcp_linear.get_issue", {"id": "VIBE-1"})
+
+    # Assert
+    assert outcome.decision == "allow"
+
+
+@pytest.mark.asyncio
+async def test_a_never_configured_provided_tool_is_denied_not_asked(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A resolver with an MCP tool configured ``never``.
+    *Do*: Resolve its route name.
+    *Assert*: It denies with the phrasing legacy's ``_should_execute_tool`` uses,
+    rather than putting a permanently disabled tool in front of the user.
+    """
+    # Prepare
+    resolver, _ = _resolver(
+        tmp_path, **{"mcp_github.create_pr": {"permission": "never"}}
+    )
+
+    # Do
+    outcome = await resolver.resolve("mcp_github.create_pr", {})
+
+    # Assert
+    assert outcome.decision == "deny"
+    assert outcome.reason == "Tool 'mcp_github.create_pr' is permanently disabled"
+
+
+@pytest.mark.asyncio
+async def test_a_session_grant_covers_the_provided_tool_it_was_given_for(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A resolver over the ordinary catalogue.
+    *Do*: Resolve a provided tool, grant the approval, resolve again -- and
+    resolve a sibling route.
+    *Assert*: The granted tool runs for the rest of the session and the sibling
+    still asks: an approval names one tool, not its whole server.
+    """
+    # Prepare
+    resolver, _ = _resolver(tmp_path)
+
+    # Do
+    ask = await resolver.resolve("mcp_linear.get_issue", {"id": "VIBE-1"})
+    assert ask.decision == "ask"
+    await resolver.grant("mcp_linear.get_issue", (), permanent=False)
+
+    # Assert
+    assert (
+        await resolver.resolve("mcp_linear.get_issue", {"id": "VIBE-2"})
+    ).decision == ("allow")
+    assert (await resolver.resolve("mcp_linear.create_issue", {})).decision == "ask"
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_provided_grant_writes_the_tool_permission(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A resolver over the ordinary catalogue.
+    *Do*: Grant a provided tool permanently.
+    *Assert*: The permission is persisted under the tool's route name, so the
+    next session resolves it without asking again.
+    """
+    # Prepare
+    resolver, orchestrator = _resolver(tmp_path)
+
+    # Do
+    await resolver.grant("mcp_linear.get_issue", (), permanent=True)
+
+    # Assert
+    assert orchestrator.config.tools["mcp_linear.get_issue"]["permission"] == (
+        ToolPermission.ALWAYS.value
+    )
+
+
 def test_scope_names_survive_the_round_trip() -> None:
     """*Prepare*: Nothing; this pins the wire form the resolver publishes.
     *Do*: Read the scope value the callback carries.

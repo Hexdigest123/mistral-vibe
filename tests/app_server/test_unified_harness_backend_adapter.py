@@ -720,6 +720,39 @@ def test_unified_mcp_projection_update_preserves_connector_sources() -> None:
     assert projected.connector_error == "bootstrap warning"
 
 
+def test_mcp_catalog_carries_the_global_tool_globs() -> None:
+    """*Prepare*: A config with global enabled/disabled tool globs.
+    *Do*: Resolve them for the harness MCP catalog.
+    *Assert*: The filter rides the catalog and matches published route names,
+    so a route the connector catalogue would drop is dropped here too. An
+    unconstrained config sends no filter, leaving every route published.
+    """
+    pytest.importorskip("mistralai_vibe_local_harness.vibe")
+    from vibe.app_server._unified_harness_backend_adapter import (
+        _harness_mcp_catalog,
+        _mcp_tool_filter,
+    )
+
+    enabled = _mcp_tool_filter(build_test_vibe_config(enabled_tools=["mcp_linear.*"]))
+    assert enabled is not None
+    assert enabled.allows("mcp_linear.get_issue")
+    assert not enabled.allows("mcp_github.create_pr")
+
+    denied = _mcp_tool_filter(
+        build_test_vibe_config(disabled_tools=["mcp_github.create_*"])
+    )
+    assert denied is not None
+    assert denied.allows("mcp_github.get_issue")
+    assert not denied.allows("mcp_github.create_pr")
+
+    catalog = _harness_mcp_catalog(
+        ResolvedMCPCatalog(revision="test", servers=()), enabled
+    )
+    assert catalog.tool_filter is enabled
+
+    assert _mcp_tool_filter(build_test_vibe_config()) is None
+
+
 @pytest.mark.asyncio
 async def test_legacy_session_start_records_the_legacy_harness(
     caplog: pytest.LogCaptureFixture,
@@ -1435,8 +1468,8 @@ async def test_unified_stale_turn_errors_match_legacy_protocol_codes(
 
 
 @pytest.mark.parametrize(
-    ("auto_approve", "edit_mode", "shell_mode"),
-    [(False, "ask", "ask"), (True, "allow", "allow")],
+    ("auto_approve", "edit_mode", "shell_mode", "provided_mode"),
+    [(False, "ask", "ask", "ask"), (True, "allow", "allow", "allow")],
 )
 @pytest.mark.asyncio
 async def test_unified_runtime_config_gates_editing_tools(
@@ -1445,6 +1478,7 @@ async def test_unified_runtime_config_gates_editing_tools(
     auto_approve: bool,
     edit_mode: str,
     shell_mode: str,
+    provided_mode: str,
 ) -> None:
     """The default agent is ``accept-edits``, and only the bypass lifts a mode.
 
@@ -1489,8 +1523,9 @@ async def test_unified_runtime_config_gates_editing_tools(
         runtime_module._command_environment_mode()
     )
     assert derivation.runtime.bypass_tool_permissions is auto_approve
-    # Provided/MCP tools keep their pre-smart-approve behaviour outside classify mode.
-    assert derivation.adapter_config.provided_tool_mode == "allow"
+    # Provided/MCP tools follow the same gate: the resolver reads their own
+    # configured permission per call, so only the bypass runs them unconditionally.
+    assert derivation.adapter_config.provided_tool_mode == provided_mode
 
 
 @pytest.mark.asyncio
@@ -1669,7 +1704,7 @@ async def test_mid_turn_switch_into_smart_approve_gates_provided_tools(
         [AddOperationPatch(path="/smart_approve_available", value=True)], reason="test"
     )
     derivation = context.derive(UnifiedSessionSettings())
-    assert derivation.adapter_config.provided_tool_mode == "allow"
+    assert derivation.adapter_config.provided_tool_mode == "ask"
 
     session = _RecordingSession()
     adapter = UnifiedHarnessBackendAdapter(cast(Any, session), context, derivation)

@@ -164,6 +164,10 @@ class UnifiedPermissionResolver:
         shell could read the command at all, the command itself becomes the
         scope, so that grant stays narrow too.
         """
+        if builtin not in RUST_BUILTIN_TOOL_SOURCES:
+            # A provided/MCP tool, named by its full group.tool route: the same
+            # identity an approval callback reports back for the grant.
+            return self._resolve_provided_tool(builtin)
         names = self.vibe_tool_names(builtin)
         if not names:
             # The mode already denies a builtin with no catalogue entry; leaving
@@ -228,6 +232,25 @@ class UnifiedPermissionResolver:
                 authorized_path=authorized_path,
             )
         return PermissionOutcome(decision="allow", authorized_path=authorized_path)
+
+    def _resolve_provided_tool(self, name: str) -> PermissionOutcome:
+        """One provided/MCP tool call, off the tool's own configured permission.
+
+        A provided tool has no call-scoped rules, so its permission is the
+        whole verdict -- exactly what ``_should_execute_tool`` reads for one.
+        The ask this returns grants the tool itself, and ``grant`` records the
+        grant against the same name.
+        """
+        permission = self._tools.get_tool_config(name).permission
+        match permission:
+            case ToolPermission.ALWAYS:
+                return PermissionOutcome(decision="allow")
+            case ToolPermission.NEVER:
+                return PermissionOutcome(
+                    decision="deny", reason=f"Tool '{name}' is permanently disabled"
+                )
+            case _:
+                return PermissionOutcome(decision="ask")
 
     def _fallback_permission(
         self, builtin: str, arguments: Mapping[str, Any]
@@ -321,6 +344,22 @@ class UnifiedPermissionResolver:
         permanent: bool,
     ) -> None:
         """Record what the user approved, scoped the way legacy scopes it."""
+        if builtin not in RUST_BUILTIN_TOOL_SOURCES:
+            name = cast(str, builtin)
+            if required_permissions:
+                for rp in required_permissions:
+                    self._store.add_rule(
+                        ApprovedRule(
+                            tool_name=name,
+                            scope=rp.scope,
+                            session_pattern=rp.session_pattern,
+                        )
+                    )
+            else:
+                self._store.set_tool_permission(name, ToolPermission.ALWAYS)
+            if permanent:
+                await self._persist(name, required_permissions)
+            return
         if not required_permissions and builtin in _FALLBACK_SCOPES:
             # A builtin that can always scope a call it can read has no honest
             # tool-wide grant. What still arrives here with nothing attached is a

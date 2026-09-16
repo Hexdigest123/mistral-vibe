@@ -2189,10 +2189,18 @@ def _rust_provided_tool_mode(
 ) -> Literal["allow", "ask", "deny", "classify"]:
     """Mode gating provided/MCP tools, which have no per-name entry in tool_modes.
 
-    Smart approve classifies them per call; every other gate leaves them at their
-    pre-smart-approve behaviour of running unconditionally (``allow``).
+    The permission resolver answers them per call off the tool's own configured
+    permission, so under PROMPT they ask rather than run unconditionally; only
+    BYPASS retires the resolver. Smart approve classifies their ``ask`` residue
+    per call, layered on that same resolver.
     """
-    return "classify" if gate is ToolGate.CLASSIFIER else "allow"
+    match gate:
+        case ToolGate.PROMPT:
+            return "ask"
+        case ToolGate.CLASSIFIER:
+            return "classify"
+        case ToolGate.BYPASS:
+            return "allow"
 
 
 def rust_agent_tool_ceiling(
