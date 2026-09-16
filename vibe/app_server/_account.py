@@ -167,14 +167,6 @@ class _Plan:
             self.kind is AccountPlanKind.MISTRAL_CODE and self.normalized_name == "F"
         )
 
-    @property
-    def teleport_eligible(self) -> bool:
-        return (
-            self.kind is AccountPlanKind.CHAT
-            and self.normalized_name in _PAID_CHAT_PLANS
-            and not self.prompt_switching_to_pro_plan
-        )
-
 
 class AccountHost(Protocol):
     """What ``AccountController`` needs of its session. ``AgentLoop`` satisfies
@@ -246,9 +238,7 @@ class AccountController:
                 # stamp NO_PLAN_DATA (distinct from the null "tried but failed"
                 # case) and show no account UI.
                 self._agent_loop.set_user_plan(NO_PLAN_DATA)
-                return None, AccountView(
-                    status=AccountStatus.UNAVAILABLE, teleport_action=upgrade
-                )
+                return None, AccountView(status=AccountStatus.UNAVAILABLE)
             # A Mistral provider is configured but its key is missing. Do NOT
             # clobber a user_plan the experiments path may have set; null
             # already signals the failure. Surface MISSING_KEY only when the
@@ -258,8 +248,7 @@ class AccountController:
                     AccountStatus.MISSING_KEY
                     if self._agent_loop.config.is_active_model_mistral()
                     else AccountStatus.UNAVAILABLE
-                ),
-                teleport_action=upgrade,
+                )
             )
 
         # Do NOT reset user_plan to None before the fetch. The experiments
@@ -280,22 +269,19 @@ class AccountController:
             # Suppress the account UI entirely for a non-Mistral active model;
             # otherwise surface the usual upgrade prompts.
             return None, (
-                AccountView(status=AccountStatus.UNAVAILABLE, teleport_action=upgrade)
+                AccountView(status=AccountStatus.UNAVAILABLE)
                 if not self._agent_loop.config.is_active_model_mistral()
                 else AccountView(
                     status=AccountStatus.UNAUTHORIZED,
                     plan_offer=upgrade,
                     rate_limit_action=upgrade,
-                    teleport_action=upgrade,
                 )
             )
         except AccountGatewayUnavailable as exc:
             logger.warning(
                 "Failed to fetch account status (%s)", type(exc).__name__, exc_info=exc
             )
-            return None, AccountView(
-                status=AccountStatus.UNAVAILABLE, teleport_action=upgrade
-            )
+            return None, AccountView(status=AccountStatus.UNAVAILABLE)
 
         # Warm the cross-session cache, and reconcile telemetry's plan fields
         # with this live result so user_plan and experiment_attributes never
@@ -312,9 +298,7 @@ class AccountController:
             # Telemetry captured the real plan above; suppress the account UI
             # for a non-Mistral active model. Tenant-domain reconciliation still
             # targets the Mistral provider that supplied this account response.
-            return tenant_update, AccountView(
-                status=AccountStatus.UNAVAILABLE, teleport_action=upgrade
-            )
+            return tenant_update, AccountView(status=AccountStatus.UNAVAILABLE)
 
         switch_key = _account_action(AccountActionKind.SWITCH_API_KEY, vibe_base_url)
         plan_offer: AccountAction | None = None
@@ -323,19 +307,11 @@ class AccountController:
         elif plan.offers_upgrade:
             plan_offer = upgrade
 
-        teleport_action: AccountAction | None = None
-        if not plan.teleport_eligible:
-            teleport_action = (
-                switch_key if plan.prompt_switching_to_pro_plan else upgrade
-            )
-
         return tenant_update, AccountView(
             status=AccountStatus.READY,
             plan=AccountPlanView(kind=plan.kind, name=plan.name, title=plan.title),
             plan_offer=plan_offer,
             rate_limit_action=(upgrade if plan.rate_limit_upgrade_available else None),
-            teleport_eligible=plan.teleport_eligible,
-            teleport_action=teleport_action,
         )
 
 

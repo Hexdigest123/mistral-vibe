@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import aclosing, suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from vibe.app_server._execution import (
@@ -15,7 +16,6 @@ from vibe.app_server._execution import (
 )
 from vibe.app_server._model import ProtocolModel
 from vibe.app_server.models import (
-    AccountActionKind,
     AccountView,
     PublicError,
     RemoteProjectLink,
@@ -36,7 +36,9 @@ from vibe.app_server.models import (
     VibeCodeRepository,
 )
 from vibe.app_server.protocol import TeleportEventParams, TeleportStartParams
-from vibe.core.agent_loop import AgentLoop, TeleportError
+from vibe.core.agent_loop import TeleportError
+from vibe.core.config import VibeConfigSchema
+from vibe.core.telemetry.send import TelemetryClient
 from vibe.core.telemetry.types import (
     ProjectPickerTelemetryPayload,
     ProjectSelectionSource,
@@ -52,8 +54,9 @@ from vibe.core.teleport.types import (
     TeleportPushResponseEvent,
     TeleportStartingWorkflowEvent,
     TeleportSummarizingContextEvent,
+    TeleportYieldEvent,
 )
-from vibe.core.types import Role
+from vibe.core.types import LLMMessage, Role
 from vibe.core.vibe_code_project import (
     ProjectPickerContext,
     VibeCodeProject as CoreVibeCodeProject,
@@ -73,6 +76,32 @@ if TYPE_CHECKING:
 
 type Notify = Callable[[str, ProtocolModel], Awaitable[None]]
 type ReadAccount = Callable[[], Awaitable[AccountView]]
+
+
+class VibeCodeHost(Protocol):
+    """The Vibe Code surface one session offers, on either harness.
+
+    ``AgentLoop`` satisfies this as it stands on the legacy backend; the Unified
+    backend reaches the same controller through a small shim instead of a
+    second copy of the teleport ladder.
+    """
+
+    @property
+    def config(self) -> VibeConfigSchema: ...
+    @property
+    def cwd(self) -> Path: ...
+    @property
+    def telemetry_client(self) -> TelemetryClient: ...
+    @property
+    def messages(self) -> Sequence[LLMMessage]: ...
+
+    def teleport_to_vibe_code(
+        self,
+        prompt: str | None,
+        *,
+        project_id: str | None = None,
+        project_picker: ProjectPickerTelemetryPayload | None = None,
+    ) -> AsyncGenerator[TeleportYieldEvent, TeleportPushResponseEvent | None]: ...
 
 
 class VibeCodeError(RuntimeError):
@@ -96,7 +125,7 @@ class ReservedTeleport:
 class VibeCodeController:
     def __init__(
         self,
-        agent_loop: AgentLoop,
+        agent_loop: VibeCodeHost,
         notify: Notify,
         execution: SessionExecution,
         read_account: ReadAccount,
@@ -416,11 +445,6 @@ class VibeCodeController:
                 "to a Mistral model, then try again."
             )
 
-        account = await self._read_account()
-        if not account.teleport_eligible:
-            self._fail_early(stage="ineligible", error_class="TeleportIneligibleError")
-            raise VibeCodeAccessError(self._teleport_access_message(account))
-
         has_history = any(
             message.role is not Role.system for message in self._agent_loop.messages
         )
@@ -428,23 +452,6 @@ class VibeCodeController:
             return
         self._fail_early(stage="no_history", error_class="TeleportNoHistoryError")
         raise VibeCodeError("No conversation history to teleport.")
-
-    def _teleport_access_message(self, account: AccountView) -> str:
-        action = account.teleport_action
-        url = (
-            action.url
-            if action is not None
-            else f"{self._agent_loop.config.vibe_base_url.rstrip('/')}/code/extensions?focus=key"
-        )
-        if action is not None and action.kind is AccountActionKind.SWITCH_API_KEY:
-            return (
-                "Teleport requires a Vibe Pro API key, but the current key is on a "
-                f"different plan. Switch to your Vibe Pro API key: {url}"
-            )
-        return (
-            "Teleport requires a Vibe Pro subscription. Your current API key isn't "
-            f"eligible. Upgrade to Vibe Pro: {url}"
-        )
 
     async def reset(self) -> None:
         for future in self._push_responses.values():

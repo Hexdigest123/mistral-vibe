@@ -119,6 +119,13 @@ class MCPAuthorizationRequiredEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class RawNotification:
+    """A backend notification with no app-server event behind it."""
+
+    method: str
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectorAuthorizationRequiredEvent:
     params: ConnectorAuthRequiredParams
     raw_connector_id: str | None = None
@@ -142,6 +149,7 @@ type AppServerEvent = (
     | ServerError
     | MCPAuthorizationRequiredEvent
     | ConnectorAuthorizationRequiredEvent
+    | RawNotification
 )
 
 _STREAMING_TEXT_PATHS = {"/content/0/text", "/text", "/state/outputText"}

@@ -41,38 +41,13 @@ from vibe.setup.auth.whoami import load_cached_whoami, store_cached_whoami
         "title",
         "offers_upgrade",
         "rate_limit_upgrade",
-        "teleport_eligible",
     ),
     [
-        (AccountPlanKind.CHAT, "FREE", "Free", "Free", True, False, False),
-        (
-            AccountPlanKind.CHAT,
-            "INDIVIDUAL",
-            "Pro",
-            "[Subscription] Pro",
-            False,
-            False,
-            True,
-        ),
-        (
-            AccountPlanKind.CHAT,
-            "EDU",
-            "Student",
-            "[Subscription] Pro",
-            False,
-            False,
-            True,
-        ),
-        (
-            AccountPlanKind.CHAT,
-            "TEAM",
-            "Team",
-            "[Subscription] Pro",
-            False,
-            False,
-            True,
-        ),
-        (AccountPlanKind.API, "FREE", "Free API", "Free", True, True, False),
+        (AccountPlanKind.CHAT, "FREE", "Free", "Free", True, False),
+        (AccountPlanKind.CHAT, "INDIVIDUAL", "Pro", "[Subscription] Pro", False, False),
+        (AccountPlanKind.CHAT, "EDU", "Student", "[Subscription] Pro", False, False),
+        (AccountPlanKind.CHAT, "TEAM", "Team", "[Subscription] Pro", False, False),
+        (AccountPlanKind.API, "FREE", "Free API", "Free", True, True),
         (
             AccountPlanKind.API,
             "PAY_AS_YOU_GO",
@@ -80,7 +55,6 @@ from vibe.setup.auth.whoami import load_cached_whoami, store_cached_whoami
             "[API] Scale plan",
             True,
             True,
-            False,
         ),
         (
             AccountPlanKind.MISTRAL_CODE,
@@ -89,14 +63,12 @@ from vibe.setup.auth.whoami import load_cached_whoami, store_cached_whoami
             "Mistral Code Free",
             True,
             True,
-            False,
         ),
         (
             AccountPlanKind.MISTRAL_CODE,
             "E",
             "Code Enterprise",
             "Mistral Code Enterprise",
-            False,
             False,
             False,
         ),
@@ -110,7 +82,6 @@ async def test_account_controller_projects_plan_semantics(
     title: str | None,
     offers_upgrade: bool,
     rate_limit_upgrade: bool,
-    teleport_eligible: bool,
 ) -> None:
     monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
@@ -129,8 +100,6 @@ async def test_account_controller_projects_plan_semantics(
     assert agent_loop.user_plan == user_plan
     assert (account.plan_offer is not None) is offers_upgrade
     assert (account.rate_limit_action is not None) is rate_limit_upgrade
-    assert account.teleport_eligible is teleport_eligible
-    assert (account.teleport_action is None) is teleport_eligible
 
 
 @pytest.mark.asyncio
@@ -154,9 +123,6 @@ async def test_account_controller_projects_switch_key_action(
 
     assert account.plan_offer is not None
     assert account.plan_offer.kind is AccountActionKind.SWITCH_API_KEY
-    assert account.teleport_action is not None
-    assert account.teleport_action.kind is AccountActionKind.SWITCH_API_KEY
-    assert not account.teleport_eligible
 
 
 @pytest.mark.asyncio

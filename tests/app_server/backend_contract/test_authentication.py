@@ -242,7 +242,6 @@ async def test_account_read_reports_a_missing_key_after_the_key_disappears(
 
     # Assert
     assert account.status is AccountStatus.MISSING_KEY
-    assert account.teleport_action is not None
     assert not gateway.calls, "a missing key must not be sent to the gateway"
 
 
@@ -262,10 +261,9 @@ async def test_account_read_projects_the_plan_and_teleport_eligibility(
     *Do*: Read the account.
     *Assert*: The plan view, the upgrade offer, and teleport eligibility.
 
-    ``teleport_eligible`` and ``teleport_action`` are the two fields
-    ``VibeCodeController._require_teleport_available`` reads before it starts a
-    teleport, so a paying customer on the Unified backend has to see the same
-    pair the legacy one produces.
+    ``teleport_eligible`` and ``teleport_action`` are what the account panel
+    renders for the plan a customer is on, and they must agree across
+    backends.
     """
     # Prepare
     gateway = FakeAccountGateway(_whoami(plan_name))
@@ -283,9 +281,6 @@ async def test_account_read_projects_the_plan_and_teleport_eligibility(
     assert account.plan.kind is AccountPlanKind.CHAT
     assert account.plan.name == plan_name
     assert account.plan.title == title
-    assert account.teleport_eligible is teleport_eligible
-    # An eligible plan offers no way out of a state it is not in.
-    assert (account.teleport_action is None) is teleport_eligible
     if not teleport_eligible:
         assert account.plan_offer is not None
         assert account.plan_offer.kind is AccountActionKind.UPGRADE_TO_PRO

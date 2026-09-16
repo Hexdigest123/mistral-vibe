@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -14,7 +15,9 @@ from collections.abc import (
 )
 import contextlib
 from dataclasses import dataclass, field, replace
+import os
 from pathlib import Path
+import shutil
 import time
 from typing import Any, Final, Literal, Never, Protocol, assert_never, cast
 from uuid import uuid4
@@ -93,6 +96,7 @@ from vibe.app_server._config_write import (
     config_write_targets,
 )
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
+from vibe.app_server._execution import SessionExecution
 from vibe.app_server._host import _time_ms, config_schema_response
 from vibe.app_server._identity import IdentityController, IdentityGateway
 from vibe.app_server._mcp_auth import MCPAuthenticationService
@@ -174,6 +178,12 @@ from vibe.app_server._unified_tool_projection import (
     unified_tool_category,
 )
 from vibe.app_server._utils import now_ms
+from vibe.app_server._vibe_code import (
+    VibeCodeAccessError,
+    VibeCodeConflictError,
+    VibeCodeController,
+    VibeCodeError,
+)
 from vibe.app_server._workspace import (
     PromptPreparationError,
     mentioned_file_content_blocks_async,
@@ -192,6 +202,7 @@ from vibe.app_server.events import (
     HistoryEntryAdded,
     HistoryEntryUpdated,
     MCPAuthorizationRequiredEvent,
+    RawNotification,
     ServerWarning,
     SessionSnapshot,
     SessionUpdated,
@@ -339,6 +350,11 @@ from vibe.app_server.protocol import (
     ShellRunResponse,
     StatsUpdatedParams,
     TelemetryRecordParams,
+    TeleportCancelParams,
+    TeleportCancelResponse,
+    TeleportPushRespondParams,
+    TeleportStartParams,
+    TeleportStartResponse,
     TurnCompletedParams,
     TurnEnqueueParams,
     TurnEnqueueResponse,
@@ -361,9 +377,23 @@ from vibe.app_server.protocol import (
     TurnSteerParams,
     TurnSteerResponse,
     TurnUserInputEntry,
+    VibeCodeProjectCancelParams,
+    VibeCodeProjectCreateParams,
+    VibeCodeProjectCreateResponse,
+    VibeCodeProjectRecoverParams,
+    VibeCodeProjectRecoverResponse,
+    VibeCodeProjectSelectParams,
+    VibeCodeProjectSelectResponse,
+    VibeCodeProjectsLoadMoreParams,
+    VibeCodeProjectsLoadMoreResponse,
+    VibeCodeProjectsOpenParams,
+    VibeCodeProjectsOpenResponse,
+    VibeCodeProjectUnlinkParams,
+    VibeCodeProjectUnlinkResponse,
     WorkspacePromptPrepareParams,
     WorkspacePromptPrepareResponse,
 )
+from vibe.core.agent_loop import TeleportError
 from vibe.core.agents.manager import AgentManager
 from vibe.core.config import MissingAPIKeyError, VibeConfigSchema
 from vibe.core.config.admin_config import MANAGED_CONFIG_TIMEOUT
@@ -393,6 +423,7 @@ from vibe.core.session.resume_sessions import (
 )
 from vibe.core.session.saved_sessions import delete_saved_session
 from vibe.core.session.session_loader import SessionLoader
+from vibe.core.session.session_logger import SessionLogger
 from vibe.core.skills.manager import SkillManager
 from vibe.core.skills.models import SkillSource
 from vibe.core.telemetry.build_metadata import build_launch_context
@@ -403,10 +434,22 @@ from vibe.core.telemetry.send import (
     TelemetryClient,
 )
 from vibe.core.telemetry.session import SessionTelemetry
-from vibe.core.telemetry.types import LaunchContext
+from vibe.core.telemetry.types import LaunchContext, ProjectPickerTelemetryPayload
+from vibe.core.teleport.errors import ServiceTeleportError
+from vibe.core.teleport.telemetry import TeleportTelemetryTracker
+from vibe.core.teleport.types import (
+    TeleportCompleteEvent,
+    TeleportPushResponseEvent,
+    TeleportYieldEvent,
+)
 from vibe.core.tools.builtins.skill import already_loaded_message, skill_content_marker
 from vibe.core.trusted_folders import has_agents_md_file
-from vibe.core.types import ScheduledLoop as CoreScheduledLoop, SessionMetadata
+from vibe.core.types import (
+    LLMMessage,
+    Role,
+    ScheduledLoop as CoreScheduledLoop,
+    SessionMetadata,
+)
 from vibe.observability.logging import logger
 from vibe.setup.auth.whoami import WhoAmICache, WhoAmIResult, resolve_user_plan
 from vibe.utils import AgentEntrypoint
@@ -767,6 +810,140 @@ class _UnifiedAccountHost:
                     }
                 )
             )
+
+
+def _is_git_executable_available() -> bool:
+    """The availability gate ``AgentLoop.teleport_service`` raises through.
+
+    Core computes it at import time behind the legacy loop; the Unified backend
+    has no loop, so the same check runs per teleport instead.
+    """
+    executable = os.environ.get("GIT_PYTHON_GIT_EXECUTABLE")
+    if not executable:
+        return shutil.which("git") is not None
+    path = Path(executable).expanduser()
+    if path.is_absolute() or os.sep in executable:
+        return path.is_file() and os.access(path, os.X_OK)
+    return shutil.which(executable) is not None
+
+
+class _UnifiedVibeCodeHost:
+    """Presents the Unified backend as a ``VibeCodeHost``.
+
+    The Rust Core owns history on this side, so ``messages`` is reconstructed
+    from the latest translated state: its roles carry what the teleport ladder
+    reads (an empty history refuses a bare ``/teleport``), and its length feeds
+    the same ``nb_session_messages`` telemetry the legacy loop reports.
+    """
+
+    def __init__(
+        self,
+        context: UnifiedSessionContext,
+        *,
+        telemetry_client: TelemetryClient,
+        cwd: Callable[[], Path],
+        state: Callable[[], PublicSessionState | None],
+        require_idle: Callable[[], None],
+        session_id: Callable[[], str],
+    ) -> None:
+        self._context = context
+        self._telemetry_client = telemetry_client
+        self._cwd = cwd
+        self._state = state
+        self._require_idle = require_idle
+        self._session_id = session_id
+
+    @property
+    def config(self) -> VibeConfigSchema:
+        return self._context.config_orchestrator.config
+
+    @property
+    def cwd(self) -> Path:
+        return self._cwd()
+
+    @property
+    def telemetry_client(self) -> TelemetryClient:
+        return self._telemetry_client
+
+    @property
+    def messages(self) -> Sequence[LLMMessage]:
+        state = self._state()
+        if state is None or not state.history:
+            return []
+        return [
+            LLMMessage(role=Role(entry.role), content=None)
+            for entry in state.history
+            if isinstance(entry, PublicMessageEntry)
+        ]
+
+    async def teleport_to_vibe_code(
+        self,
+        prompt: str | None,
+        *,
+        project_id: str | None = None,
+        project_picker: ProjectPickerTelemetryPayload | None = None,
+    ) -> AsyncGenerator[TeleportYieldEvent, TeleportPushResponseEvent | None]:
+        if not _is_git_executable_available():
+            raise TeleportError(
+                "Teleport requires git to be installed. "
+                "Please install git and try again."
+            )
+        nb_session_messages = max(len(self.messages) - 1, 0)
+        resolved_prompt = prompt or ""
+        telemetry_tracker = TeleportTelemetryTracker(
+            telemetry_client=self.telemetry_client,
+            nb_session_messages=nb_session_messages,
+            stage="no_history" if not resolved_prompt else "git_check",
+            project_picker=project_picker,
+        )
+        self._require_idle()
+        config = self.config
+        session_logger = SessionLogger(
+            config.session_logging, self._session_id(), cwd=self.cwd
+        )
+        try:
+            from vibe.core.teleport.teleport import TeleportService
+        except ImportError as exc:
+            raise TeleportError(
+                "Teleport requires git to be installed. "
+                "Please install git and try again."
+            ) from exc
+        service = TeleportService(
+            session_logger=session_logger,
+            vibe_code_sessions_base_url=config.vibe_code_sessions_base_url,
+            vibe_code_api_key=config.vibe_code_api_key,
+            vibe_config=config,
+            workdir=self.cwd,
+        )
+        try:
+            async with service:
+                gen = service.execute(
+                    prompt=resolved_prompt,
+                    project_id=project_id,
+                    message_context=None,
+                    conversation_id=self._session_id(),
+                )
+                response: TeleportPushResponseEvent | None = None
+                while True:
+                    try:
+                        event = await gen.asend(response)
+                        telemetry_tracker.record_event(event)
+                        if isinstance(event, TeleportCompleteEvent):
+                            telemetry_tracker.send_success()
+                        response = yield event
+                    except StopAsyncIteration:
+                        break
+        except ServiceTeleportError as exc:
+            telemetry_tracker.record_service_error(exc)
+            raise TeleportError(str(exc)) from exc
+        except (asyncio.CancelledError, GeneratorExit):
+            telemetry_tracker.record_cancelled()
+            raise
+        except Exception as exc:
+            telemetry_tracker.record_unexpected_error(exc)
+            raise
+        finally:
+            telemetry_tracker.send_failure_if_needed()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2597,6 +2774,41 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._scheduled_loops_task: asyncio.Task[None] | None = None
         self._pending_startup_notices: list[str] = []
         self._host_shell = _HostShell(ShellController(self._cwd_path()))
+        self._execution = SessionExecution()
+        self._vibe_code = VibeCodeController(
+            _UnifiedVibeCodeHost(
+                context,
+                telemetry_client=self._telemetry,
+                cwd=self._cwd_path,
+                state=lambda: self._translated_state,
+                require_idle=self._require_idle,
+                session_id=lambda: self.session_id,
+            ),
+            self._unified_notify,
+            self._execution,
+            self._read_account,
+        )
+
+    async def _unified_notify(self, method: str, params: ProtocolModel) -> None:
+        """Deliver a Vibe Code notification on the one stream the Client has.
+
+        The Vibe Code controller notifies (``vibeCode/teleport/event``) with no
+        Harness event behind it, so it rides the same host-event merge the
+        manual `!` command uses rather than a second queue.
+        """
+        if not self._events_subscribed:
+            return
+        self._event_id += 1
+        self._host_shell.pending += 1
+        self._host_shell.queue.put_nowait(
+            SessionBackendEvent(
+                event=RawNotification(method),
+                event_id=self._event_id,
+                method=method,
+                params=params,
+                session_id=self.session_id,
+            )
+        )
 
     def runtime_updated_params(self) -> RuntimeUpdatedParams:
         return RuntimeUpdatedParams(session_id=self.session_id, runtime=self._runtime)
@@ -2723,6 +2935,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 response = await self._dispatch_session_extension(method, raw_params)
             case _ if method.startswith("plugin/"):
                 response = await self._dispatch_plugin(method, raw_params)
+            case _ if method.startswith("vibeCode/"):
+                return await self._dispatch_vibe_code(method, raw_params)
             case "account/read":
                 params = validate_wire(AccountReadParams, raw_params)
                 self._require_session(params.session_id)
@@ -2760,16 +2974,127 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                     ),
                 )
                 response = EmptyResponse()
-            case "narration/summarize":
-                response = await self._dispatch_narration(raw_params)
-            case "feedback/shouldShow":
-                params = validate_wire(FeedbackShouldShowParams, raw_params)
-                self._require_session(params.session_id)
-                response = FeedbackShouldShowResponse(show=False)
+            case "narration/summarize" | "feedback/shouldShow":
+                response = await self._dispatch_narration_or_feedback(
+                    method, raw_params
+                )
             case "workspace/prompt/prepare":
                 params = validate_wire(WorkspacePromptPrepareParams, raw_params)
                 self._require_session(params.session_id)
                 response = await self._prepare_prompt_response(params)
+            case _:
+                raise method_not_found(method)
+        return DispatchResult(response)
+
+    async def _dispatch_vibe_code(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult:
+        """Serve the Vibe Code surface the legacy ``CoreRequestHandler`` owns.
+
+        The controller is shared and hold-agnostic; what differs here is the
+        guard: unified turns are Harness-managed and invisible to the
+        controller's own ``SessionExecution``, so the adapter's idle check
+        refuses a picker opened or a teleport started under a running turn.
+        """
+        try:
+            return await self._dispatch_vibe_code_inner(method, raw_params)
+        except VibeCodeConflictError as exc:
+            raise SessionBackendError(ProtocolErrorCode.CONFLICT, str(exc)) from exc
+        except VibeCodeAccessError as exc:
+            raise SessionBackendError(ProtocolErrorCode.FORBIDDEN, str(exc)) from exc
+        except VibeCodeError as exc:
+            raise SessionBackendError(
+                ProtocolErrorCode.INVALID_PARAMS, str(exc)
+            ) from exc
+
+    async def _dispatch_vibe_code_inner(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult:
+        if method.startswith("vibeCode/projects/"):
+            return await self._dispatch_vibe_code_project_picker(method, raw_params)
+        after_response: Callable[[], None] | None = None
+        match method:
+            case "vibeCode/teleport/start":
+                params = validate_wire(TeleportStartParams, raw_params)
+                self._require_session(params.session_id)
+                self._require_idle()
+                await self._vibe_code.reserve_teleport(params)
+                response: ProtocolModel = TeleportStartResponse(
+                    operation_id=params.operation_id
+                )
+                after_response = lambda: self._vibe_code.start_teleport(params)
+            case "vibeCode/teleport/cancel":
+                params = validate_wire(TeleportCancelParams, raw_params)
+                self._require_session(params.session_id)
+                response = TeleportCancelResponse(
+                    cancelled=await self._vibe_code.cancel_teleport(params.operation_id)
+                )
+            case "vibeCode/teleport/push/respond":
+                params = validate_wire(TeleportPushRespondParams, raw_params)
+                self._require_session(params.session_id)
+                self._vibe_code.respond_to_push(params.operation_id, params.approved)
+                response = EmptyResponse()
+            case _:
+                raise method_not_found(method)
+        return DispatchResult(response, after_response)
+
+    async def _dispatch_vibe_code_project_picker(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult:
+        match method:
+            case "vibeCode/projects/open":
+                params = validate_wire(VibeCodeProjectsOpenParams, raw_params)
+                self._require_session(params.session_id)
+                if params.purpose == "teleport":
+                    self._require_idle()
+                picker_id, view, project_id = await self._vibe_code.open(
+                    purpose=params.purpose, prompt=params.prompt
+                )
+                response: ProtocolModel = VibeCodeProjectsOpenResponse(
+                    picker_id=picker_id, view=view, resolved_project_id=project_id
+                )
+            case "vibeCode/projects/loadMore":
+                params = validate_wire(VibeCodeProjectsLoadMoreParams, raw_params)
+                self._require_session(params.session_id)
+                view, focus = await self._vibe_code.load_more(params.picker_id)
+                response = VibeCodeProjectsLoadMoreResponse(
+                    view=view, focus_option_id=focus
+                )
+            case "vibeCode/projects/create":
+                params = validate_wire(VibeCodeProjectCreateParams, raw_params)
+                self._require_session(params.session_id)
+                view, project = await self._vibe_code.create(
+                    picker_id=params.picker_id,
+                    name=params.name,
+                    default_branch=params.default_branch,
+                )
+                response = VibeCodeProjectCreateResponse(view=view, project=project)
+            case "vibeCode/projects/select":
+                params = validate_wire(VibeCodeProjectSelectParams, raw_params)
+                self._require_session(params.session_id)
+                view, project = await self._vibe_code.select(
+                    picker_id=params.picker_id, project_id=params.project_id
+                )
+                response = VibeCodeProjectSelectResponse(view=view, project=project)
+            case "vibeCode/projects/unlink":
+                params = validate_wire(VibeCodeProjectUnlinkParams, raw_params)
+                self._require_session(params.session_id)
+                view = await self._vibe_code.unlink(params.picker_id)
+                response = VibeCodeProjectUnlinkResponse(view=view)
+            case "vibeCode/projects/cancel":
+                params = validate_wire(VibeCodeProjectCancelParams, raw_params)
+                self._require_session(params.session_id)
+                await self._vibe_code.cancel_picker(params.picker_id)
+                response = EmptyResponse()
+            case "vibeCode/projects/recover":
+                params = validate_wire(VibeCodeProjectRecoverParams, raw_params)
+                self._require_session(params.session_id)
+                view, recovered = await self._vibe_code.recover_stale_link(
+                    params.picker_id
+                )
+                response = VibeCodeProjectRecoverResponse(
+                    recovered=recovered, view=view
+                )
             case _:
                 raise method_not_found(method)
         return DispatchResult(response)
@@ -2930,6 +3255,15 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._require_session(params.session_id)
         summary = await self._narration.summarize(params)
         return NarrationSummarizeResponse(summary=summary)
+
+    async def _dispatch_narration_or_feedback(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> ProtocolModel:
+        if method == "feedback/shouldShow":
+            params = validate_wire(FeedbackShouldShowParams, raw_params)
+            self._require_session(params.session_id)
+            return FeedbackShouldShowResponse(show=False)
+        return await self._dispatch_narration(raw_params)
 
     async def _dispatch_session_extension(
         self, method: str, raw_params: dict[str, Any]
@@ -4114,6 +4448,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         # outlive the session that spawned it.
         with contextlib.suppress(Exception):
             await self._host_shell.controller.close()
+        # Cancel any Vibe Code operation (a teleport push awaiting approval, a
+        # picker reservation) so the session cannot be torn down under it.
+        with contextlib.suppress(Exception):
+            await self._vibe_code.close()
         scheduler = self._scheduled_loops_task
         self._scheduled_loops_task = None
         if scheduler is not None:
