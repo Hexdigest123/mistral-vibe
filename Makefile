@@ -1,6 +1,15 @@
-# vibe-rs build/run helpers for vibe/cli-rust/; run from this dir so `uv run vibe-app-server` resolves.
+# Local fork helpers: `make build` builds the PyInstaller standalone and offers to
+# install it as ~/.local/bin/vibes. The targets below cover vibe/cli-rust/; run
+# from this dir so `uv run vibe-app-server` resolves.
 M = --manifest-path vibe/cli-rust/Cargo.toml
 BIN = vibe/cli-rust/target/release/vibe-rs
+# Standalone CLI: PyInstaller onedir bundle, installed via a wrapper script.
+SPEC = vibe.spec
+DIST_DIR = dist/$(SPEC:.spec=-dir)
+# Local install locations; override in Makefile.local if needed.
+LOCAL_BIN_DIR ?= $(HOME)/.local/bin
+LOCAL_BUNDLE_DIR ?= $(HOME)/.local/lib/vibes/$(notdir $(DIST_DIR))
+PYINSTALLER = uv run --no-dev --group build pyinstaller
 # Extra cargo flags, e.g. CARGO_BUILD_FLAGS=--no-default-features to drop `voice` and its ALSA dependency.
 CARGO_BUILD_FLAGS ?=
 # Cargo flags for the tested binary; defaults to --no-default-features to match CI (voice off) so goldens compare against the same feature set.
@@ -22,7 +31,7 @@ QUIET ?=
 QUIET_FLAGS = $(if $(QUIET),-q,)
 CARGO_QUIET = $(if $(QUIET),-- --quiet,)
 
-.PHONY: start run build build_test release fmt lint check clean sweep test test_rust test_golden store_golden profile-stress view-stress
+.PHONY: start run build build_rs install build_test release fmt lint check clean sweep test test_rust test_golden store_golden profile-stress view-stress
 
 # The golden snapshot pytest run (Rust-only), shared by `test` and `test_golden`.
 GOLDEN_CMD = uv run --no-project --with "pyte==0.8.2" --with "rich==15.0.0" --with pytest --with pytest-timeout --with pytest-xdist \
@@ -45,7 +54,26 @@ run:            ## Debug build + run
 release:        ## Optimized build + run via cargo
 	cargo run $(M) --release --bin vibe-rs -- $(RUN_ARGS)
 
-build:          ## Optimized release build only
+build:          ## PyInstaller standalone build, then offer to install it as ~/.local/bin/vibes
+	uv sync --no-dev --group build
+	$(PYINSTALLER) $(SPEC)
+	@printf 'Install this build as %s/vibes? [y/N] ' "$(LOCAL_BIN_DIR)"; \
+	answer=; read -r answer < /dev/tty || true; \
+	case $$answer in \
+	y|Y|yes|YES) $(MAKE) --no-print-directory install ;; \
+	*) echo "Not installed. Binary left in $(DIST_DIR)/" ;; \
+	esac
+
+install:        ## Install the last PyInstaller build as ~/.local/bin/vibes
+	@test -x $(DIST_DIR)/vibe || { echo "$(DIST_DIR)/vibe missing; run make build first" >&2; exit 1; }
+	mkdir -p "$(LOCAL_BUNDLE_DIR)" "$(LOCAL_BIN_DIR)"
+	rm -rf "$(LOCAL_BUNDLE_DIR)"
+	cp -R $(DIST_DIR) "$(LOCAL_BUNDLE_DIR)"
+	printf '#!/bin/sh\nexec "%s/vibe" "$$@"\n' "$(LOCAL_BUNDLE_DIR)" > "$(LOCAL_BIN_DIR)/vibes"
+	chmod +x "$(LOCAL_BIN_DIR)/vibes"
+	@echo "Installed: $(LOCAL_BIN_DIR)/vibes -> $(LOCAL_BUNDLE_DIR)/vibe"
+
+build_rs:       ## Optimized vibe-rs release build only
 	cargo build $(M) --release $(CARGO_BUILD_FLAGS)
 
 build_test:     ## Release build in the CI configuration, used by every test target
@@ -80,7 +108,7 @@ store_golden: build_test ## Regenerate Rust golden snapshots (all scenarios)
 
 STRESS_OUT ?= profile.stress.json
 
-profile-stress: build ## Profile an interactive vibe-rs session with samply (run /stress + scroll, then quit)
+profile-stress: build_rs ## Profile an interactive vibe-rs session with samply (run /stress + scroll, then quit)
 	samply record --save-only -o $(STRESS_OUT) -- $(BIN)
 
 view-stress:    ## Open the interactive-session profile in the samply server

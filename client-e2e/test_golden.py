@@ -230,7 +230,7 @@ def test_rust_matches_golden(name: str) -> None:
         expected_titles = expected_titles[1:]
     scenario.capture_startup = False
     if not os.path.exists(CLIENTS["rust"][0]) or not os.path.exists(REPLAY_BIN):
-        pytest.skip("Rust binary missing (run `make build`)")
+        pytest.skip("Rust binary missing (run `make build_rs`)")
 
     captured = capture_scenario(CLIENTS["rust"], scenario)
     if expected_titles is not None:

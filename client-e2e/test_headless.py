@@ -15,7 +15,7 @@ def test_headless_scenario(name: str) -> None:
     scenario = load_scenario(name)
     command = CLIENTS["rust"]
     if not os.path.exists(command[0]):
-        pytest.skip(f"CLI missing: {command[0]} (run `make build`)")
+        pytest.skip(f"CLI missing: {command[0]} (run `make build_rs`)")
 
     captured = capture_headless_scenario(command, scenario)
 

@@ -31,9 +31,9 @@ def main() -> None:
         names = args
 
     if not os.path.exists(CLIENTS["rust"][0]):
-        sys.exit(f"Rust binary missing: {CLIENTS['rust'][0]} (run `make build`)")
+        sys.exit(f"Rust binary missing: {CLIENTS['rust'][0]} (run `make build_rs`)")
     if not os.path.exists(REPLAY_BIN):
-        sys.exit(f"Replay binary missing: {REPLAY_BIN} (run `make build`)")
+        sys.exit(f"Replay binary missing: {REPLAY_BIN} (run `make build_rs`)")
 
     for name in names:
         scenario = load_scenario(name)
