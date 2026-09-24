@@ -1,6 +1,7 @@
-# Local fork helpers: `make build` builds the PyInstaller standalone and offers to
-# install it as ~/.local/bin/vibes; `make build-experimental` installs a wrapper
-# that injects --experimental-harness. The targets below cover vibe/cli-rust/;
+# Local fork helpers: `make build` builds the PyInstaller standalone from the
+# current source (all patches included) and offers to install it as
+# ~/.local/bin/vibes. The Unified Harness is the default backend, so the
+# installed binary needs no flags. The targets below cover vibe/cli-rust/;
 # run from this dir so `uv run vibe-app-server` resolves.
 M = --manifest-path vibe/cli-rust/Cargo.toml
 BIN = vibe/cli-rust/target/release/vibe-rs
@@ -25,14 +26,14 @@ export VIBE_APP_SERVER_CWD = .
 # VIBE_APP_SERVER_CWD); the guard only activates when that checkout exists.
 HARNESS_SRC ?=
 HARNESS_EDITABLE = $(if $(HARNESS_SRC),$(if $(wildcard $(HARNESS_SRC)/pyproject.toml),--with-editable $(HARNESS_SRC) ,),)
-start run release profile-stress: export VIBE_APP_SERVER_CMD = uv run --quiet $(HARNESS_EDITABLE)vibe-app-server --experimental-harness
+start run release profile-stress: export VIBE_APP_SERVER_CMD = uv run --quiet $(HARNESS_EDITABLE)vibe-app-server
 
 # Set QUIET=1 to suppress per-test output (only failures, slowest, and summary).
 QUIET ?=
 QUIET_FLAGS = $(if $(QUIET),-q,)
 CARGO_QUIET = $(if $(QUIET),-- --quiet,)
 
-.PHONY: start run build build-experimental build_rs install build_test release fmt lint check clean sweep test test_rust test_golden store_golden profile-stress view-stress
+.PHONY: start run build build_rs install build_test release fmt lint check clean sweep test test_rust test_golden store_golden profile-stress view-stress
 
 # The golden snapshot pytest run (Rust-only), shared by `test` and `test_golden`.
 GOLDEN_CMD = uv run --no-project --with "pyte==0.8.2" --with "rich==15.0.0" --with pytest --with pytest-timeout --with pytest-xdist \
@@ -55,9 +56,9 @@ run:            ## Debug build + run
 release:        ## Optimized build + run via cargo
 	cargo run $(M) --release --bin vibe-rs -- $(RUN_ARGS)
 
-# Extra args baked into the ~/.local/bin/vibes wrapper (build-experimental sets
-# --experimental-harness). Set from the goal's command line, so it propagates
-# through the build -> install sub-makes.
+# Extra args baked into the ~/.local/bin/vibes wrapper. Set from the goal's
+# command line, so it propagates through the build -> install sub-makes. The
+# Unified Harness is the default backend, so no flags are needed.
 VIBES_WRAPPER_ARGS ?=
 
 build:          ## PyInstaller standalone build, then offer to install it as ~/.local/bin/vibes
@@ -69,9 +70,6 @@ build:          ## PyInstaller standalone build, then offer to install it as ~/.
 	n|N|no|NO) echo "Not installed. Binary left in $(DIST_DIR)/" ;; \
 	*) $(MAKE) --no-print-directory install VIBES_WRAPPER_ARGS='$(VIBES_WRAPPER_ARGS)' ;; \
 	esac
-
-build-experimental: ## Like build, but the vibes wrapper injects --experimental-harness
-	$(MAKE) --no-print-directory build VIBES_WRAPPER_ARGS=--experimental-harness
 
 install:        ## Install the last PyInstaller build as ~/.local/bin/vibes
 	@test -x $(DIST_DIR)/vibe || { echo "$(DIST_DIR)/vibe missing; run make build first" >&2; exit 1; }

@@ -182,7 +182,7 @@ impl ToolName {
     fn spec(self, environment: CommandEnvironment) -> Option<ToolSpec> {
         let direct_name = self.direct_name(environment)?;
         let description = match self {
-            Self::ReadFile => "Read a text file with optional zero-indexed line offset and limit.",
+            Self::ReadFile => "Read a file with optional zero-indexed line offset and limit. Image files are supported: reading an image returns a text description of its contents, so images found with find or ls can be read directly.",
             Self::WriteFile => "Create or overwrite a UTF-8 file.",
             Self::Edit => EDIT_DESCRIPTION,
             Self::Bash => environment.profile()?.tool_description,

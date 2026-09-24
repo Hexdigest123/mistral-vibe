@@ -73,6 +73,11 @@ def spawned_vibe_process() -> SpawnedVibeFactory:
         env["VIBE_TEST_DISABLE_KEYRING"] = "1"
         env["VIBE_TEST_DISABLE_AUTO_TITLE"] = "1"
         arguments = ["--workdir", str(workdir), *(extra_args or [])]
+        # These suites characterize the legacy loop. The fork's default backend
+        # is the Unified Harness, so pin the escape hatch unless a test opts
+        # into unified explicitly.
+        if "--experimental-harness" not in arguments:
+            arguments = ["--legacy-harness", *arguments]
         executable = "uv"
         if "--experimental-harness" in arguments:
             executable = str(Path(sys.executable).with_name("vibe"))

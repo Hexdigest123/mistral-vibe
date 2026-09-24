@@ -41,6 +41,9 @@ def _options() -> LocalHarnessOptions:
             disabled_tools=["ask_user_question", "exit_plan_mode"],
             headless=True,
         ),
+        # These tests mock the backend at the legacy loop's factory seam; the
+        # fork's default backend is the Unified Harness, so pin the escape hatch.
+        legacy_harness=True,
     )
 
 

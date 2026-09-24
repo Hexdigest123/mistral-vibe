@@ -41,6 +41,12 @@ Always go through `uv` — never invoke bare `python` or `pip`.
 - `uv run pre-commit run --all-files` — full lint pass. Install once with `uv tool install pre-commit && uv run pre-commit install`.
 - Useful uv basics: `uv sync --all-extras`, `uv add <pkg>`, `uv remove <pkg>`.
 
+### Local fork builds
+
+- `make build` is the one build command: it builds the PyInstaller standalone from the current source — every patch in this checkout included — and installs it as `~/.local/bin/vibes`. Do not add experimental-flag build variants; there is no `make build-experimental`.
+- The Unified Harness is the default backend on every surface (CLI, ACP, app-server) whenever the harness package is installed — no `--experimental-harness` needed. `--legacy-harness` remains the escape hatch, and a checkout without the harness package falls back to the legacy loop.
+- Keep new features working on the Unified Harness path; the legacy loop is compatibility-only.
+
 ## Project layout & module conventions
 
 - `__init__.py` exposes the public API via an explicit `__all__`.

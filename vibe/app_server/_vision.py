@@ -15,6 +15,8 @@ the legacy ``AgentLoop`` keeps rejecting attachments its model cannot read.
 
 from __future__ import annotations
 
+import mimetypes
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vibe.app_server._turn_input import image_attachment_from_session_block
@@ -26,9 +28,9 @@ from vibe.app_server.models import (
     TextContentBlock,
 )
 from vibe.core.tracing import build_otel_span_exporter_config
-from vibe.core.types import ImageAttachment as CoreImageAttachment
+from vibe.core.types import FileImageSource, ImageAttachment as CoreImageAttachment
 from vibe.core.vision import ImageDescriber, complete_vision
-from vibe.utils.images import MAX_IMAGES_PER_MESSAGE
+from vibe.utils.images import MAX_IMAGES_PER_MESSAGE, MIME_BY_IMAGE_EXTENSION
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -89,6 +91,7 @@ class SessionImageDescriber:
                 ),
             ),
             model,
+            source="turn_input",
         )
         return [
             TextContentBlock(text=self._image_text(_core_attachment(block.attachment)))
@@ -123,6 +126,7 @@ class SessionImageDescriber:
                 ),
             ),
             model,
+            source="turn_input",
         )
         return [
             SessionTextContentBlock(
@@ -133,16 +137,42 @@ class SessionImageDescriber:
             for block in blocks
         ]
 
-    def _report(self, report: DescribeReport, model: ModelConfig) -> None:
+    async def describe_file(self, path: Path) -> str | None:
+        """Describe one file-backed image for an agent tool read, or None.
+
+        The seam behind the ``builtin:image_describe`` post-tool hook: a blind
+        model that just ran ``file_system.read_file`` on an image gets the
+        vision fallback model's transcription in place of the file's bytes.
+        ``None`` means there is nothing to substitute -- no describer for this
+        active model -- and the caller leaves the read alone.
+        """
+        model = self._config().get_vision_fallback_model()
+        if model is None:
+            return None
+        attachment = _file_core_attachment(path)
+        self._report(
+            await self._describer.describe_all(
+                [attachment], model=model, instruction=""
+            ),
+            model,
+            source="tool_read",
+        )
+        return self._image_text(attachment)
+
+    def _report(
+        self, report: DescribeReport, model: ModelConfig, *, source: str
+    ) -> None:
         # The agent is handed a placeholder either way, so without this the
         # user only sees it claim it cannot see an image it was never shown.
         for failure in report.failures:
             self._notice(
                 f"{model.alias} could not describe {failure.alias}: {failure.reason}"
             )
-        self._record(report, model)
+        self._record(report, model, source=source)
 
-    def _record(self, report: DescribeReport, model: ModelConfig) -> None:
+    def _record(
+        self, report: DescribeReport, model: ModelConfig, *, source: str
+    ) -> None:
         try:
             blind = self._config().get_active_model().alias
         except ValueError:
@@ -153,6 +183,9 @@ class SessionImageDescriber:
                 "from": blind,
                 "to": model.alias,
                 "provider": model.provider,
+                # "turn_input" is a pasted or queued image; "tool_read" is a
+                # file the agent read with file_system.read_file.
+                "source": source,
                 "outcome": report.outcome,
                 "nb_images_described": report.described,
                 "nb_images_cached": report.cached,
@@ -215,3 +248,16 @@ def _core_attachment(attachment: ImageAttachment) -> CoreImageAttachment:
 
 def _session_core_attachment(block: SessionImageContentBlock) -> CoreImageAttachment:
     return _core_attachment(image_attachment_from_session_block(block))
+
+
+def _file_core_attachment(path: Path) -> CoreImageAttachment:
+    # The hook already validated the extension against IMAGE_EXTENSIONS; the
+    # fallback keeps a renamed file from describing itself as an octet stream.
+    mime_type = MIME_BY_IMAGE_EXTENSION.get(path.suffix.lower()) or (
+        mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    )
+    return CoreImageAttachment(
+        source=FileImageSource(path=path.expanduser().resolve()),
+        alias=str(path),
+        mime_type=mime_type,
+    )

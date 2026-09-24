@@ -15,6 +15,14 @@ from mistralai_vibe_local_harness.vibe._permissions import PermissionResolver
 
 type ThinkingLevel = Literal["off", "low", "medium", "high", "max"]
 
+# Host-bound per-session image transcription for a model that cannot see images:
+# given the file-backed image the runtime's ``file_system.read_file`` just read,
+# returns a textual description or ``None`` when the Host has no describer for
+# this session. Rides the adapter config (like ``permission_resolver``) so child
+# sessions inherit the parent's describer through the ``replace()`` copies
+# ``_subagents/_configuration`` builds.
+type ImageDescriberSink = Callable[[Path], Awaitable[str | None]]
+
 # "classify" defers to the smart-approve risk classifier at dispatch time; the
 # other three are frozen decisions.
 type ToolApprovalMode = Literal["allow", "ask", "deny", "classify"]
@@ -227,6 +235,9 @@ class LocalRuntimeAdapterConfig:
     # name or a provided tool's full route. Under smart approve it runs first, and only
     # its ``ask`` residue is classified.
     permission_resolver: PermissionResolver | None = None
+    # None means this session's reads of image files pass through untouched.
+    # Bound to the session's ImageDescriber (see vibe/app_server/_image_read_hooks).
+    image_describer: ImageDescriberSink | None = None
     correlation_id_sink: CorrelationIdSink | None = None
     request_sent_sink: RequestSentSink | None = None
     skills: Mapping[str, str] = field(default_factory=dict)
@@ -271,6 +282,7 @@ __all__ = [
     "CompletionMetadataSource",
     "CompletionPurpose",
     "CorrelationIdSink",
+    "ImageDescriberSink",
     "LocalModelRoute",
     "LocalProviderRoute",
     "LocalRuntimeAdapterConfig",

@@ -28,7 +28,20 @@ def _harness_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod, "experimental_harness_available", lambda: True)
 
 
-def test_no_flags_no_cache_defaults_to_legacy() -> None:
+def test_no_flags_no_cache_defaults_to_unified_when_available() -> None:
+    selection = resolve_harness_selection(
+        experimental_harness=False, legacy_harness=False, cached_eval=None
+    )
+    assert selection.use_unified is True
+    assert selection.source == "default"
+
+
+def test_default_falls_back_to_legacy_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibe._experimental_harness as mod
+
+    monkeypatch.setattr(mod, "experimental_harness_available", lambda: False)
     selection = resolve_harness_selection(
         experimental_harness=False, legacy_harness=False, cached_eval=None
     )
@@ -46,13 +59,15 @@ def test_cache_with_unified_selects_unified() -> None:
     assert selection.source == "rollout"
 
 
-def test_cache_with_legacy_selects_legacy() -> None:
+def test_a_stale_legacy_rollout_cannot_override_the_unified_default() -> None:
+    # This fork's default is the Unified Harness; the rollout cache only ever
+    # selects unified, it cannot demote an installed build back to legacy.
     selection = resolve_harness_selection(
         experimental_harness=False,
         legacy_harness=False,
         cached_eval=_cached_response("legacy"),
     )
-    assert selection.use_unified is False
+    assert selection.use_unified is True
     assert selection.source == "default"
 
 
@@ -101,7 +116,7 @@ def test_cache_without_rollout_feature_returns_default() -> None:
     selection = resolve_harness_selection(
         experimental_harness=False, legacy_harness=False, cached_eval=cached
     )
-    assert selection.use_unified is False
+    assert selection.use_unified is True
     assert selection.source == "default"
 
 

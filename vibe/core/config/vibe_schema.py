@@ -360,7 +360,6 @@ class VibeConfigSchema(ConfigSchema):
             " model that cannot see them. Only needed to override the default,"
             " which is any vision-capable model on the active model's own"
             " provider; set this to reach a different provider."
-            " Requires --experimental-harness."
         ),
     )
     auto_compact_threshold: Annotated[int, WithReplaceMerge()] = Field(

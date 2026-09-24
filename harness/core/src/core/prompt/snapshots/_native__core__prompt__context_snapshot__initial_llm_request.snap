@@ -317,7 +317,7 @@ expression: reviewable_snapshot(request)
         },
         {
           "name": "read_file",
-          "description": "Read a text file with optional zero-indexed line offset and limit.",
+          "description": "Read a file with optional zero-indexed line offset and limit. Image files are supported: reading an image returns a text description of its contents, so images found with find or ls can be read directly.",
           "parameters": {
             "type": "object",
             "additionalProperties": false,

@@ -1250,7 +1250,7 @@ async def test_fork_uses_latest_compaction_boundary_in_copied_prefix(
 
 @pytest.mark.asyncio
 async def test_detached_fork_transfers_live_runtime_without_session_logging() -> None:
-    process = HarnessProcess()
+    process = HarnessProcess(legacy_harness=True)
     source_loop = build_test_agent_loop()
 
     async def open_source(_request: RootOpenRequest) -> AgentLoop:

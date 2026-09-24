@@ -2103,7 +2103,9 @@ async def test_root_config_discovery_uses_session_cwd(
     monkeypatch.chdir(launcher)
     monkeypatch.setattr(runtime, "setup_tracing", lambda _: None)
 
-    process = runtime.HarnessProcess(HarnessFilesManager(sources=("project",)))
+    process = runtime.HarnessProcess(
+        HarnessFilesManager(sources=("project",)), legacy_harness=True
+    )
     blueprint = await process.build_root_blueprint(
         SessionOptions(cwd=str(session_cwd), trust_workspace=True),
         ClientInfo(name="cwd-test", version="1"),
@@ -2157,15 +2159,18 @@ def test_experimental_harness_process_selects_the_unified_harness_host(
     assert host.harness_kind == selected.harness_kind
 
 
-def test_default_process_selects_the_legacy_session_backend(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def explode() -> object:
-        raise AssertionError("the default path must not import the Harness")
-
-    monkeypatch.setattr(runtime, "create_experimental_harness_host", explode)
-
+def test_default_process_selects_the_unified_session_backend() -> None:
+    # The fork ships the Unified Harness as the default backend; the harness
+    # package is part of the project, so a plain process resolves to it.
     host = runtime.HarnessProcess().create_session_backend_host(
+        FakeSessionBackendServices()
+    )
+
+    assert not isinstance(host, LegacySessionBackendHost)
+
+
+def test_legacy_harness_flag_selects_the_legacy_session_backend() -> None:
+    host = runtime.HarnessProcess(legacy_harness=True).create_session_backend_host(
         FakeSessionBackendServices()
     )
 
@@ -2504,7 +2509,7 @@ async def test_session_config_build_starts_session_log_permission_sweep(
 async def test_runtime_is_built_only_when_session_start_crosses_json_rpc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    process = runtime.HarnessProcess()
+    process = runtime.HarnessProcess(legacy_harness=True)
     agent_loop = build_test_agent_loop()
     blueprint = Mock()
     blueprint.config = agent_loop.config
@@ -2554,7 +2559,7 @@ async def test_production_legacy_root_holds_lease_until_runtime_shutdown(
     session_id = saved.session_id
     await saved.aclose()
 
-    process = runtime.HarnessProcess()
+    process = runtime.HarnessProcess(legacy_harness=True)
     blueprint = Mock()
     blueprint.config = config
     blueprint.cwd = tmp_path

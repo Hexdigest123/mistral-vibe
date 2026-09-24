@@ -37,8 +37,8 @@ def add_experimental_harness_argument(
         action="store_true",
         default=False,
         help=(
-            "Use the Unified Harness backend. Requires an "
-            "internal Unified Harness installation."
+            "Use the Unified Harness backend (the default when installed;"
+            " kept for scripts and wrappers that pass it explicitly)."
             if experimental_harness_available()
             else argparse.SUPPRESS
         ),
@@ -104,9 +104,9 @@ def resolve_harness_selection(
 
     Precedence (highest wins):
       1. ``--legacy-harness``  -> legacy (escape hatch)
-      2. ``--experimental-harness`` -> unified (if available; else fallback)
-      3. GrowthBook rollout cache -> unified (if available; else legacy)
-      4. Default -> legacy
+      2. ``--experimental-harness`` -> unified (explicit; now also the default)
+      3. GrowthBook rollout cache -> unified (if available; else the default)
+      4. Default -> unified when the harness package is installed, else legacy
     """
     if legacy_harness:
         return HarnessSelection(use_unified=False, source="flag-legacy")
@@ -117,6 +117,13 @@ def resolve_harness_selection(
     variant = _rollout_variant_from_cache(cached_eval)
     if variant == "unified" and experimental_harness_available():
         return HarnessSelection(use_unified=True, source="rollout")
+
+    # This fork ships the Unified Harness as the default backend: it carries
+    # the features the fork's patches build on (vision fallback on tool reads,
+    # smart approve, programmatic tools). The installed build always has the
+    # package; only a checkout without it falls back to the legacy loop.
+    if experimental_harness_available():
+        return HarnessSelection(use_unified=True, source="default")
 
     return HarnessSelection(use_unified=False, source="default")
 

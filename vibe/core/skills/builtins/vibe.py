@@ -275,7 +275,7 @@ name = "devstral"
 provider = "llamacpp"
 alias = "local"
 
-# Optional override, requires --experimental-harness. A non-vision active model
+# Optional override, Unified Harness only (the default backend). A non-vision active model
 # already picks up any supports_images model on its OWN provider automatically;
 # set this only to point somewhere else, which is also the only way to cross
 # providers. Ignored whenever the active model has supports_images = true --
@@ -488,8 +488,7 @@ and the API key env var is set. Toggle the master switch or hide individual
 connectors / tools:
 
 The legacy backend keeps a discovered connector disabled until it has an
-explicit `[[connectors]]` entry. The Unified Harness backend (selected via
-`--experimental-harness` or through the GrowthBook rollout) enables ready
+explicit `[[connectors]]` entry. The Unified Harness backend (the default, or via the GrowthBook rollout) enables ready
 connectors by default in memory. It does not write that default to TOML, and
 the master switch plus explicit connector, tool, allowlist, and denylist
 settings always take precedence. Use `--legacy-harness` to force the legacy
@@ -779,8 +778,7 @@ vibe --max-tokens N                 # Max total session tokens (programmatic mod
 vibe --enabled-tools TOOL           # Enable specific tools (repeatable)
 vibe --disabled-tools TOOL          # Disable specific tools (repeatable)
 vibe --output text|json|streaming   # Output format (programmatic mode)
-vibe --experimental-harness        # Force the Unified Harness backend (requires internal installation)
-vibe --legacy-harness             # Force the legacy Python harness, overriding the GrowthBook rollout
+vibe --legacy-harness             # Escape hatch: force the legacy Python harness instead of the default Unified one
 ```
 
 ## Built-in Agents
@@ -885,7 +883,7 @@ already starts a child that inherits the parent's prompt and tools.
   **macOS only** — the command is not registered on Linux or Windows.
 - `/todo` - Open the full todo list. The current item is already
   pinned to a single line under the input; this shows every item grouped by
-  status. Registered only under `--experimental-harness`, where todo updates are
+  status. Registered only on the Unified Harness (the default backend), where todo updates are
   logged in the transcript as a one-line delta instead of a full reprint.
 - `/voice` - Configure voice settings
 - `/mcp` (or `/connectors`) - Display MCP servers and connector status. The
@@ -961,7 +959,7 @@ Image attachments:
 
 - Require `supports_images = true` on the active model in `config.toml`.
   The legacy loop rejects an image its model cannot read; under
-  `--experimental-harness` the send always goes through, and the agent is
+  the Unified Harness (the default backend) the send always goes through, and the agent is
   shown a description of the image or, failing that, a link to the file.
 - The describer is picked automatically: any `supports_images` model on
   the active model's **own** provider, no config needed. Same provider
@@ -978,6 +976,14 @@ Image attachments:
 - A describe that fails does not fail the turn. The agent gets a
   placeholder saying the image could not be read, and a warning names the
   image and the provider's reason.
+- **Reading image files with `read_file`** (Unified Harness, the default): a
+  blind active model that reads an image it discovered — e.g. through
+  `find` or `grep` — gets the same treatment: the read result's binary
+  bytes are replaced by the describer's transcription inside an
+  `<image alias="...">` block, using the same cache and `vision_model`
+  fallback as pasted images. Sessions whose model sees images, files over
+  10 MiB, and reads with no describer reachable keep the raw read. The
+  hook also covers subagent sessions.
 - With no describer reachable the image is left alone, and the harness
   hands the model a `file://` link to it instead of the pixels.
 - Snapshotted into `<session_dir>/attachments/<sha1>.<ext>` so that

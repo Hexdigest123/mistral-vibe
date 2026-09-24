@@ -379,6 +379,7 @@ class TestTelemetry:
         [(name, props)] = events
         assert name == FALLBACK_EVENT
         assert (props["from"], props["to"]) == ("glm", "vision")
+        assert props["source"] == "turn_input"
         assert props["outcome"] == "success"
         assert props["nb_images_described"] == 1
 
@@ -414,3 +415,102 @@ class TestTelemetry:
         ).described_blocks([_image_block(tmp_path)])
 
         assert events == []
+
+
+class TestDescribeFile:
+    @pytest.mark.asyncio
+    async def test_a_read_image_becomes_a_tagged_description(
+        self, tmp_path: Path, complete: RecordingComplete
+    ) -> None:
+        path = tmp_path / "shot.png"
+        path.write_bytes(PNG_BYTES)
+
+        described = await _describer(
+            _config(active_sees_images=False, vision_model=True)
+        ).describe_file(path)
+
+        assert described is not None
+        assert 'alias="' in described
+        assert "shot.png" in described
+        assert "a red error dialog" in described
+        [messages] = complete.calls
+        assert messages[-1].images, "the description request carries the file image"
+
+    @pytest.mark.asyncio
+    async def test_a_model_with_vision_gets_no_description(
+        self, tmp_path: Path, complete: RecordingComplete
+    ) -> None:
+        path = tmp_path / "shot.png"
+        path.write_bytes(PNG_BYTES)
+
+        described = await _describer(
+            _config(active_sees_images=True, vision_model=True)
+        ).describe_file(path)
+
+        assert described is None
+        assert not complete.calls
+
+    @pytest.mark.asyncio
+    async def test_without_a_vision_model_nothing_happens(
+        self, tmp_path: Path, complete: RecordingComplete
+    ) -> None:
+        path = tmp_path / "shot.png"
+        path.write_bytes(PNG_BYTES)
+
+        described = await _describer(
+            _config(active_sees_images=False, vision_model=False)
+        ).describe_file(path)
+
+        assert described is None
+        assert not complete.calls
+
+    @pytest.mark.asyncio
+    async def test_a_failed_description_degrades_to_a_placeholder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def boom(**_: object) -> LLMChunk:
+            raise RuntimeError("vision provider is down")
+
+        monkeypatch.setattr(_vision, "complete_vision", boom)
+        notices: list[str] = []
+
+        path = tmp_path / "shot.png"
+        path.write_bytes(PNG_BYTES)
+        described = await _describer(
+            _config(active_sees_images=False, vision_model=True), notices
+        ).describe_file(path)
+
+        assert described is not None
+        assert _vision.UNREADABLE_IMAGE in described
+        assert notices and "shot.png" in notices[0]
+
+    @pytest.mark.asyncio
+    async def test_the_same_file_is_described_once_per_session(
+        self, tmp_path: Path, complete: RecordingComplete
+    ) -> None:
+        describer = _describer(_config(active_sees_images=False, vision_model=True))
+        path = tmp_path / "shot.png"
+        path.write_bytes(PNG_BYTES)
+
+        first = await describer.describe_file(path)
+        second = await describer.describe_file(path)
+
+        assert len(complete.calls) == 1
+        assert first == second
+
+    @pytest.mark.asyncio
+    async def test_the_switch_is_recorded_as_a_tool_read(
+        self, tmp_path: Path, complete: RecordingComplete
+    ) -> None:
+        events: list[tuple[str, dict[str, Any]]] = []
+        path = tmp_path / "shot.png"
+        path.write_bytes(PNG_BYTES)
+
+        await _describer(
+            _config(active_sees_images=False, vision_model=True), events=events
+        ).describe_file(path)
+
+        [(name, props)] = events
+        assert name == FALLBACK_EVENT
+        assert props["source"] == "tool_read"
+        assert props["outcome"] == "success"

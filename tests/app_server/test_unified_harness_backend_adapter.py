@@ -2033,11 +2033,14 @@ async def test_smart_approve_mode_sets_gated_tools_to_classify(
     # Provided/MCP tools are gated by the classifier under smart approve too.
     assert adapter_config.provided_tool_mode == "classify"
     # The mode contributes no binding of its own, and `hooks.bindings` carries only
-    # the builtins: the lazy AGENTS.md injection (whose handler rides the
-    # Host-global registry instead) plus the user's. Vibe's builtin scratchpad
-    # hook rides in the capability set instead, which is the channel a subagent
-    # inherits.
-    assert [binding.id for binding in context.hooks.bindings] == ["builtin:agents_md"]
+    # the builtins: the lazy AGENTS.md injection and the image-describe hook (whose
+    # handlers ride the Host-global registry instead) plus the user's. Vibe's
+    # builtin scratchpad hook rides in the capability set instead, which is the
+    # channel a subagent inherits.
+    assert [binding.id for binding in context.hooks.bindings] == [
+        "builtin:agents_md",
+        "builtin:image_describe",
+    ]
 
 
 @pytest.mark.asyncio
@@ -8957,11 +8960,13 @@ async def test_unified_runtime_counts_the_hooks_the_session_compiled(
     assert derivation.runtime.hooks_count == 2
     # The count stands for hooks that actually bound, not files that parsed —
     # and it counts the *user's* hooks only. The builtin lazy AGENTS.md
-    # injection binds too, but its handler rides the Host-global registry.
+    # injection and image-describe hook bind too, but their handlers ride the
+    # Host-global registry.
     assert [binding.id.rsplit(":", 1)[-1] for binding in context.hooks.bindings] == [
         "guard",
         "audit",
         "agents_md",
+        "image_describe",
     ]
 
 

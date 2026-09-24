@@ -1210,10 +1210,22 @@ class HarnessProcess:
                 # handler map, or it surfaces public hook-run notices. The
                 # matching binding is merged into every session's compiled
                 # hooks at context build (see merge_agents_md_hook).
-                from vibe.app_server._agents_md_hooks import agents_md_hook_handlers
+                from mistralai_vibe_local_harness.vibe import HookHandlers
 
+                from vibe.app_server._agents_md_hooks import agents_md_hook_handlers
+                from vibe.app_server._image_read_hooks import (
+                    image_describe_hook_handlers,
+                )
+
+                agents_md_handlers = agents_md_hook_handlers(self.harness_files)
+                image_describe_handlers = image_describe_hook_handlers()
                 cast(Any, candidate).configure_hook_handlers(
-                    agents_md_hook_handlers(self.harness_files)
+                    HookHandlers(
+                        post_tool_call={
+                            **agents_md_handlers.post_tool_call,
+                            **image_describe_handlers.post_tool_call,
+                        }
+                    )
                 )
                 unified_host = candidate
             except (
@@ -1388,6 +1400,10 @@ class HarnessProcess:
         )
 
         from vibe.app_server._agents_md_hooks import merge_agents_md_hook
+        from vibe.app_server._image_read_hooks import (
+            ImageDescribePort,
+            merge_image_describe_hook,
+        )
         from vibe.app_server._plugins import (
             core_plugins,
             plugin_agent_names,
@@ -1512,6 +1528,12 @@ class HarnessProcess:
         # Same lifetime and sharing as ``correlation``: the completion adapter
         # appends each request's shape here, the adapter drains it to telemetry.
         request_sent = RequestSentQueue()
+
+        # The bind point for the builtin image-describe hook: every derivation's
+        # adapter config carries its ``describe`` sink (child sessions inherit
+        # it), and the adapter binds the session's SessionImageDescriber to it
+        # once constructed. See _image_read_hooks.
+        image_describer_port = ImageDescribePort()
 
         if require_api_key:
             config_orchestrator.config.require_active_provider_api_key()
@@ -1802,6 +1824,7 @@ class HarnessProcess:
                     skills=skills.model_payloads,
                     correlation_id_sink=correlation.record,
                     request_sent_sink=request_sent.record,
+                    image_describer=image_describer_port.describe,
                 ),
             )
 
@@ -1841,6 +1864,10 @@ class HarnessProcess:
         # subdirectory docs (see _agents_md_hooks). The handler is registered
         # Host-globally, so only the binding rides the session here.
         hooks = merge_agents_md_hook(hooks)
+        # Same pattern for the image-describe builtin: describes image files a
+        # blind active model reads with file_system.read_file (see
+        # _image_read_hooks).
+        hooks = merge_image_describe_hook(hooks)
         return UnifiedSessionContext(
             storage_root=self._unified_storage_root(config.session_logging),
             session_logging_enabled=config.session_logging.enabled,
@@ -1884,6 +1911,7 @@ class HarnessProcess:
             ),
             correlation=correlation,
             request_sent=request_sent,
+            image_describer_port=image_describer_port,
         )
 
     async def _build_session_config(self, options: SessionOptions) -> _SessionConfig:

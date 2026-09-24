@@ -124,6 +124,7 @@ from vibe.app_server._deferred_config import DeferredConfiguration
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
 from vibe.app_server._host import config_schema_response
 from vibe.app_server._identity import IdentityController, IdentityGateway
+from vibe.app_server._image_read_hooks import ImageDescribePort
 from vibe.app_server._mcp_auth import MCPAuthenticationService
 from vibe.app_server._model import ProtocolModel, validate_backend_wire, validate_wire
 from vibe.app_server._narration import NarrationContext, NarrationService
@@ -775,6 +776,10 @@ class UnifiedSessionContext:
     # (via ``request_sent_sink``); the adapter drains it on the app loop and
     # forwards ``vibe.request_sent``. Frozen field, mutable object.
     request_sent: RequestSentQueue = field(default_factory=RequestSentQueue)
+    # Bind point the adapter config's ``image_describer`` sink resolves through
+    # (see _image_read_hooks): built at context build, bound to the session's
+    # SessionImageDescriber by the adapter. Frozen field, mutable object.
+    image_describer_port: ImageDescribePort = field(default_factory=ImageDescribePort)
     # Fallback user_plan from the account ladder, used when the experiment manager
     # has no attribute snapshot (mirrors the legacy ``_user_plan`` field).
     user_plan_fallback: UserPlanFallback = field(default_factory=UserPlanFallback)
@@ -3785,6 +3790,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             session_id=lambda: self._session.session_id,
             record_event=self._telemetry.send_telemetry_event,
         )
+        # The adapter config's image_describer sink (inherited by child
+        # sessions) resolves through this port; the builtin image-describe
+        # hook reads image files through it (see _image_read_hooks).
+        self._context.image_describer_port.bind(self._image_describer)
         self._session_replaced = session_replaced
         self._teleport_active: str | None = None
         self._vibe_code: VibeCodeController | None = None
@@ -6388,6 +6397,9 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         if self._closed:
             return
         self._closed = True
+        # The context (and its port) can outlive the adapter's describer; an
+        # unbound port makes any late hook read pass through untouched.
+        self._context.image_describer_port.unbind()
         if self._vibe_code is not None:
             with contextlib.suppress(Exception):
                 await self._vibe_code.reset()
