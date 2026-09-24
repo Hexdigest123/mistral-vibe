@@ -935,7 +935,8 @@ Image attachments:
 
   macOS reads the pasteboard via `osascript` with a TIFF→PNG fallback via
   `sips`. Linux reads `image/png` from `wl-paste` (Wayland) or `xclip`
-  (X11); neither tool is bundled, so install `wl-clipboard` or `xclip`.
+  (X11), then falls back to GTK (PyGObject), which talks to Wayland and
+  X11 directly; without PyGObject, install `wl-clipboard` or `xclip`.
   On Windows the binding and the slash command are not registered at all,
   so the feature is invisible to users on that platform.
 - Rendered in the chat bubble as one dim `attached image:` footer line

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import datetime
+import importlib
 import os
 from pathlib import Path
 import platform
@@ -48,7 +49,10 @@ def _readers_for_platform() -> list[Callable[[], bytes | None]]:
     if system == "Darwin":
         return [_read_macos]
     if system == "Linux":
-        return [_read_wayland, _read_x11]
+        # GTK is the last resort: wl-clipboard and xclip miss fast and clean,
+        # but GDK talks to Wayland and X11 natively, covering desktops where
+        # neither tool is installed.
+        return [_read_wayland, _read_x11, _read_gtk]
     return []
 
 
@@ -80,6 +84,39 @@ def _read_x11() -> bytes | None:
     if result.returncode != 0:
         return None
     return result.stdout or None
+
+
+def _read_gtk() -> bytes | None:
+    # PyGObject is optional and absent on many installs, so it is imported
+    # lazily via importlib (never at module scope) and a missing GTK stack is
+    # a clean miss. GDK speaks Wayland and X11 directly, so this reaches the
+    # clipboard even without wl-clipboard or xclip installed.
+    try:
+        gi = importlib.import_module("gi")
+        gi.require_version("Gtk", "3.0")
+        repository = importlib.import_module("gi.repository")
+        gdk = repository.Gdk
+        gtk = repository.Gtk
+    except (ImportError, ValueError, AttributeError):
+        return None
+    try:
+        # init_check opens the default display without aborting on failure;
+        # PyGObject returns bool on modern versions, (bool, argv) on older.
+        initialized = gtk.init_check()
+        if isinstance(initialized, tuple):
+            initialized = initialized[0] if initialized else False
+        if not initialized:
+            return None  # headless: no display server to talk to
+        pixbuf = gtk.Clipboard.get(gdk.SELECTION_CLIPBOARD).wait_for_image()
+    except Exception:
+        # GLib surfaces headless and display-server failures as errors here.
+        return None
+    if pixbuf is None:
+        return None
+    saved = pixbuf.save_to_buffer("png")
+    if not saved or not saved[0] or not saved[1]:
+        return None
+    return bytes(saved[1]) or None
 
 
 def _read_macos() -> bytes | None:

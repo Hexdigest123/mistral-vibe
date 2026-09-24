@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Clipboard image paste (`Ctrl+V` and `/paste-image`) now works on Linux via `wl-paste` (Wayland) or `xclip` (X11), matching the existing macOS support, in both the Python TUI and the Rust CLI
+- The Python TUI's Linux clipboard image paste now also falls back to GTK (PyGObject) when `wl-clipboard` or `xclip` is not installed, covering desktops where GDK can reach Wayland or X11 directly
 
 ## [2.25.8] - 2026-09-23
 

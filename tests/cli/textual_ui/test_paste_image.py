@@ -4,7 +4,9 @@ import importlib
 from pathlib import Path
 import platform
 import subprocess
+import sys
 import tempfile
+import types
 from unittest.mock import patch
 
 import pytest
@@ -17,6 +19,7 @@ from vibe.cli.textual_ui.app import VibeApp
 from vibe.cli.textual_ui.widgets.chat_input import paste_image
 from vibe.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
 from vibe.cli.textual_ui.widgets.chat_input.paste_image import (
+    _read_gtk,
     _read_macos,
     _read_macos_class,
     _read_wayland,
@@ -201,6 +204,7 @@ def test_readers_for_platform_dispatches_linux(monkeypatch) -> None:
     assert paste_image._readers_for_platform() == [
         paste_image._read_wayland,
         paste_image._read_x11,
+        paste_image._read_gtk,
     ]
 
 
@@ -257,6 +261,125 @@ def test_read_x11_returns_none_when_clipboard_lacks_image(monkeypatch) -> None:
     monkeypatch.setattr(paste_image.shutil, "which", lambda _name: "/usr/bin/xclip")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: _completed(returncode=1))
     assert _read_x11() is None
+
+
+class _FakePixbuf:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def save_to_buffer(self, _format: str) -> tuple[bool, bytes]:
+        return True, self._data
+
+
+class _FakeClipboard:
+    def __init__(self, pixbuf: object | None) -> None:
+        self._pixbuf = pixbuf
+
+    def wait_for_image(self) -> object | None:
+        return self._pixbuf
+
+
+def _install_fake_gtk(
+    monkeypatch, *, init_check_result: object = True, pixbuf: object | None = None
+) -> list[str]:
+    calls: list[str] = []
+
+    gi = types.ModuleType("gi")
+
+    def require_version(namespace: str, version: str) -> None:
+        calls.append(f"require:{namespace}")
+        if namespace != "Gtk" or version != "3.0":
+            raise ValueError("unsupported version")
+
+    repository = types.ModuleType("gi.repository")
+
+    class _Gdk:
+        SELECTION_CLIPBOARD = object()
+
+    class _Clipboard:
+        @staticmethod
+        def get(selection: object) -> _FakeClipboard:
+            calls.append("clipboard_get")
+            assert selection is _Gdk.SELECTION_CLIPBOARD
+            return _FakeClipboard(pixbuf)
+
+    class _Gtk:
+        Clipboard = _Clipboard
+
+        @staticmethod
+        def init_check(*_args: object) -> object:
+            calls.append("init_check")
+            return init_check_result
+
+    monkeypatch.setattr(gi, "require_version", require_version, raising=False)
+    monkeypatch.setattr(repository, "Gdk", _Gdk, raising=False)
+    monkeypatch.setattr(repository, "Gtk", _Gtk, raising=False)
+    monkeypatch.setitem(sys.modules, "gi", gi)
+    monkeypatch.setitem(sys.modules, "gi.repository", repository)
+    return calls
+
+
+def test_read_gtk_returns_png_bytes_when_pixbuf_available(monkeypatch) -> None:
+    calls = _install_fake_gtk(monkeypatch, pixbuf=_FakePixbuf(_FAKE_PNG))
+    assert _read_gtk() == _FAKE_PNG
+    assert calls == ["require:Gtk", "init_check", "clipboard_get"]
+
+
+def test_read_gtk_returns_none_when_clipboard_lacks_image(monkeypatch) -> None:
+    calls = _install_fake_gtk(monkeypatch, pixbuf=None)
+    assert _read_gtk() is None
+    assert calls == ["require:Gtk", "init_check", "clipboard_get"]
+
+
+def test_read_gtk_returns_none_when_no_display(monkeypatch) -> None:
+    # init_check refusing must skip the clipboard query entirely.
+    calls = _install_fake_gtk(
+        monkeypatch, init_check_result=False, pixbuf=_FakePixbuf(_FAKE_PNG)
+    )
+    assert _read_gtk() is None
+    assert calls == ["require:Gtk", "init_check"]
+
+
+def test_read_gtk_tolerates_tuple_shaped_init_check(monkeypatch) -> None:
+    # Older PyGObject returns (bool, argv) from init_check instead of bool.
+    calls = _install_fake_gtk(
+        monkeypatch, init_check_result=(True, ["vibe"]), pixbuf=_FakePixbuf(_FAKE_PNG)
+    )
+    assert _read_gtk() == _FAKE_PNG
+    assert calls == ["require:Gtk", "init_check", "clipboard_get"]
+
+
+def test_read_gtk_returns_none_when_gi_missing(monkeypatch) -> None:
+    # sys.modules["gi"] = None makes import_module("gi") raise ImportError.
+    monkeypatch.setitem(sys.modules, "gi", None)
+    assert _read_gtk() is None
+
+
+def test_read_gtk_swallows_display_errors(monkeypatch) -> None:
+    gi = types.ModuleType("gi")
+    repository = types.ModuleType("gi.repository")
+
+    class _Gdk:
+        SELECTION_CLIPBOARD = object()
+
+    class _Clipboard:
+        @staticmethod
+        def get(_selection: object) -> _FakeClipboard:
+            raise RuntimeError("cannot open display")
+
+    class _Gtk:
+        Clipboard = _Clipboard
+
+        @staticmethod
+        def init_check(*_args: object) -> bool:
+            return True
+
+    monkeypatch.setattr(gi, "require_version", lambda *_args: None, raising=False)
+    monkeypatch.setattr(repository, "Gdk", _Gdk, raising=False)
+    monkeypatch.setattr(repository, "Gtk", _Gtk, raising=False)
+    monkeypatch.setitem(sys.modules, "gi", gi)
+    monkeypatch.setitem(sys.modules, "gi.repository", repository)
+    assert _read_gtk() is None
 
 
 def test_reader_timeout_is_swallowed(monkeypatch) -> None:
