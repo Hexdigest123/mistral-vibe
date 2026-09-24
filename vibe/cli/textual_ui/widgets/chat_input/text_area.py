@@ -15,7 +15,7 @@ from textual.widgets.text_area import Location, Selection, TextAreaTheme
 
 from vibe.cli.autocompletion.base import CompletionResult
 from vibe.cli.commands import CommandRegistry
-from vibe.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+from vibe.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
 from vibe.cli.input_modes import DEFAULT_MODE, InputMode
 from vibe.cli.textual_ui.external_editor import ExternalEditor
 from vibe.cli.textual_ui.widgets.chat_input.completion_manager import (
@@ -82,7 +82,7 @@ class ChatTextArea(TextArea):
                     priority=True,
                 )
             ]
-            if platform.system() == CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+            if platform.system() in CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
             else []
         ),
     ]

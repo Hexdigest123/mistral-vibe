@@ -1,5 +1,10 @@
 //! Clipboard images use Codex-style persistent temporary files and Python-style tokens.
 
+#[cfg(target_os = "linux")]
+use std::process::Command;
+
+#[cfg(target_os = "linux")]
+use vibe_rs::paste_image::linux::capture_with_timeout;
 use std::fs;
 use std::path::Path;
 
@@ -8,7 +13,6 @@ use vibe_rs::app::{App, Status};
 use vibe_rs::paste_image::{
     apply_event, insert_image_token, is_paste_image_key, write_clipboard_image, Event, PNG_MAGIC,
 };
-
 #[test]
 fn writes_a_unique_persistent_temp_png() {
     let path = write_clipboard_image(&[PNG_MAGIC, b"payload"].concat()).expect("write image");
@@ -87,6 +91,34 @@ fn clipboard_result_uses_the_current_model_capability() {
     apply_event(&mut starting, event());
 
     assert_eq!(starting.chat_input.input, "@/tmp/image.png ");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn capture_with_timeout_returns_stdout_on_success() {
+    let mut command = Command::new("printf");
+    command.arg("clipboard-bytes");
+
+    assert_eq!(
+        capture_with_timeout(&mut command).as_deref(),
+        Some(b"clipboard-bytes".as_slice())
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn capture_with_timeout_returns_none_on_failure() {
+    let mut command = Command::new("false");
+
+    assert!(capture_with_timeout(&mut command).is_none());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn capture_with_timeout_returns_none_when_tool_is_missing() {
+    let mut command = Command::new("vibe-nonexistent-clipboard-tool");
+
+    assert!(capture_with_timeout(&mut command).is_none());
 }
 
 #[test]

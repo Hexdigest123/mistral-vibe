@@ -268,9 +268,9 @@ class TestBuiltinSkillCommandDrift:
     @staticmethod
     def _all_aliases() -> set[str]:
         # Deliberately the unfiltered command table rather than a live registry:
-        # `/paste-image` is macOS-only and `/teleport` / `/remote-project` need
-        # Vibe Code, but the skill documents all three with their conditions, and
-        # the guard must hold on every platform.
+        # `/paste-image` is platform-gated (macOS and Linux) and `/teleport` /
+        # `/remote-project` need Vibe Code, but the skill documents all of them
+        # with their conditions, and the guard must hold on every platform.
         return {
             alias
             for command in CommandRegistry()._build_commands().values()  # pyright: ignore[reportPrivateUsage]

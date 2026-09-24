@@ -821,7 +821,7 @@ Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
 - `/whoami` - Display the Mistral signed-in user, workspace, and plan
 - `/copy` - Copy the last agent message to the clipboard
 - `/paste-image` - Paste an image from the OS clipboard into the prompt.
-  **macOS only** — the command is not registered on Linux or Windows.
+  **macOS and Linux only** — the command is not registered on Windows.
 - `/voice` - Configure voice settings
 - `/mcp` (or `/connectors`) - Display MCP servers and connector status. The
   browser opens on the first item; press Up or Left to move into the fuzzy-search
@@ -926,16 +926,18 @@ Image attachments:
   them), the input automatically prepends `@` and quotes paths containing
   spaces. This applies to text files, folders, and images; pasted prose,
   relative paths, and missing paths are left unchanged.
-- **Image copy/paste from the clipboard** (**macOS only** for now):
+- **Image copy/paste from the clipboard** (**macOS and Linux only** for now):
   writes the image to `<session_dir>/attachments/clipboard-<ts>.png`
   (or the system temp dir when no session is active) and inserts an
   `@<path>` token at the cursor. Two entry points:
   1. `Ctrl+V` keybinding inside the prompt.
   2. `/paste-image` slash command.
 
-  Uses `osascript` with a TIFF→PNG fallback via `sips`. On Linux and
-  Windows the binding and the slash command are not registered at all,
-  so the feature is invisible to users on those platforms.
+  macOS reads the pasteboard via `osascript` with a TIFF→PNG fallback via
+  `sips`. Linux reads `image/png` from `wl-paste` (Wayland) or `xclip`
+  (X11); neither tool is bundled, so install `wl-clipboard` or `xclip`.
+  On Windows the binding and the slash command are not registered at all,
+  so the feature is invisible to users on that platform.
 - Rendered in the chat bubble as one dim `attached image:` footer line
   per image, linking each attachment to its snapshot. Clicking opens the
   file with the OS default image viewer.

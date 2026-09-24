@@ -1,6 +1,7 @@
 # Local fork helpers: `make build` builds the PyInstaller standalone and offers to
-# install it as ~/.local/bin/vibes. The targets below cover vibe/cli-rust/; run
-# from this dir so `uv run vibe-app-server` resolves.
+# install it as ~/.local/bin/vibes; `make build-experimental` installs a wrapper
+# that injects --experimental-harness. The targets below cover vibe/cli-rust/;
+# run from this dir so `uv run vibe-app-server` resolves.
 M = --manifest-path vibe/cli-rust/Cargo.toml
 BIN = vibe/cli-rust/target/release/vibe-rs
 # Standalone CLI: PyInstaller onedir bundle, installed via a wrapper script.
@@ -31,7 +32,7 @@ QUIET ?=
 QUIET_FLAGS = $(if $(QUIET),-q,)
 CARGO_QUIET = $(if $(QUIET),-- --quiet,)
 
-.PHONY: start run build build_rs install build_test release fmt lint check clean sweep test test_rust test_golden store_golden profile-stress view-stress
+.PHONY: start run build build-experimental build_rs install build_test release fmt lint check clean sweep test test_rust test_golden store_golden profile-stress view-stress
 
 # The golden snapshot pytest run (Rust-only), shared by `test` and `test_golden`.
 GOLDEN_CMD = uv run --no-project --with "pyte==0.8.2" --with "rich==15.0.0" --with pytest --with pytest-timeout --with pytest-xdist \
@@ -54,22 +55,30 @@ run:            ## Debug build + run
 release:        ## Optimized build + run via cargo
 	cargo run $(M) --release --bin vibe-rs -- $(RUN_ARGS)
 
+# Extra args baked into the ~/.local/bin/vibes wrapper (build-experimental sets
+# --experimental-harness). Set from the goal's command line, so it propagates
+# through the build -> install sub-makes.
+VIBES_WRAPPER_ARGS ?=
+
 build:          ## PyInstaller standalone build, then offer to install it as ~/.local/bin/vibes
 	uv sync --no-dev --group build
-	$(PYINSTALLER) $(SPEC)
-	@printf 'Install this build as %s/vibes? [y/N] ' "$(LOCAL_BIN_DIR)"; \
+	$(PYINSTALLER) --noconfirm $(SPEC)
+	@printf 'Install this build as %s/vibes? [Y/n] ' "$(LOCAL_BIN_DIR)"; \
 	answer=; read -r answer < /dev/tty || true; \
 	case $$answer in \
-	y|Y|yes|YES) $(MAKE) --no-print-directory install ;; \
-	*) echo "Not installed. Binary left in $(DIST_DIR)/" ;; \
+	n|N|no|NO) echo "Not installed. Binary left in $(DIST_DIR)/" ;; \
+	*) $(MAKE) --no-print-directory install VIBES_WRAPPER_ARGS='$(VIBES_WRAPPER_ARGS)' ;; \
 	esac
+
+build-experimental: ## Like build, but the vibes wrapper injects --experimental-harness
+	$(MAKE) --no-print-directory build VIBES_WRAPPER_ARGS=--experimental-harness
 
 install:        ## Install the last PyInstaller build as ~/.local/bin/vibes
 	@test -x $(DIST_DIR)/vibe || { echo "$(DIST_DIR)/vibe missing; run make build first" >&2; exit 1; }
 	mkdir -p "$(LOCAL_BUNDLE_DIR)" "$(LOCAL_BIN_DIR)"
 	rm -rf "$(LOCAL_BUNDLE_DIR)"
 	cp -R $(DIST_DIR) "$(LOCAL_BUNDLE_DIR)"
-	printf '#!/bin/sh\nexec "%s/vibe" "$$@"\n' "$(LOCAL_BUNDLE_DIR)" > "$(LOCAL_BIN_DIR)/vibes"
+	printf '#!/bin/sh\nexec "%s/vibe" %s "$$@"\n' "$(LOCAL_BUNDLE_DIR)" "$(VIBES_WRAPPER_ARGS)" > "$(LOCAL_BIN_DIR)/vibes"
 	chmod +x "$(LOCAL_BIN_DIR)/vibes"
 	@echo "Installed: $(LOCAL_BIN_DIR)/vibes -> $(LOCAL_BUNDLE_DIR)/vibe"
 

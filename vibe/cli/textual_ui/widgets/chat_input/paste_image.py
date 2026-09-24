@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import datetime
+import os
 from pathlib import Path
 import platform
 import shutil
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from humanize import naturalsize
 
-from vibe.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+from vibe.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
 from vibe.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from vibe.observability.logging import logger
 from vibe.utils.images import MAX_IMAGE_BYTES
@@ -26,7 +27,7 @@ _MAX_SAME_SECOND_COLLISIONS = 1000
 
 
 def is_clipboard_image_paste_supported() -> bool:
-    return platform.system() == CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+    return platform.system() in CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEMS
 
 
 def read_clipboard_image() -> bytes | None:
@@ -43,9 +44,42 @@ def read_clipboard_image() -> bytes | None:
 
 
 def _readers_for_platform() -> list[Callable[[], bytes | None]]:
-    if platform.system() == CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM:
+    system = platform.system()
+    if system == "Darwin":
         return [_read_macos]
+    if system == "Linux":
+        return [_read_wayland, _read_x11]
     return []
+
+
+def _read_wayland() -> bytes | None:
+    # wl-clipboard's wl-paste exits nonzero when the clipboard does not
+    # offer the requested mime type, so a text-only clipboard is a clean miss.
+    if not os.environ.get("WAYLAND_DISPLAY") or shutil.which("wl-paste") is None:
+        return None
+    result = subprocess.run(
+        ["wl-paste", "-t", "image/png"],
+        capture_output=True,
+        timeout=_READ_TIMEOUT_S,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout or None
+
+
+def _read_x11() -> bytes | None:
+    if not os.environ.get("DISPLAY") or shutil.which("xclip") is None:
+        return None
+    result = subprocess.run(
+        ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+        capture_output=True,
+        timeout=_READ_TIMEOUT_S,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout or None
 
 
 def _read_macos() -> bytes | None:

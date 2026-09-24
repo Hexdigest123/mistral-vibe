@@ -19,6 +19,8 @@ from vibe.cli.textual_ui.widgets.chat_input.container import ChatInputContainer
 from vibe.cli.textual_ui.widgets.chat_input.paste_image import (
     _read_macos,
     _read_macos_class,
+    _read_wayland,
+    _read_x11,
     handle_clipboard_image_paste,
     read_clipboard_image,
     write_clipboard_image,
@@ -192,6 +194,69 @@ def test_macos_reader_falls_back_to_tiff_when_png_missing(monkeypatch) -> None:
     monkeypatch.setattr(subprocess, "run", fake_run)
     assert _read_macos() == _FAKE_PNG
     assert calls == ["PNGf", "TIFF", "sips"]
+
+
+def test_readers_for_platform_dispatches_linux(monkeypatch) -> None:
+    monkeypatch.setattr(paste_image.platform, "system", lambda: "Linux")
+    assert paste_image._readers_for_platform() == [
+        paste_image._read_wayland,
+        paste_image._read_x11,
+    ]
+
+
+def test_read_wayland_returns_png_bytes_when_wl_paste_succeeds(monkeypatch) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setattr(paste_image.shutil, "which", lambda _name: "/usr/bin/wl-paste")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _completed(stdout=_FAKE_PNG)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _read_wayland() == _FAKE_PNG
+    assert calls == [["wl-paste", "-t", "image/png"]]
+
+
+def test_read_wayland_returns_none_when_clipboard_lacks_image(monkeypatch) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setattr(paste_image.shutil, "which", lambda _name: "/usr/bin/wl-paste")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _completed(returncode=1))
+    assert _read_wayland() is None
+
+
+def test_linux_readers_skip_when_tool_unavailable(monkeypatch) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(paste_image.shutil, "which", lambda _name: None)
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError("reader must not spawn a subprocess")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+    assert _read_wayland() is None
+    assert _read_x11() is None
+
+
+def test_read_x11_returns_png_bytes_when_xclip_succeeds(monkeypatch) -> None:
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(paste_image.shutil, "which", lambda _name: "/usr/bin/xclip")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _completed(stdout=_FAKE_PNG)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert _read_x11() == _FAKE_PNG
+    assert calls == [["xclip", "-selection", "clipboard", "-t", "image/png", "-o"]]
+
+
+def test_read_x11_returns_none_when_clipboard_lacks_image(monkeypatch) -> None:
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(paste_image.shutil, "which", lambda _name: "/usr/bin/xclip")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _completed(returncode=1))
+    assert _read_x11() is None
 
 
 def test_reader_timeout_is_swallowed(monkeypatch) -> None:
@@ -415,15 +480,18 @@ async def test_handle_clipboard_image_paste_rejects_oversize(monkeypatch) -> Non
 def test_paste_image_slash_command_hidden_on_unsupported_platform(monkeypatch) -> None:
     from vibe.cli.commands import CommandRegistry
 
-    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("platform.system", lambda: "Windows")
     registry = CommandRegistry()
     assert not registry.has_command("paste-image")
 
 
-def test_paste_image_slash_command_available_on_darwin(monkeypatch) -> None:
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_paste_image_slash_command_available_on_supported_platforms(
+    monkeypatch, system: str
+) -> None:
     from vibe.cli.commands import CommandRegistry
 
-    monkeypatch.setattr("platform.system", lambda: "Darwin")
+    monkeypatch.setattr("platform.system", lambda: system)
     registry = CommandRegistry()
     assert registry.has_command("paste-image")
 
@@ -435,7 +503,7 @@ def test_ctrl_v_binding_absent_on_unsupported_platform(monkeypatch) -> None:
 
     from vibe.cli.textual_ui.widgets.chat_input import text_area as text_area_module
 
-    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("platform.system", lambda: "Windows")
     reloaded = importlib.reload(text_area_module)
     try:
         assert all(b.key != "ctrl+v" for b in reloaded.ChatTextArea.BINDINGS)
@@ -466,18 +534,19 @@ async def test_handle_clipboard_image_paste_is_silent_on_unsupported_platform(
 
 
 @pytest.mark.asyncio
-async def test_ctrl_v_keybinding_triggers_image_paste_with_notify_on_darwin(
-    monkeypatch,
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+async def test_ctrl_v_keybinding_triggers_image_paste_with_notify_on_supported_platforms(
+    monkeypatch, system: str
 ) -> None:
-    has_binding, posted = await _press_ctrl_v_under_platform(monkeypatch, "Darwin")
+    has_binding, posted = await _press_ctrl_v_under_platform(monkeypatch, system)
     assert has_binding
     assert len(posted) == 1
     assert posted[0].notify_when_empty is True
 
 
 @pytest.mark.asyncio
-async def test_ctrl_v_keybinding_does_not_paste_image_on_linux(monkeypatch) -> None:
-    has_binding, posted = await _press_ctrl_v_under_platform(monkeypatch, "Linux")
+async def test_ctrl_v_keybinding_does_not_paste_image_on_windows(monkeypatch) -> None:
+    has_binding, posted = await _press_ctrl_v_under_platform(monkeypatch, "Windows")
     assert not has_binding
     assert posted == []
 

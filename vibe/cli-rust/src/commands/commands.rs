@@ -60,14 +60,14 @@ const COMMANDS: &[Command] = &[
     ),
 ];
 
-/// `/paste-image`: only available on macOS, matching Python's `is_available`.
-#[cfg(target_os = "macos")]
+/// `/paste-image`: available on macOS and Linux, matching Python's `is_available`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PASTE_IMAGE: Option<Command> = Some(cmd(
     &["/paste-image"],
     "Paste an image from the OS clipboard into the prompt",
     true,
 ));
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const PASTE_IMAGE: Option<Command> = None;
 
 fn available() -> impl Iterator<Item = &'static Command> {
