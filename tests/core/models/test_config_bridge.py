@@ -85,6 +85,43 @@ async def test_refresh_with_no_targets_is_noop(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_refresh_targets_discover_only_providers_without_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``discover_only`` provider is queried even with no declared models."""
+    import tomli_w
+
+    from vibe.core.config.harness_files import HarnessFilesManager
+    from vibe.core.paths import VIBE_HOME
+
+    (VIBE_HOME.path / "config.toml").write_text(
+        tomli_w.dumps({"providers": [{**OPENROUTER_PROVIDER, "discover_only": True}]}),
+        encoding="utf-8",
+    )
+    manager = HarnessFilesManager(sources=("user", "project"))
+    orchestrator = await build_default_orchestrator(harness_files=manager)
+
+    async def fake_discover(provider):
+        from vibe.core.models.catalog import ModelCatalogResult
+
+        assert provider.name == "openrouter"
+        return ModelCatalogResult(
+            provider_name=provider.name,
+            endpoint="https://openrouter.ai/api/v1/models",
+            model_ids=["openai/gpt-4o-mini"],
+            fetched_at=1.0,
+        )
+
+    monkeypatch.setattr(
+        "vibe.core.models.config_bridge.discover_provider_models", fake_discover
+    )
+    report = await refresh_models(orchestrator, declared_aliases=set())
+    assert report.ok
+    await orchestrator.reload()
+    assert "openai/gpt-4o-mini" in orchestrator.config.models
+
+
+@pytest.mark.asyncio
 async def test_refresh_falls_back_to_cache_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

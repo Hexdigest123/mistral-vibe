@@ -2093,6 +2093,15 @@ NarratorStatus {
     color: $primary;
 }
 
+#modelpicker-search {
+    width: 100%;
+    height: auto;
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin-bottom: 0;
+}
+
 #modelpicker-options {
     width: 100%;
     max-height: 50vh;

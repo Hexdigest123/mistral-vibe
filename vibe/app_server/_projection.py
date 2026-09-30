@@ -183,6 +183,7 @@ def _project_model_config(model: ModelConfig) -> ModelConfigView:
         thinking=model.thinking,
         supports_images=model.supports_images,
         display_name=model.display_name or model.alias,
+        provider=model.provider,
     )
 
 

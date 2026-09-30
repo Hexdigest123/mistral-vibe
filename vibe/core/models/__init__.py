@@ -14,25 +14,25 @@ from vibe.core.models.catalog import (
 )
 from vibe.core.models.config_bridge import (
     CatalogRefreshReport,
+    discover_only_provider_names,
     load_cached_models,
     refresh_models,
     user_declared_model_aliases,
 )
 from vibe.core.models.discovery import (
-    MAX_DISCOVERED_MODELS_PER_PROVIDER,
     cached_provider_models,
     discover_provider_models,
     discovered_models_payload,
 )
 
 __all__ = [
-    "MAX_DISCOVERED_MODELS_PER_PROVIDER",
     "MODELS_CACHE_VERSION",
     "CatalogRefreshReport",
     "ModelCatalogCache",
     "ModelCatalogResult",
     "ProviderCatalogEntry",
     "cached_provider_models",
+    "discover_only_provider_names",
     "discover_provider_models",
     "discovered_models_payload",
     "fetch_provider_models",

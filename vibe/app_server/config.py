@@ -16,6 +16,8 @@ class ModelConfigView(ProtocolModel):
     thinking: ThinkingLevel
     supports_images: bool
     display_name: str
+    # Additive field (older harnesses omit it): shown by the model picker.
+    provider: str = ""
 
 
 class TranscribeModelConfigView(ProtocolModel):

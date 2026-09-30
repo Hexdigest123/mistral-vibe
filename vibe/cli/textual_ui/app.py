@@ -5185,7 +5185,11 @@ class VibeApp(App):  # noqa: PLR0904
             return
 
         models = [
-            ModelOption(alias=model.alias, display_name=model.display_name)
+            ModelOption(
+                alias=model.alias,
+                display_name=model.display_name,
+                provider=model.provider,
+            )
             for model in self.config.models
         ]
         await self._switch_from_input(

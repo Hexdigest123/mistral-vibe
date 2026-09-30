@@ -11,10 +11,6 @@ from vibe.core.models.catalog import (
 from vibe.observability.logging import logger
 from vibe.utils.api_keys import resolve_api_key
 
-# Discovery stays bounded even for providers with very wide catalogs: enough to
-# fill a picker, not enough to drown it or bloat the merged config.
-MAX_DISCOVERED_MODELS_PER_PROVIDER = 100
-
 
 def _model_payload(provider_name: str, model_id: str) -> dict[str, Any]:
     return {
@@ -31,7 +27,7 @@ def discovered_models_payload(result: ModelCatalogResult) -> dict[str, Any]:
         return {}
     models = {
         model_id: _model_payload(result.provider_name, model_id)
-        for model_id in result.model_ids[:MAX_DISCOVERED_MODELS_PER_PROVIDER]
+        for model_id in result.model_ids
     }
     return models
 

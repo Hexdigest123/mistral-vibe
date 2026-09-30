@@ -120,16 +120,17 @@ def fetch_result_ok(provider: str, model_ids: list[str]):
     )
 
 
-def test_discovered_models_payload_caps_entries() -> None:
+def test_discovered_models_payload_keeps_wide_catalogs() -> None:
     result = fetch_result_ok("openrouter", [f"m{i}" for i in range(300)])
     payload = discovered_models_payload(result)
-    assert len(payload) == 100
+    assert len(payload) == 300
     assert payload["m0"] == {
         "name": "m0",
         "provider": "openrouter",
         "alias": "m0",
         "display_name": None,
     }
+    assert payload["m299"]["alias"] == "m299"
 
 
 def test_discovered_models_payload_skips_failed_results() -> None:

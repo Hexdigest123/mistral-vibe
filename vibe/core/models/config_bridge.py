@@ -76,6 +76,11 @@ def _catalog_layer(
     return layer if isinstance(layer, ModelCatalogLayer) else None
 
 
+def discover_only_provider_names(config: VibeConfigSchema) -> set[str]:
+    """Names of providers flagged ``discover_only`` in the merged config."""
+    return {provider.name for provider in config.providers if provider.discover_only}
+
+
 def _discovery_targets(
     config: VibeConfigSchema, declared_aliases: set[str] | None = None
 ) -> list[Any]:
@@ -84,13 +89,16 @@ def _discovery_targets(
     With ``declared_aliases`` (the startup gate), only the providers of the
     user-declared [[model]] blocks are queried; a plain refresh covers every
     provider referenced by a configured model, so a catalog fetched once keeps
-    refreshing after the entry that introduced it is edited.
+    refreshing after the entry that introduced it is edited. Providers flagged
+    ``discover_only`` are always targets: their models exist only through
+    discovery, so no [[model]] block can gate them.
     """
     providers = {provider.name: provider for provider in config.providers}
+    names = discover_only_provider_names(config)
     models = list(config.models.values())
     if declared_aliases is not None:
         models = [m for m in models if m.alias in declared_aliases]
-    names = {model.provider for model in models}
+    names |= {model.provider for model in models}
     return [providers[name] for name in sorted(names) if name in providers]
 
 

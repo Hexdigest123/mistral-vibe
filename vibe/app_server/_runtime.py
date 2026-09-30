@@ -97,6 +97,7 @@ from vibe.core.experiments.models import EvalResponse
 from vibe.core.hooks.config import load_hooks_file, load_hooks_from_fs
 from vibe.core.hooks.models import HookConfigResult
 from vibe.core.models import (
+    discover_only_provider_names,
     load_cached_models,
     refresh_models,
     user_declared_model_aliases,
@@ -2787,16 +2788,18 @@ async def _start_model_catalog_sync(
     """Load the cached model catalog, then refresh it in the background.
 
     Only runs when a durable layer (user or project TOML) declares [[model]]
-    blocks: the default model set needs no discovery, and a session without
-    explicit models must not send requests to any endpoint. The background
-    fetch rewrites the cache and the catalog layer; the next config reload (or
-    the /models refresh command) picks the result up.
+    blocks, or when a provider is flagged ``discover_only``: the default model
+    set needs no discovery, and a session without explicit models must not send
+    requests to any endpoint. The background fetch rewrites the cache and the
+    catalog layer; the next config reload (or the /models refresh command)
+    picks the result up.
     """
     try:
         declared = await user_declared_model_aliases(config_orchestrator)
     except Exception:
         declared = set()
-    if not declared:
+    discover_only = discover_only_provider_names(config_orchestrator.config)
+    if not declared and not discover_only:
         return
     load_cached_models(config_orchestrator, declared_aliases=declared)
 

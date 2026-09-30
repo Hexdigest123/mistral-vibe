@@ -19,6 +19,7 @@ from vibe.cli.textual_ui.widgets.context_progress import ContextProgress
 from vibe.cli.textual_ui.widgets.messages import ErrorMessage
 from vibe.cli.textual_ui.widgets.model_picker import ModelPickerApp
 from vibe.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
+from vibe.cli.textual_ui.widgets.vscode_compat import VscodeCompatInput
 from vibe.core.config import ModelConfig
 
 
@@ -42,12 +43,12 @@ def _make_unpinned_config(**kwargs):
 
 
 async def _open_model_picker(pilot, app) -> ModelPickerApp:
-    # The picker focuses its option list from a deferred callback, so a key press
-    # sent before that lands would reach the chat input instead.
+    # The picker focuses its search input from a deferred callback, so a key
+    # press sent before that lands would reach the chat input instead.
     await app._show_model()
     await wait_until(pilot, lambda: bool(app.query(ModelPickerApp)))
     picker = app.query_one(ModelPickerApp)
-    await wait_until(pilot, lambda: picker.query_one(OptionList).has_focus)
+    await wait_until(pilot, lambda: picker.query_one(VscodeCompatInput).has_focus)
     return picker
 
 
@@ -121,6 +122,72 @@ async def test_model_picker_shows_display_name_but_persists_alias() -> None:
         await wait_until(pilot, lambda: app.config.active_model.alias == "glm-5-2")
 
         assert app.config.active_model.alias == "glm-5-2"
+
+
+@pytest.mark.asyncio
+async def test_model_picker_search_filters_and_selects_match() -> None:
+    """Typing narrows the rows to fuzzy matches; Enter picks the top match."""
+    app = build_test_vibe_app(config=_make_config_with_models())
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await _open_model_picker(pilot, app)
+
+        picker = app.query_one(ModelPickerApp)
+        for key in "beta":
+            await pilot.press(key)
+        await pilot.pause(0.1)
+
+        option_list = picker.query_one(OptionList)
+        assert option_list.option_count == 1
+        assert option_list.get_option_at_index(0).id == "beta"
+
+        await pilot.press("enter")
+        await wait_until(pilot, lambda: app.config.active_model.alias == "beta")
+
+        assert app._current_bottom_app == BottomApp.Input
+
+
+@pytest.mark.asyncio
+async def test_model_picker_search_matches_provider() -> None:
+    """The query matches against the provider, not just the model name."""
+    models = [
+        ModelConfig(name="model-a", provider="mistral", alias="alpha"),
+        ModelConfig(name="model-b", provider="llamacpp", alias="beta"),
+    ]
+    config = build_test_vibe_config(models=models, active_model="alpha")
+    app = build_test_vibe_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await _open_model_picker(pilot, app)
+
+        picker = app.query_one(ModelPickerApp)
+        for key in "llamacpp":
+            await pilot.press(key)
+        await pilot.pause(0.1)
+
+        option_list = picker.query_one(OptionList)
+        assert option_list.option_count == 1
+        assert option_list.get_option_at_index(0).id == "beta"
+
+
+@pytest.mark.asyncio
+async def test_model_picker_rows_show_provider() -> None:
+    """Each row labels the model with the provider it comes from."""
+    models = [
+        ModelConfig(name="model-a", provider="mistral", alias="alpha"),
+        ModelConfig(name="model-b", provider="llamacpp", alias="beta"),
+    ]
+    config = build_test_vibe_config(models=models, active_model="alpha")
+    app = build_test_vibe_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await _open_model_picker(pilot, app)
+
+        picker = app.query_one(ModelPickerApp)
+        option_list = picker.query_one(OptionList)
+        prompts = [str(option.prompt) for option in option_list.options]
+        assert "mistral" in prompts[1]
+        assert "llamacpp" in prompts[2]
 
 
 @pytest.mark.asyncio
