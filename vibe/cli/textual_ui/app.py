@@ -110,6 +110,7 @@ from vibe.app_server.protocol import (
     AppServerResponseError,
     ConfigReadResponse,
     ConfigWriteOpWire,
+    ModelsRefreshResponse,
     ProtocolError,
     ProtocolErrorCode,
     RuntimeMutationStatus,
@@ -4314,6 +4315,52 @@ class VibeApp(App):  # noqa: PLR0904
         if self._current_bottom_app == BottomApp.ModelPicker:
             return
         await self._switch_to_model_picker_app()
+
+    async def _models_command(self, cmd_args: str = "", **kwargs: Any) -> None:
+        """Handle /models: refresh the auto-discovered model catalog."""
+        subcommand = cmd_args.strip().lower()
+        if subcommand != "refresh":
+            usage = "Usage: /models refresh"
+            if subcommand:
+                await self._mount_and_scroll(
+                    ErrorMessage(
+                        f"Unknown /models subcommand: {subcommand.strip()}. {usage}",
+                        collapsed=self._tools_collapsed,
+                    )
+                )
+            else:
+                await self._mount_and_scroll(UserCommandMessage(usage))
+            return
+        await self._ensure_loading_widget("Refreshing model catalog", show_hint=False)
+        try:
+            response = await self.app_server.resources.config.refresh_models()
+        except AppServerResponseError as exc:
+            await self._remove_loading_widget()
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Model catalog refresh failed. {exc}",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+        await self._remove_loading_widget()
+        await self._apply_config_to_ui()
+        await self._mount_and_scroll(
+            UserCommandMessage(self._format_models_refresh_response(response))
+        )
+
+    def _format_models_refresh_response(self, response: ModelsRefreshResponse) -> str:
+        if not response.entries and not response.errors:
+            return (
+                "No model discovery targets. Declare a [[model]] block in "
+                "config.toml to enable catalog auto-discovery."
+            )
+        lines = [f"Model catalog refreshed: {response.total_models} models found."]
+        for entry in response.entries:
+            lines.append(f"- {entry.provider_name} ({entry.endpoint})")
+        for error in response.errors:
+            lines.append(f"- {error}")
+        return "\n".join(lines)
 
     async def _show_thinking(self, **kwargs: Any) -> None:
         """Switch to the thinking level picker in the bottom panel."""

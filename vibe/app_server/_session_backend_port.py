@@ -33,6 +33,8 @@ from vibe.app_server.protocol import (
     ContextInjectResponse,
     EmptyResponse,
     ModelConfigWriteParams,
+    ModelsRefreshParams,
+    ModelsRefreshResponse,
     ProtocolErrorCode,
     RuntimeMutationResponse,
     RuntimeUpdatedParams,
@@ -419,6 +421,9 @@ class SessionBackend(Protocol):
     async def reload_config(
         self, params: ConfigReloadParams
     ) -> SessionBackendResult[ConfigMutationResponse]: ...
+    async def refresh_models_catalog(
+        self, params: ModelsRefreshParams
+    ) -> SessionBackendResult[ModelsRefreshResponse]: ...
 
     async def start_turn(
         self, params: TurnStartParams

@@ -98,7 +98,10 @@ from vibe.app_server.protocol import (
     LoopsDeleteResponse,
     LoopsListParams,
     LoopsListResponse,
+    ModelCatalogEntryView,
     ModelConfigWriteParams,
+    ModelsRefreshParams,
+    ModelsRefreshResponse,
     NarrationSummarizeParams,
     NarrationSummarizeResponse,
     ProtocolErrorCode,
@@ -123,6 +126,7 @@ from vibe.core.feedback import (
 )
 from vibe.core.log_reader import LogReader
 from vibe.core.loop import LoopError, LoopManager
+from vibe.core.models import refresh_models
 from vibe.core.proxy_setup import (
     SUPPORTED_PROXY_VARS,
     ProxySetupError,
@@ -239,6 +243,8 @@ class ResourceRequestHandler:
                 result = await self._dispatch_connectors(method, raw_params)
             case "loops":
                 result = await self._dispatch_loops(method, raw_params)
+            case "models":
+                result = await self._dispatch_models(method, raw_params)
             case "narration":
                 result = await self._dispatch_narration(method, raw_params)
             case "telemetry" | "feedback":
@@ -376,6 +382,16 @@ class ResourceRequestHandler:
             case _:
                 raise method_not_found(method)
         return DispatchResult(response, runtime_updated=runtime_updated)
+
+    async def _dispatch_models(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult:
+        if method != "models/refresh":
+            raise method_not_found(method)
+        response = await self._models_refresh(
+            validate_wire(ModelsRefreshParams, raw_params)
+        )
+        return DispatchResult(response, runtime_updated=True)
 
     async def _dispatch_narration(
         self, method: str, raw_params: dict[str, Any]
@@ -666,6 +682,32 @@ class ResourceRequestHandler:
         else:
             await self._agent_loop.refresh_config()
         return self._config_mutation_response()
+
+    async def _models_refresh(
+        self, params: ModelsRefreshParams
+    ) -> ModelsRefreshResponse:
+        """Re-run model auto-discovery and fold the result into the config."""
+        self._execution.require_idle()
+        self._require_session(params.session_id)
+        report = await refresh_models(self._agent_loop.config_orchestrator)
+        await self._agent_loop.config_orchestrator.reload()
+        await self._agent_loop.refresh_config()
+        return ModelsRefreshResponse(
+            entries=[
+                ModelCatalogEntryView(
+                    provider_name=result.provider_name,
+                    endpoint=result.endpoint,
+                    model_ids=list(result.model_ids),
+                )
+                for result in report.results
+            ],
+            total_models=report.total_models,
+            errors=[
+                f"{result.provider_name}: {result.error}"
+                for result in report.results
+                if not result.ok
+            ],
+        )
 
     async def apply_admin_config(self) -> bool:
         """Pull org-enforced config and merge it as the highest-priority layer.

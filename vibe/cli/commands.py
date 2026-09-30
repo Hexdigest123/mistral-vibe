@@ -56,6 +56,11 @@ class CommandRegistry:
                 description="Select active model",
                 handler="_show_model",
             ),
+            "models": Command(
+                aliases=frozenset(["/models"]),
+                description=("Model catalog auto-discovery. Subcommand: refresh"),
+                handler="_models_command",
+            ),
             "skills": Command(
                 aliases=frozenset(["/skills"]),
                 description="Browse, import, and manage skills",

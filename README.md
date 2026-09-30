@@ -363,6 +363,19 @@ Use `/mcp` or `/connectors` to browse configured MCP servers and workspace
 connectors. The browser starts on the first item; press Up or Left to focus its
 fuzzy search bar, then Up again to wrap to the last item.
 
+#### Model Auto-Discovery
+
+When your `config.toml` declares a `[[model]]` block, Vibe auto-discovers the
+provider's catalog: it fetches the OpenAI-compatible `/models` endpoint of the
+provider that model references (for example
+`https://openrouter.ai/api/v1/models` for an OpenRouter provider) and merges the
+listed model ids into the model picker. The catalog is persisted to
+`~/.vibe/model_catalog_cache.json` and loaded from disk at startup, so no
+network request blocks the session; a fresh fetch runs in the background once
+per session. Explicit `[[model]]` entries always win over discovered ids, and
+discovery never runs without a declared `[[model]]` block. When the catalog is
+outdated, run `/models refresh` to re-fetch it and see the per-provider result.
+
 ### Custom Slash Commands via Skills
 
 You can define your own slash commands through the skills system. Skills are reusable components that extend Vibe's functionality.

@@ -96,6 +96,11 @@ from vibe.core.experiments.manager import (
 from vibe.core.experiments.models import EvalResponse
 from vibe.core.hooks.config import load_hooks_file, load_hooks_from_fs
 from vibe.core.hooks.models import HookConfigResult
+from vibe.core.models import (
+    load_cached_models,
+    refresh_models,
+    user_declared_model_aliases,
+)
 from vibe.core.paths import VIBE_HOME, WORKTREES_DIR, dedup_paths
 from vibe.core.session import last_session_pointer
 from vibe.core.session.session_id import extract_suffix, generate_session_id
@@ -1936,6 +1941,12 @@ class HarnessProcess:
             overrides, harness_files=harness_files
         )
         await _apply_cached_experiment_variants(config_orchestrator)
+        # Model auto-discovery: when a durable layer declares [[model]] blocks,
+        # the providers they reference are queried for their /models catalog.
+        # The on-disk cache is loaded synchronously (cheap) so the first render
+        # already shows discovered models; a fresh fetch runs in the background
+        # and lands as a config change when it finds anything new.
+        await _start_model_catalog_sync(config_orchestrator)
         # Every session crosses this config build, and the unified harness
         # never constructs the legacy agent loop, so the sweep starts here.
         start_restrict_session_log_permissions(
@@ -2763,6 +2774,42 @@ async def _apply_cached_experiment_variants(
     if isinstance(layer, GrowthbookLayer):
         layer.set_variants(variants)
         await config_orchestrator.reload()
+
+
+# Background catalog-refresh tasks hold their own references so a fire-and-forget
+# task is never garbage-collected mid-flight.
+_MODEL_CATALOG_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def _start_model_catalog_sync(
+    config_orchestrator: ConfigOrchestrator[VibeConfigSchema],
+) -> None:
+    """Load the cached model catalog, then refresh it in the background.
+
+    Only runs when a durable layer (user or project TOML) declares [[model]]
+    blocks: the default model set needs no discovery, and a session without
+    explicit models must not send requests to any endpoint. The background
+    fetch rewrites the cache and the catalog layer; the next config reload (or
+    the /models refresh command) picks the result up.
+    """
+    try:
+        declared = await user_declared_model_aliases(config_orchestrator)
+    except Exception:
+        declared = set()
+    if not declared:
+        return
+    load_cached_models(config_orchestrator, declared_aliases=declared)
+
+    async def _refresh() -> None:
+        try:
+            await refresh_models(config_orchestrator, declared_aliases=declared)
+            await config_orchestrator.reload()
+        except Exception as exc:
+            logger.debug("Model catalog background refresh failed", exc_info=exc)
+
+    task = asyncio.create_task(_refresh(), name="vibe-model-catalog-refresh")
+    _MODEL_CATALOG_TASKS.add(task)
+    task.add_done_callback(_MODEL_CATALOG_TASKS.discard)
 
 
 def _session_config_overrides(options: SessionOptions) -> dict[str, object]:

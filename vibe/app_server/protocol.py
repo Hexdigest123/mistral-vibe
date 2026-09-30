@@ -147,6 +147,7 @@ SERVER_METHODS: tuple[str, ...] = (
     "mcp_catalog/refresh",
     "mcp_catalog/remove",
     "mcp_catalog/toggle",
+    "models/refresh",
     "narration/summarize",
     "plugin/info",
     "plugin/reload",
@@ -770,6 +771,30 @@ class ConfigSchemaReadResponse(ProtocolModel):
 class ConfigReloadParams(ProtocolModel):
     session_id: str
     reload_runtime: bool = True
+
+
+class ModelCatalogEntryView(ProtocolModel):
+    provider_name: str
+    endpoint: str
+    model_ids: list[str]
+
+
+class ModelsRefreshParams(ProtocolModel):
+    session_id: str
+
+
+class ModelsRefreshResponse(ProtocolModel):
+    """Result of one model-catalog discovery pass.
+
+    ``entries`` carries what each provider served; a provider that could not
+    be reached contributes no entry, with the reason in ``errors``. The merged
+    result rides the runtime update the dispatch emits, so the client renders
+    the discovered models immediately.
+    """
+
+    entries: list[ModelCatalogEntryView]
+    total_models: int = 0
+    errors: list[str] = Field(default_factory=list)
 
 
 class ConfigProxyReadParams(ProtocolModel):
