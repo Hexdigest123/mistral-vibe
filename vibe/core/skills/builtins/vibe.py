@@ -855,8 +855,8 @@ already starts a child that inherits the parent's prompt and tools.
 - `/model` - Select active model from a fuzzy-search picker: type to filter
   over model name, alias, and provider (fzf-style, best matches first), arrows
   to move, Enter to select. Each row shows the provider the model comes from.
-- `/models refresh` - Re-run model auto-discovery: fetch the provider's
-  `/models` endpoint for every provider referenced by a `[[model]]` block in
+- `/model refresh` - Re-run model auto-discovery: fetch each provider's
+  OpenAI-compatible models endpoint for every provider referenced by a `[[model]]` block in
   config.toml plus every provider flagged `discover_only = true`, persist the
   catalog to `~/.vibe/model_catalog_cache.json`, and merge all discovered ids
   into the model picker. Startup loads the cache without network traffic and

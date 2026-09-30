@@ -2791,7 +2791,7 @@ async def _start_model_catalog_sync(
     blocks, or when a provider is flagged ``discover_only``: the default model
     set needs no discovery, and a session without explicit models must not send
     requests to any endpoint. The background fetch rewrites the cache and the
-    catalog layer; the next config reload (or the /models refresh command)
+    catalog layer; the next config reload (or the /model refresh command)
     picks the result up.
     """
     try:

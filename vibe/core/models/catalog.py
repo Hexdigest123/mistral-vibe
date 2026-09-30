@@ -131,7 +131,7 @@ async def fetch_provider_models(
     """Fetch ``/models`` from an OpenAI-compatible endpoint.
 
     Any failure is returned as ``error`` on the result rather than raised, so
-    discovery never breaks startup or the ``/models refresh`` command.
+    discovery never breaks startup or the ``/model refresh`` command.
     """
     endpoint = models_endpoint(api_base)
     headers = dict(extra_headers or {})

@@ -376,7 +376,7 @@ per session. Explicit `[[model]]` entries always win over discovered ids, and
 discovery never runs without a declared `[[model]]` block. A provider flagged
 `discover_only = true` is also a discovery target: its catalog is fetched even
 when no `[[model]]` block names it, so standalone providers need no hand-written
-model entries. When the catalog is outdated, run `/models refresh` to re-fetch
+model entries. When the catalog is outdated, run `/model refresh` to re-fetch
 it and see the per-provider result.
 
 ### Custom Slash Commands via Skills

@@ -1132,11 +1132,6 @@ class VibeApp(App):  # noqa: PLR0904
                     else (init.hooks_count if init else 0)
                 ),
                 model_pending=self._model_pending() if has_session else False,
-                experimental_harness=(
-                    self.app_server.resources.runtime.experimental_harness
-                    if has_session
-                    else False
-                ),
             )
             yield self._banner
             yield VerticalGroup(id="messages")
@@ -1681,20 +1676,6 @@ class VibeApp(App):  # noqa: PLR0904
         self._show_mcp_discovery_failures()
         await self._show_mcp_auth_required_notice()
         await self._show_skill_updates_notice()
-        await self._show_unified_harness_notice()
-
-    async def _show_unified_harness_notice(self) -> None:
-        """Warn the user when the session is running on the Unified Harness."""
-        if not self.app_server.resources.runtime.experimental_harness:
-            return
-        message = (
-            "You are using our new unified harness. "
-            "If you encounter issues, restart with --legacy-harness."
-        )
-        try:
-            await self._mount_and_scroll(WarningMessage(message, show_border=False))
-        except Exception:
-            self.notify(message, severity="warning", markup=False, timeout=10)
 
     def _is_cold_start(self) -> bool | None:
         """True if this process paid first-run startup cost (cold), False if it
@@ -4310,27 +4291,27 @@ class VibeApp(App):  # noqa: PLR0904
             )
         await self._reload_config()
 
-    async def _show_model(self, **kwargs: Any) -> None:
-        """Switch to the model picker in the bottom panel."""
+    async def _show_model(self, cmd_args: str = "", **kwargs: Any) -> None:
+        """Handle /model: open the picker, or refresh the catalog on refresh."""
+        subcommand = cmd_args.strip().lower()
+        if subcommand == "refresh":
+            await self._refresh_model_catalog()
+            return
+        if subcommand:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Unknown /model subcommand: {subcommand.strip()}. "
+                    "Usage: /model [refresh]",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
         if self._current_bottom_app == BottomApp.ModelPicker:
             return
         await self._switch_to_model_picker_app()
 
-    async def _models_command(self, cmd_args: str = "", **kwargs: Any) -> None:
-        """Handle /models: refresh the auto-discovered model catalog."""
-        subcommand = cmd_args.strip().lower()
-        if subcommand != "refresh":
-            usage = "Usage: /models refresh"
-            if subcommand:
-                await self._mount_and_scroll(
-                    ErrorMessage(
-                        f"Unknown /models subcommand: {subcommand.strip()}. {usage}",
-                        collapsed=self._tools_collapsed,
-                    )
-                )
-            else:
-                await self._mount_and_scroll(UserCommandMessage(usage))
-            return
+    async def _refresh_model_catalog(self) -> None:
+        """Refresh the auto-discovered model catalog."""
         await self._ensure_loading_widget("Refreshing model catalog", show_hint=False)
         try:
             response = await self.app_server.resources.config.refresh_models()
@@ -4831,7 +4812,6 @@ class VibeApp(App):  # noqa: PLR0904
                 hooks_count=self.app_server.resources.runtime.hooks_count,
                 plan_description=plan_title(self.app_server.resources.account.current),
                 model_pending=self._model_pending(),
-                experimental_harness=self.app_server.resources.runtime.experimental_harness,
             )
         self._show_config_issues()
 
@@ -6064,7 +6044,6 @@ class VibeApp(App):  # noqa: PLR0904
                 hooks_count=self.app_server.resources.runtime.hooks_count,
                 plan_description=plan_title(self.app_server.resources.account.current),
                 model_pending=self._model_pending(),
-                experimental_harness=self.app_server.resources.runtime.experimental_harness,
             )
 
     def _update_profile_widgets(self, profile: AgentSummary) -> None:

@@ -14,23 +14,29 @@ from vibe.app_server.protocol import (
 )
 from vibe.cli.commands import CommandRegistry
 from vibe.cli.textual_ui.widgets.messages import ErrorMessage, UserCommandMessage
+from vibe.cli.textual_ui.widgets.model_picker import ModelPickerApp
 from vibe.core.config import ModelConfig
 
 
-def test_models_command_is_registered() -> None:
+def test_model_command_is_registered() -> None:
     registry = CommandRegistry()
-    assert registry.get_command_name("/models") == "models"
-    command = registry.get("models")
+    assert registry.get_command_name("/model") == "model"
+    command = registry.get("model")
     assert command is not None
-    assert command.handler == "_models_command"
+    assert command.handler == "_show_model"
 
 
-def test_models_command_parses_refresh_argument() -> None:
+def test_models_command_is_removed() -> None:
     registry = CommandRegistry()
-    parsed = registry.parse_command("/models refresh")
+    assert registry.get_command_name("/models") is None
+
+
+def test_model_command_parses_refresh_argument() -> None:
+    registry = CommandRegistry()
+    parsed = registry.parse_command("/model refresh")
     assert parsed is not None
     cmd_name, _command, cmd_args = parsed
-    assert cmd_name == "models"
+    assert cmd_name == "model"
     assert cmd_args == "refresh"
 
 
@@ -62,12 +68,12 @@ def _mock_refresh(app, response: ModelsRefreshResponse | None = None) -> AsyncMo
 
 
 @pytest.mark.asyncio
-async def test_models_refresh_reports_discovered_models() -> None:
+async def test_model_refresh_reports_discovered_models() -> None:
     app = _app()
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
         mock = _mock_refresh(app, _ok_response())
-        await app._models_command(cmd_args="refresh")
+        await app._show_model(cmd_args="refresh")
         await wait_until(
             pilot,
             lambda: any(
@@ -80,33 +86,27 @@ async def test_models_refresh_reports_discovered_models() -> None:
 
 
 @pytest.mark.asyncio
-async def test_models_without_subcommand_shows_usage() -> None:
+async def test_model_without_subcommand_opens_picker() -> None:
     app = _app()
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
         mock = _mock_refresh(app, _ok_response())
-        await app._models_command(cmd_args="")
-        await wait_until(
-            pilot,
-            lambda: any(
-                "Usage: /models refresh" in str(m.render())
-                for m in app.query(UserCommandMessage)
-            ),
-        )
+        await app._show_model()
+        await wait_until(pilot, lambda: bool(app.query(ModelPickerApp)))
         mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_models_unknown_subcommand_shows_error() -> None:
+async def test_model_unknown_subcommand_shows_error() -> None:
     app = _app()
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
         mock = _mock_refresh(app, _ok_response())
-        await app._models_command(cmd_args="bogus")
+        await app._show_model(cmd_args="bogus")
         await wait_until(
             pilot,
             lambda: any(
-                "Unknown /models subcommand" in str(m.render())
+                "Unknown /model subcommand" in str(m.render())
                 for m in app.query(ErrorMessage)
             ),
         )
@@ -114,7 +114,7 @@ async def test_models_unknown_subcommand_shows_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_models_refresh_failure_shows_error() -> None:
+async def test_model_refresh_failure_shows_error() -> None:
     app = _app()
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
@@ -124,7 +124,7 @@ async def test_models_refresh_failure_shows_error() -> None:
             )
         )
         app.app_server.resources.config.refresh_models = mock
-        await app._models_command(cmd_args="refresh")
+        await app._show_model(cmd_args="refresh")
         await wait_until(
             pilot,
             lambda: any(
@@ -134,12 +134,12 @@ async def test_models_refresh_failure_shows_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_models_refresh_without_targets_hints_at_model_blocks() -> None:
+async def test_model_refresh_without_targets_hints_at_model_blocks() -> None:
     app = _app()
     async with app.run_test() as pilot:
         await pilot.pause(0.1)
         _mock_refresh(app, ModelsRefreshResponse(entries=[], total_models=0))
-        await app._models_command(cmd_args="refresh")
+        await app._show_model(cmd_args="refresh")
         await wait_until(
             pilot,
             lambda: any(

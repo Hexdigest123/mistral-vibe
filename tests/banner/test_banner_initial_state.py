@@ -115,16 +115,7 @@ class TestBannerInitialState:
     def test_banner_hides_harness_label_by_default(self) -> None:
         banner = Banner(config=_make_config(), skills_count=0)
 
-        assert banner._initial_state.experimental_harness is False
         assert "harness" not in banner._initial_state.active_model
-
-    def test_banner_shows_unified_harness_when_unified(self) -> None:
-        banner = Banner(
-            config=_make_config(), skills_count=0, experimental_harness=True
-        )
-
-        assert banner._initial_state.experimental_harness is True
-        assert " · unified harness" in banner._initial_state.active_model
 
     def test_format_meta_counts_includes_connectors(self) -> None:
         banner = Banner(config=_make_config(), skills_count=0)

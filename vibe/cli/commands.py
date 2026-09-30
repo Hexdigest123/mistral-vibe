@@ -53,13 +53,11 @@ class CommandRegistry:
             ),
             "model": Command(
                 aliases=frozenset(["/model"]),
-                description="Select active model",
+                description=(
+                    "Select active model. Subcommand: refresh (re-run model "
+                    "auto-discovery)"
+                ),
                 handler="_show_model",
-            ),
-            "models": Command(
-                aliases=frozenset(["/models"]),
-                description=("Model catalog auto-discovery. Subcommand: refresh"),
-                handler="_models_command",
             ),
             "skills": Command(
                 aliases=frozenset(["/skills"]),
