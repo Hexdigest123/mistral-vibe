@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -53,6 +54,27 @@ def _build_option_text(label: str, is_current: bool, *, hint: str = "") -> Text:
     if hint:
         text.append(f"  {hint}", style="dim")
     return text
+
+
+class ModelPickerSearchInput(VscodeCompatInput):
+    """Picker search input that steers arrows straight to the results list.
+
+    Up/down are handled on the focused widget itself: the key event never has
+    to bubble to an ancestor, so navigation cannot be swallowed along the way.
+    """
+
+    def __init__(self, *, on_navigate: Callable[[int], None], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._on_navigate = on_navigate
+
+    async def _on_key(self, event: events.Key) -> None:
+        delta = {"up": -1, "down": 1}.get(event.key)
+        if delta is None:
+            await super()._on_key(event)
+            return
+        self._on_navigate(delta)
+        event.stop()
+        event.prevent_default()
 
 
 class ModelPickerApp(Container):
@@ -135,8 +157,11 @@ class ModelPickerApp(Container):
     def compose(self) -> ComposeResult:
         with Vertical(id="modelpicker-content"):
             yield NoMarkupStatic("Select Model", classes="modelpicker-title")
-            yield VscodeCompatInput(
-                placeholder="Search models...", id="modelpicker-search", compact=True
+            yield ModelPickerSearchInput(
+                on_navigate=self._move_highlight,
+                placeholder="Search models...",
+                id="modelpicker-search",
+                compact=True,
             )
             yield NavigableOptionList(
                 *map(self._option, self._entries_for_query("")),
@@ -160,7 +185,7 @@ class ModelPickerApp(Container):
                     highlighted = index
                     break
         option_list.highlighted = highlighted
-        self.query_one(VscodeCompatInput).focus()
+        self.query_one(ModelPickerSearchInput).focus()
 
     def on_input_changed(self, event: VscodeCompatInput.Changed) -> None:
         if event.input.id != "modelpicker-search":
@@ -170,20 +195,6 @@ class ModelPickerApp(Container):
 
     def on_input_submitted(self, _event: VscodeCompatInput.Submitted) -> None:
         self.action_select()
-
-    def on_key(self, event: events.Key) -> None:
-        """Steer navigation from the search input, fzf-style, keeping focus."""
-        if not isinstance(self.screen.focused, VscodeCompatInput):
-            return
-        match event.key:
-            case "up":
-                self._move_highlight(-1)
-            case "down":
-                self._move_highlight(1)
-            case _:
-                return
-        event.prevent_default()
-        event.stop()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if not event.option.id:

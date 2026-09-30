@@ -238,6 +238,42 @@ async def test_model_picker_select_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_model_picker_arrow_selects_non_top_match() -> None:
+    # Arrows must move the highlight off the top row of a multi-match query,
+    # and Enter must persist the highlighted row, not the top match.
+    models = [
+        ModelConfig(name="kimi-k3", provider="moonshot", alias="kimi-k3"),
+        ModelConfig(name="kimi-k3:batch", provider="moonshot", alias="kimi-k3:batch"),
+        ModelConfig(name="kimi-k3-flash", provider="moonshot", alias="kimi-k3-flash"),
+    ]
+    config = build_test_vibe_config(models=models, active_model="")
+    app = build_test_vibe_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        picker = await _open_model_picker(pilot, app)
+
+        for key in "kimi-k3":
+            await pilot.press(key)
+        await pilot.pause(0.1)
+
+        option_list = picker.query_one(OptionList)
+        assert option_list.option_count >= 3
+        for _ in range(option_list.option_count):
+            await pilot.press("down")
+            await pilot.pause(0.1)
+            highlighted_id = option_list.get_option_at_index(option_list.highlighted).id
+            if highlighted_id == "kimi-k3:batch":
+                break
+        else:
+            pytest.fail("arrow down never reached the kimi-k3:batch row")
+
+        await pilot.press("enter")
+        await wait_until(
+            pilot, lambda: app.config.active_model.alias == "kimi-k3:batch"
+        )
+
+
+@pytest.mark.asyncio
 async def test_model_picker_select_current_model() -> None:
     """Selecting the already-active model still saves (idempotent)."""
     app = build_test_vibe_app(config=_make_config_with_models())
