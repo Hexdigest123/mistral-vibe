@@ -2801,7 +2801,14 @@ async def _start_model_catalog_sync(
     discover_only = discover_only_provider_names(config_orchestrator.config)
     if not declared and not discover_only:
         return
-    load_cached_models(config_orchestrator, declared_aliases=declared)
+    cached = load_cached_models(config_orchestrator, declared_aliases=declared)
+    # The catalog layer feeds discovery results into the merged config; a
+    # reload is what makes the cached models visible to the session. Without
+    # it they only appear after the background fetch (or a manual /models
+    # refresh), so a session with a valid on-disk cache would start without
+    # its discovered models.
+    if cached.ok:
+        await config_orchestrator.reload()
 
     async def _refresh() -> None:
         try:
