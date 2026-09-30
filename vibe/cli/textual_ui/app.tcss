@@ -1392,8 +1392,8 @@ StatusMessage {
 }
 
 #skillsbrowser-search .input--selection {
-    background: $primary;
-    color: $foreground;
+    background: $block-cursor-background;
+    color: $block-cursor-foreground;
 }
 
 #skillsbrowser-body {
@@ -2108,6 +2108,14 @@ NarratorStatus {
     text-wrap: nowrap;
     text-overflow: ellipsis;
     border: none;
+}
+
+#modelpicker-options > .option-list--option-highlighted,
+#modelpicker-options:focus > .option-list--option-highlighted {
+    /* The list never takes focus (the search input owns it), so the
+       highlighted row must carry the selection on its own. */
+    background: $block-cursor-background;
+    color: $block-cursor-foreground;
 }
 
 #modelpicker-options:focus {
