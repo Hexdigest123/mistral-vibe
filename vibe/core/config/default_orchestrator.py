@@ -15,6 +15,7 @@ from vibe.core.config.layers.agent_profile import AgentProfileLayer
 from vibe.core.config.layers.default import DefaultConfigLayer
 from vibe.core.config.layers.environment import EnvironmentLayer
 from vibe.core.config.layers.growthbook import GrowthbookLayer
+from vibe.core.config.layers.model_catalog import ModelCatalogLayer
 from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.layers.project import ProjectConfigLayer
 from vibe.core.config.layers.user import UserConfigLayer
@@ -67,6 +68,9 @@ async def build_default_orchestrator(
 
     layers = [
         DefaultConfigLayer(schema=VibeConfigSchema),
+        # Auto-discovered model catalogs: the lowest non-default source, so every
+        # durable layer's explicit [[model]] entries win per alias.
+        ModelCatalogLayer(),
         GrowthbookLayer(),
         *([user_layer] if user_layer is not None else []),
         *([project_layer] if project_layer is not None else []),

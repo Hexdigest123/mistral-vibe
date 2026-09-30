@@ -851,6 +851,13 @@ already starts a child that inherits the parent's prompt and tools.
 - `/help` - Show help message
 - `/config` - Full-screen settings browser. Fields show their value and origin layer (default / TOML / env / override). Type to filter, arrows to move, Enter to edit; booleans toggle, closed-set fields (theme, models) pick from a list, scalars edit inline, complex fields open a JSON editor. The edit modal shows an inspector of the layers setting the field; edits persist to the user config (`~/.vibe/config.toml`) by default, `Tab` cycles the save target through the project config (`.vibe/config.toml`, when the project layer is active) and the ephemeral session override (until restart), and `Ctrl+R` clears the field one writable layer at a time toward the default. The `tools` field opens a grouped tool list with a per-tool config editor (permission, allow/deny lists, `Ctrl+E` for raw JSON). Enabling/disabling whole MCP servers or connectors stays in `/mcp`.
 - `/model` - Select active model
+- `/models refresh` - Re-run model auto-discovery: fetch the provider's
+  `/models` endpoint for every provider referenced by a `[[model]]` block in
+  config.toml, persist the catalog to `~/.vibe/model_catalog_cache.json`, and
+  merge the discovered ids into the model picker. Startup loads the cache
+  without network traffic and refreshes it in the background only when a
+  `[[model]]` block is declared; explicit `[[model]]` entries always win over
+  discovered ids.
 - `/skills` - Browse and manage the skills available to this session. Lists the
   installed ones alongside the shared skills you can add, and can import a
   skill, pin it to a version or alias, convert it to a local copy, or remove it.

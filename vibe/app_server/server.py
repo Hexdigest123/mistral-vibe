@@ -75,6 +75,7 @@ from vibe.app_server.protocol import (
     JsonRpcSuccessResponse,
     MCPAuthUrlParams,
     ModelConfigWriteParams,
+    ModelsRefreshParams,
     Notification,
     PageRequest,
     ProtocolError,
@@ -167,6 +168,7 @@ _SESSION_BACKEND_METHODS = frozenset({
     "config/reload",
     "config/model/write",
     "config/write",
+    "models/refresh",
     "session/agent/update",
     "session/compact",
     "session/context/inject",
@@ -1104,6 +1106,17 @@ class AppServer:
                 return await self._dispatch_backend_turn(root, method, raw_params)
             case "config":
                 return await self._dispatch_backend_config(root, method, raw_params)
+            case "models":
+                if method != "models/refresh":
+                    return None
+                result = await root.refresh_models_catalog(
+                    validate_wire(ModelsRefreshParams, raw_params)
+                )
+                return DispatchResult(
+                    result.response,
+                    after_response=result.after_response,
+                    runtime_updated=True,
+                )
             case "callback":
                 return await self._dispatch_backend_callback(root, method, raw_params)
         return None

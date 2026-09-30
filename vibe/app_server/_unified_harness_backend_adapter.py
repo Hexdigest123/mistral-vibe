@@ -371,7 +371,10 @@ from vibe.app_server.protocol import (
     LoopsListParams,
     LoopsListResponse,
     MCPAuthRequiredParams,
+    ModelCatalogEntryView,
     ModelConfigWriteParams,
+    ModelsRefreshParams,
+    ModelsRefreshResponse,
     NarrationSummarizeParams,
     NarrationSummarizeResponse,
     PageRequest,
@@ -508,6 +511,7 @@ from vibe.core.hooks.config import load_hooks_from_fs
 from vibe.core.identity_cache import IdentityCache
 from vibe.core.log_reader import LogReader
 from vibe.core.loop import LoopError
+from vibe.core.models import refresh_models
 from vibe.core.proxy_setup import (
     SUPPORTED_PROXY_VARS,
     ProxySetupError,
@@ -4865,6 +4869,38 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         return SessionBackendResult(
             response=ConfigMutationResponse(runtime=self._runtime)
         )
+
+    async def refresh_models_catalog(
+        self, params: ModelsRefreshParams
+    ) -> SessionBackendResult[ModelsRefreshResponse]:
+        """Re-run model auto-discovery and reload the config from the result.
+
+        The fetched catalog lands in the model-catalog layer (persisted in the
+        on-disk cache), the orchestrator reload re-merges it, and the returned
+        runtime snapshot carries the discovered models to the client.
+        """
+        self._require_session(params.session_id)
+        self._require_idle()
+        report = await refresh_models(self._context.config_orchestrator)
+        await self._context.config_orchestrator.reload(preflight=self._preflight_config)
+        await self._apply_derivation()
+        entries = [
+            ModelCatalogEntryView(
+                provider_name=result.provider_name,
+                endpoint=result.endpoint,
+                model_ids=list(result.model_ids),
+            )
+            for result in report.results
+        ]
+        errors = [
+            f"{result.provider_name}: {result.error}"
+            for result in report.results
+            if not result.ok
+        ]
+        response = ModelsRefreshResponse(
+            entries=entries, total_models=report.total_models, errors=errors
+        )
+        return SessionBackendResult(response=response)
 
     async def refresh_admin_config(self) -> bool:
         """Returns whether the live runtime changed, so the caller can push a

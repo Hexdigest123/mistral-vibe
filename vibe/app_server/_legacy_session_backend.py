@@ -69,6 +69,8 @@ from vibe.app_server.protocol import (
     EventNotificationParams,
     MCPAuthRequiredParams,
     ModelConfigWriteParams,
+    ModelsRefreshParams,
+    ModelsRefreshResponse,
     Notification,
     ProtocolErrorCode,
     RuntimeMutationResponse,
@@ -742,6 +744,13 @@ class LegacySessionBackend:
     ) -> SessionBackendResult[ConfigMutationResponse]:
         return await self._resource_request(
             "config/reload", params, ConfigMutationResponse
+        )
+
+    async def refresh_models_catalog(
+        self, params: ModelsRefreshParams
+    ) -> SessionBackendResult[ModelsRefreshResponse]:
+        return await self._resource_request(
+            "models/refresh", params, ModelsRefreshResponse
         )
 
     async def start_turn(

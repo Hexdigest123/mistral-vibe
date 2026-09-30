@@ -45,6 +45,8 @@ from vibe.app_server.protocol import (
     IdentityReadParams,
     IdentityReadResponse,
     ModelConfigWriteParams,
+    ModelsRefreshParams,
+    ModelsRefreshResponse,
     Notification,
     ProtocolError,
     ProtocolErrorCode,
@@ -202,6 +204,17 @@ class ConfigResource:
 
     async def set_thinking(self, level: ThinkingLevel) -> RuntimeMutationStatus:
         return await self.write_model(reasoning_effort=level)
+
+    async def refresh_models(self) -> ModelsRefreshResponse:
+        """Re-run model auto-discovery and apply the refreshed catalog."""
+        client = await self._connection.connect()
+        response = validate_wire(
+            ModelsRefreshResponse,
+            await client.request(
+                "models/refresh", ModelsRefreshParams(session_id=self._state.session_id)
+            ),
+        )
+        return response
 
     async def reload(self, *, reload_runtime: bool = True) -> int:
         client = await self._connection.connect()
