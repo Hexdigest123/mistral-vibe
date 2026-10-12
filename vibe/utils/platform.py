@@ -159,6 +159,15 @@ def resolve_ssh_executable(*, cwd: Path | None = None) -> str | None:
     return _search_trusted_path("ssh", cwd=(cwd or Path.cwd()).resolve())
 
 
+def resolve_trusted_executable(name: str, *, cwd: Path | None = None) -> str | None:
+    """Return an absolute ``name`` executable that is not a project-local binary.
+
+    The same discovery rules as `resolve_ssh_executable`, for the optional
+    native helpers (fzf, fd) Vibe runs on the user's behalf.
+    """
+    return _search_trusted_path(name, cwd=(cwd or Path.cwd()).resolve())
+
+
 def configure_git_python_executable(*, cwd: Path | None = None) -> str | None:
     """Pin GitPython to the same trusted executable used by direct callers."""
     executable = resolve_git_executable(cwd=cwd)

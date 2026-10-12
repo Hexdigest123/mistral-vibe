@@ -856,6 +856,18 @@ There are two kinds of agents:
 - **explore**: Read-only codebase exploration subagent with grep, file reading,
   and skill loading. Spawned by the model, not selectable by the user.
 
+Each subagent the model spawns gets its own live block in the chat instead of
+a line in a collapsed tool group: `● Explore(Name) · task`, then its latest
+tool uses (`⎿ Read path`), `+N more tool uses · tokens · elapsed`, and finally
+`⎿ Done (N tool uses · tokens · time)` or the failure. Agents spawned together
+share one block drawn as a tree (`● Running 3 agents…`, `├─`/`└─` rows). Click a
+row to open that subagent's transcript.
+
+The transcript opens in a read-only window over the chat with a title bar
+(`‹ Main │ ● Explore(Name) · status · tool uses · tokens · elapsed`); click the
+bar or press Escape to return. The main conversation stays laid out underneath,
+so switching back is instant even in long sessions.
+
 With the Unified Harness, the interactive prompt lists each known subagent with
 its name, type, live status, and latest measured context size. Opening a
 subagent also shows its active status above the prompt and its context use in the
@@ -1006,7 +1018,14 @@ Type `@` in the chat input to autocomplete files and folders. A bare `@`
 lists non-hidden immediate children directly from the filesystem for fast
 browsing. Once you type a path character, Git workspaces use tracked and
 non-ignored untracked paths, including nested `.gitignore` rules; outside Git
-the picker falls back to the project tree. Pressing Tab/Enter inserts the
+the picker indexes the project tree with `fd` (or `fdfind`) when it is on
+`PATH`, honoring the built-in ignore list plus the root `.gitignore`, and
+walks the tree in Python otherwise. On large trees (1000+ paths) suggestions
+are ranked with `fzf --filter` when `fzf` is installed (your
+`FZF_DEFAULT_OPTS` are ignored); exact names, stem and prefix matches still
+rank first, and the built-in matcher is used when `fzf` is missing. Neither
+tool is required, and neither is ever run from inside the project directory.
+Pressing Tab/Enter inserts the
 chosen path. Your message text is sent as-is (the `@path` stays in the prompt);
 behavior then depends on the mention kind:
 

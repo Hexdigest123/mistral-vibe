@@ -21,13 +21,46 @@ TextArea > .text-area--cursor {
     color: $foreground;
 }
 
-#chat {
+/* The subagent transcript window is a layer over the main chat, so opening
+   and closing it never hides (and so never re-lays out) the main history. */
+#chat-area {
+    layers: chat subagent;
+    height: 1fr;
+    width: 100%;
+    background: transparent;
+}
+
+#chat,
+#subagent-chat {
     layout: stream;
     height: 1fr;
     width: 100%;
     background: transparent;
     padding: 0;
     align-vertical: bottom;
+}
+
+#chat {
+    layer: chat;
+    height: 100%;
+}
+
+#subagent-view {
+    layer: subagent;
+    display: none;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+}
+
+#subagent-view-header {
+    width: 100%;
+    height: 1;
+    padding: 0 1;
+    background: $surface;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    pointer: pointer;
 }
 
 #loading-area {
@@ -149,8 +182,30 @@ TextArea > .text-area--cursor {
     width: 100%;
     height: auto;
     text-align: left;
-    margin-top: 1;
+    margin-top: 0;
     margin-bottom: 0;
+}
+
+.subagent-run-group {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+}
+
+.subagent-run-header,
+.subagent-run-row {
+    width: 100%;
+    height: auto;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+.subagent-run-row {
+    pointer: pointer;
+
+    &:hover {
+        background: $boost;
+    }
 }
 
 .subagent-transcript {
@@ -1797,8 +1852,8 @@ NarratorStatus {
 
 .petit-chat {
     color: $foreground;
-    width: 12;
-    height: 3;
+    width: 17;
+    height: 4;
 }
 
 .whats-new-message {

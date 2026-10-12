@@ -52,7 +52,9 @@ def fuzzy_match(pattern: str, text: str, text_lower: str | None = None) -> Match
         text_lower = text.lower()
     pattern_lower = pattern.lower()
 
-    if len(pattern_lower) > len(text_lower):
+    if len(pattern_lower) > len(text_lower) or not _is_subsequence(
+        pattern_lower, text_lower
+    ):
         return MatchResult(matched=False, score=0.0, matched_indices=())
 
     indices = _find_optimal_match(pattern, pattern_lower, text_lower, text)
@@ -61,6 +63,18 @@ def fuzzy_match(pattern: str, text: str, text_lower: str | None = None) -> Match
 
     score = _calculate_score(pattern, text_lower, text, indices)
     return MatchResult(matched=True, score=score, matched_indices=indices)
+
+
+def _is_subsequence(pattern_lower: str, text_lower: str) -> bool:
+    """Cheap pre-check: the O(m*n) DP can only match a subsequence."""
+    position = 0
+    find = text_lower.find
+    for char in pattern_lower:
+        position = find(char, position)
+        if position < 0:
+            return False
+        position += 1
+    return True
 
 
 def _is_boundary(text_lower: str, text_orig: str, j: int) -> float:
@@ -150,7 +164,7 @@ def _find_optimal_match(
                     bt[i][j] = gap.best_k
 
     # Find the best ending position.
-    best_end = max(range(n), key=lambda j: dp[m - 1][j], default=-1)
+    best_end = max(range(n), key=dp[m - 1].__getitem__, default=-1)
     if dp[m - 1][best_end] == NEG_INF:
         return ()
 

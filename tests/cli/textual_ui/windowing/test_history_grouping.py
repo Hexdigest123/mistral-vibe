@@ -12,9 +12,12 @@ from vibe.app_server.models import (
     PublicEntryGenerationStatus,
     PublicHistoryEntry,
     PublicMessageEntry,
+    SubagentEffectDetail,
+    SubagentEffectInput,
     TextContentBlock,
 )
 from vibe.cli.textual_ui.widgets.messages import AssistantMessage, UserMessage
+from vibe.cli.textual_ui.widgets.subagent_runs import SubagentRunGroup
 from vibe.cli.textual_ui.widgets.tools import ToolGroup
 from vibe.cli.textual_ui.windowing.history import (
     build_history_widgets,
@@ -271,3 +274,44 @@ def test_history_agent_shell_call_still_groups() -> None:
     )
     assert len(widgets) == 1
     assert isinstance(widgets[0], ToolGroup)
+
+
+def _spawn(index: int) -> PublicEffectEntry:
+    return PublicEffectEntry(
+        id=f"spawn-{index}",
+        session_id="s1",
+        created_at=index,
+        updated_at=index,
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        title="Spawn",
+        detail=SubagentEffectDetail(
+            tool_name="subagent.spawn",
+            display=EffectCallDisplay(summary="Spawning", status_text="Spawning"),
+            input=SubagentEffectInput(task="Look around", agent="explore"),
+            child_session_id=f"child-{index}",
+        ),
+        state=CompletedEffectState(
+            display=EffectResultDisplay(success=True, message="spawned")
+        ),
+    )
+
+
+def test_history_renders_parallel_spawns_as_one_run_block() -> None:
+    indices = _indices()
+    batch: list[PublicHistoryEntry] = [_effect(0), _spawn(1), _spawn(2), _effect(3)]
+
+    widgets = build_history_widgets(
+        batch, start_index=0, history_widget_indices=indices, tools_collapsed=True
+    )
+
+    assert [type(widget) for widget in widgets] == [
+        ToolGroup,
+        SubagentRunGroup,
+        ToolGroup,
+    ]
+    run_group = widgets[1]
+    assert isinstance(run_group, SubagentRunGroup)
+    assert [row.entry_id for row in run_group.rows] == ["spawn-1", "spawn-2"]
+    assert visible_history_widgets_count(widgets) == 3
+    # Tool groups report call + result per effect; the run block reports itself.
+    assert visible_history_indices(widgets, indices) == [0, 0, 1, 3, 3]

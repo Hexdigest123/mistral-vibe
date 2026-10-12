@@ -21,7 +21,7 @@ import webbrowser
 from rich import print as rprint
 from textual.app import WINDOWS, App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Horizontal, VerticalGroup, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalGroup, VerticalScroll
 from textual.css.query import NoMatches
 from textual.dom import NoScreen
 from textual.driver import Driver
@@ -162,6 +162,7 @@ from vibe.cli.textual_ui.notifications import (
 from vibe.cli.textual_ui.provider_auth_status import render_provider_auth_section
 from vibe.cli.textual_ui.quit_manager import QuitManager
 from vibe.cli.textual_ui.scheduled_loop_runner import ScheduledLoopCommands
+from vibe.cli.textual_ui.subagent_activity import SubagentActivityTracker
 from vibe.cli.textual_ui.todo_tracker import TodoTracker, todo_deltas
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.banner.banner import Banner
@@ -230,6 +231,7 @@ from vibe.cli.textual_ui.widgets.rewind_app import RewindApp
 from vibe.cli.textual_ui.widgets.rewind_fork_message import RewindForkMessage
 from vibe.cli.textual_ui.widgets.session_picker import SessionPickerApp
 from vibe.cli.textual_ui.widgets.skills_browser import SkillsBrowserApp
+from vibe.cli.textual_ui.widgets.subagent_runs import SubagentRunRow, SubagentViewHeader
 from vibe.cli.textual_ui.widgets.subagent_transcripts import SubagentTranscripts
 from vibe.cli.textual_ui.widgets.teleport_message import TeleportMessage
 from vibe.cli.textual_ui.widgets.theme_picker import ThemePickerApp, sorted_theme_names
@@ -411,6 +413,10 @@ WHEEL_SCROLL_DURATION = 0.1
 
 class ChatScroll(VerticalScroll):
     """Optimized scroll container that skips cascading style recalculations."""
+
+    # Widgets inside find their scroll container by this class (the main chat
+    # and the subagent transcript window are both ChatScrolls).
+    DEFAULT_CLASSES = "chat-scroll"
 
     @property
     def is_at_bottom(self) -> bool:
@@ -831,6 +837,7 @@ class VibeApp(App):  # noqa: PLR0904
         self._cached_messages_area: Widget | None = None
         self._cached_subagent_transcripts: SubagentTranscripts | None = None
         self._cached_chat: ChatScroll | None = None
+        self._cached_subagent_chat: ChatScroll | None = None
         self._cached_loading_area: Widget | None = None
         self._subagent_loading_widget: LoadingWidget | None = None
         self._viewed_subagent_id: str | None = None
@@ -838,6 +845,11 @@ class VibeApp(App):  # noqa: PLR0904
         self._subagent_refresh_requested = False
         self._subagent_refresh_worker: Worker[None] | None = None
         self._subagent_refresh_generation = 0
+        self._subagent_activity = SubagentActivityTracker(
+            self._read_subagent_history,
+            child_lookup=self._lookup_child_session,
+            on_change=self._on_subagent_activity_changed,
+        )
         self._context_progress: ContextProgress | None = None
         self._todo_status_row: TodoStatusRow | None = None
         # Unset on the legacy harness, which is what gates the whole todo surface.
@@ -1104,41 +1116,50 @@ class VibeApp(App):  # noqa: PLR0904
     def _compose_main_ui(self) -> ComposeResult:
         has_session = self._app_server is not None
         init = self._initial_config_response
-        with ChatScroll(id="chat"):
-            self._banner = Banner(
-                config=self.config if has_session else (init.config if init else None),
-                skills_count=(
-                    self.app_server.resources.runtime.custom_skills_count
+        # The subagent transcript window sits on a layer above the main chat
+        # instead of swapping it in: hiding #messages throws away the layout of
+        # the whole history, and re-showing a long one cost seconds.
+        with Vertical(id="chat-area"):
+            with ChatScroll(id="chat"):
+                self._banner = Banner(
+                    config=self.config
                     if has_session
-                    else (init.skills_count if init else 0)
-                ),
-                mcp=self.app_server.resources.runtime.mcp if has_session else None,
-                mcp_servers_total=(
-                    init.mcp_servers_total if init and not has_session else 0
-                ),
-                mcp_servers_enabled=(
-                    init.mcp_servers_enabled if init and not has_session else 0
-                ),
-                connectors_connected=(
-                    self.app_server.resources.runtime.connectors.connected
-                    if has_session
-                    else 0
-                ),
-                connectors_total=(
-                    self.app_server.resources.runtime.connectors.total
-                    if has_session
-                    else None
-                ),
-                hooks_count=(
-                    self.app_server.resources.runtime.hooks_count
-                    if has_session
-                    else (init.hooks_count if init else 0)
-                ),
-                model_pending=self._model_pending() if has_session else False,
-            )
-            yield self._banner
-            yield VerticalGroup(id="messages")
-            yield SubagentTranscripts(id="subagent-transcripts")
+                    else (init.config if init else None),
+                    skills_count=(
+                        self.app_server.resources.runtime.custom_skills_count
+                        if has_session
+                        else (init.skills_count if init else 0)
+                    ),
+                    mcp=self.app_server.resources.runtime.mcp if has_session else None,
+                    mcp_servers_total=(
+                        init.mcp_servers_total if init and not has_session else 0
+                    ),
+                    mcp_servers_enabled=(
+                        init.mcp_servers_enabled if init and not has_session else 0
+                    ),
+                    connectors_connected=(
+                        self.app_server.resources.runtime.connectors.connected
+                        if has_session
+                        else 0
+                    ),
+                    connectors_total=(
+                        self.app_server.resources.runtime.connectors.total
+                        if has_session
+                        else None
+                    ),
+                    hooks_count=(
+                        self.app_server.resources.runtime.hooks_count
+                        if has_session
+                        else (init.hooks_count if init else 0)
+                    ),
+                    model_pending=self._model_pending() if has_session else False,
+                )
+                yield self._banner
+                yield VerticalGroup(id="messages")
+            with Vertical(id="subagent-view"):
+                yield SubagentViewHeader(id="subagent-view-header")
+                with ChatScroll(id="subagent-chat"):
+                    yield SubagentTranscripts(id="subagent-transcripts")
 
         with Horizontal(id="loading-area"):
             yield NarratorStatus(self._narrator_manager)
@@ -1209,6 +1230,23 @@ class VibeApp(App):  # noqa: PLR0904
         if self._cached_chat is None:
             self._cached_chat = self.query_one("#chat", ChatScroll)
         return self._cached_chat
+
+    @property
+    def _subagent_chat(self) -> ChatScroll:
+        if self._cached_subagent_chat is None:
+            self._cached_subagent_chat = self.query_one("#subagent-chat", ChatScroll)
+        return self._cached_subagent_chat
+
+    @property
+    def _subagent_view(self) -> Widget:
+        return self.query_one("#subagent-view")
+
+    @property
+    def _active_chat(self) -> ChatScroll:
+        """The scroll container the user is looking at."""
+        if self._viewed_subagent_id is not None:
+            return self._subagent_chat
+        return self._chat_widget
 
     @property
     def _loading_area(self) -> Widget:
@@ -1383,18 +1421,22 @@ class VibeApp(App):  # noqa: PLR0904
         )
 
     def _remember_transcript_scroll(self) -> None:
+        # The main chat keeps its own scroll container (and position); only
+        # subagent transcripts take turns in the overlay's.
+        if self._viewed_subagent_id is None:
+            return
         self._transcript_scroll_offsets[self._viewed_subagent_id] = float(
-            self._chat_widget.scroll_offset.y
+            self._subagent_chat.scroll_offset.y
         )
 
     def _restore_transcript_scroll(self, session_id: str | None) -> None:
-        if self._viewed_subagent_id != session_id:
+        if session_id is None or self._viewed_subagent_id != session_id:
             return
         scroll_y = self._transcript_scroll_offsets.get(session_id)
         if scroll_y is None:
-            self._chat_widget.anchor()
+            self._subagent_chat.anchor()
             return
-        self._chat_widget.scroll_to(
+        self._subagent_chat.scroll_to(
             y=scroll_y, animate=False, force=True, immediate=True
         )
 
@@ -1405,7 +1447,7 @@ class VibeApp(App):  # noqa: PLR0904
         self._viewed_subagent_id = None
         self._refresh_session_indicators()
         self._subagent_transcripts.select(None)
-        self._messages_area.display = True
+        self._set_subagent_view_visible(False)
         if self._chat_input_container is not None:
             self._chat_input_container.set_subagent_view(
                 False, restore_input_focus=focus_input
@@ -1416,7 +1458,6 @@ class VibeApp(App):  # noqa: PLR0904
             else (),
             selected_session_id=None,
         )
-        self.call_after_refresh(partial(self._restore_transcript_scroll, None))
         if focus_input:
             self.call_after_refresh(self._focus_current_bottom_app)
 
@@ -1430,7 +1471,8 @@ class VibeApp(App):  # noqa: PLR0904
         if selected is not None:
             await self._ensure_subagent_loading_widget(selected)
         self._refresh_session_indicators()
-        self._messages_area.display = False
+        self._set_subagent_view_visible(True)
+        self._refresh_subagent_view_header()
         cached = self._subagent_transcripts.select(session_id)
         self.query_one(SubagentList).update_sessions(
             self.app_server.child_sessions, selected_session_id=session_id
@@ -1494,8 +1536,9 @@ class VibeApp(App):  # noqa: PLR0904
         if self._viewed_subagent_id != session_id:
             return
 
-        was_at_bottom = self._chat_widget.is_at_bottom
-        scroll_y = float(self._chat_widget.scroll_offset.y)
+        subagent_chat = self._subagent_chat
+        was_at_bottom = subagent_chat.is_at_bottom
+        scroll_y = float(subagent_chat.scroll_offset.y)
         changed = await self._subagent_transcripts.replace_history(
             session_id,
             history,
@@ -1506,11 +1549,11 @@ class VibeApp(App):  # noqa: PLR0904
         if not changed:
             return
         if was_at_bottom:
-            self.call_after_refresh(self._chat_widget.anchor)
+            self.call_after_refresh(subagent_chat.anchor)
         else:
             self.call_after_refresh(
                 partial(
-                    self._chat_widget.scroll_to,
+                    subagent_chat.scroll_to,
                     y=scroll_y,
                     animate=False,
                     force=True,
@@ -1537,10 +1580,76 @@ class VibeApp(App):  # noqa: PLR0904
         self._subagent_loading_widget = None
         self._transcript_scroll_offsets.clear()
         await self._subagent_transcripts.clear()
-        self._messages_area.display = True
+        await self._subagent_activity.reset()
+        self._set_subagent_view_visible(False)
         if self._chat_input_container is not None:
             self._chat_input_container.set_subagent_view(False)
         self._refresh_subagent_list()
+
+    def _set_subagent_view_visible(self, visible: bool) -> None:
+        view = self._subagent_view
+        if view.display != visible:
+            view.display = visible
+        if not visible:
+            self.query_one(SubagentViewHeader).stop()
+
+    def _refresh_subagent_view_header(self) -> None:
+        session_id = self._viewed_subagent_id
+        if session_id is None:
+            return
+        self.query_one(SubagentViewHeader).show_child(
+            self._subagent_activity.child(session_id),
+            self._subagent_activity.activity(session_id),
+        )
+
+    async def _read_subagent_history(
+        self, session_id: str, limit: int
+    ) -> list[PublicHistoryEntry]:
+        return await self.app_server.resources.sessions.get_session_history(
+            session_id, history_limit=limit
+        )
+
+    def _lookup_child_session(self, session_id: str) -> PublicChildSession | None:
+        if self._app_server is None:
+            return None
+        return next(
+            (
+                session
+                for session in self.app_server.child_sessions
+                if session.id == session_id
+            ),
+            None,
+        )
+
+    def _on_subagent_activity_changed(self, session_id: str) -> None:
+        if session_id == self._viewed_subagent_id:
+            self._refresh_subagent_view_header()
+
+    def on_subagent_run_row_attached(self, event: SubagentRunRow.Attached) -> None:
+        event.stop()
+        self._subagent_activity.register(event.row)
+
+    async def on_subagent_run_row_open_requested(
+        self, event: SubagentRunRow.OpenRequested
+    ) -> None:
+        event.stop()
+        if not self.config.show_subagent_status_list:
+            self.notify(
+                "Enable show_subagent_status_list to open subagent transcripts.",
+                severity="warning",
+            )
+            return
+        if all(
+            session.id != event.session_id for session in self.app_server.child_sessions
+        ):
+            return
+        await self._show_subagent_chat(event.session_id)
+
+    def on_subagent_view_header_back_requested(
+        self, event: SubagentViewHeader.BackRequested
+    ) -> None:
+        event.stop()
+        self._show_main_chat()
 
     async def on_subagent_list_selected(self, event: SubagentList.Selected) -> None:
         if event.session_id is None:
@@ -3222,6 +3331,7 @@ class VibeApp(App):  # noqa: PLR0904
 
     async def _handle_immediate_turn_event(self, event: AppServerEvent) -> bool:
         if isinstance(event, ChildSessionUpdated):
+            self._subagent_activity.child_updated(event.child_session)
             await self._update_subagent_ready_message(event.child_session)
             if event.child_session.id == self._viewed_subagent_id:
                 self._refresh_session_indicators()
@@ -5839,14 +5949,14 @@ class VibeApp(App):  # noqa: PLR0904
             session_id, _SUBAGENT_READ_ONLY_MESSAGE, severity=UserMessageSeverity.ERROR
         )
         if self._viewed_subagent_id == session_id:
-            self.call_after_refresh(self._chat_widget.anchor)
+            self.call_after_refresh(self._subagent_chat.anchor)
 
     async def _update_subagent_ready_message(self, session: PublicChildSession) -> None:
         added = await self._subagent_transcripts.announce_ready_transition(
             session, message=_SUBAGENT_READY_MESSAGE
         )
         if added and self._viewed_subagent_id == session.id:
-            self.call_after_refresh(self._chat_widget.anchor)
+            self.call_after_refresh(self._subagent_chat.anchor)
 
     def _try_interrupt(self) -> bool:
         if self._viewed_subagent_id is not None:
@@ -6265,13 +6375,13 @@ class VibeApp(App):  # noqa: PLR0904
 
     def action_scroll_chat_up(self) -> None:
         try:
-            self._chat_widget.scroll_relative(y=-5, animate=False)
+            self._active_chat.scroll_relative(y=-5, animate=False)
         except Exception:
             pass
 
     def action_scroll_chat_down(self) -> None:
         try:
-            self._chat_widget.scroll_relative(y=5, animate=False)
+            self._active_chat.scroll_relative(y=5, animate=False)
         except Exception:
             pass
 

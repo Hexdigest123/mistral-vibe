@@ -155,7 +155,12 @@ class CollapsibleSection(ClickWithoutDragMixin, Vertical):
             return
         if self._is_collapsed:
             chat = next(
-                (ancestor for ancestor in self.ancestors if ancestor.id == "chat"), None
+                (
+                    ancestor
+                    for ancestor in self.ancestors
+                    if ancestor.has_class("chat-scroll")
+                ),
+                None,
             )
             if chat is not None:
                 cast("ChatScroll", chat).preserve_scroll_position()

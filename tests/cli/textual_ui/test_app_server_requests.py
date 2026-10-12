@@ -74,6 +74,7 @@ from vibe.cli.textual_ui.widgets.messages import (
 )
 from vibe.cli.textual_ui.widgets.question_app import QuestionApp
 from vibe.cli.textual_ui.widgets.subagent_transcripts import SubagentTranscripts
+from vibe.cli.textual_ui.windowing import HISTORY_RESUME_TAIL_MESSAGES
 from vibe.core.config import SessionLoggingConfig
 from vibe.core.types import Role, ScheduledLoop, UserMessageEvent
 from vibe.setup.trusted_folders.trust_folder_dialog import TrustFolderApp
@@ -136,7 +137,7 @@ async def test_turn_finalization_keeps_ready_subagents_visible() -> None:
         widget = app.query_one(SubagentList)
         assert widget.display
         assert widget.option_count == 2
-        assert "[ready]" in str(widget.get_option_at_index(1).prompt)
+        assert "· ready ·" in str(widget.get_option_at_index(1).prompt)
 
 
 @pytest.mark.asyncio
@@ -316,11 +317,24 @@ async def test_subagent_transcript_switch_reuses_the_mounted_view(
         child_container = transcripts.transcript_container(child.id)
         assert child_container is not None
         root_messages = app.query_one("#messages")
+        subagent_view = app.query_one("#subagent-view")
         input_box = app.query_one("#input-box")
         assert app.focused is subagent_list
         assert subagent_list.highlighted == 1
-        assert not root_messages.display
+        # The transcript window overlays the main chat; the main history stays
+        # laid out so switching back does not re-layout all of it.
+        assert root_messages.display
+        assert subagent_view.display
         assert not input_box.display
+
+        def transcript_reads() -> int:
+            # Inline agent rows read short tails for their live stats too;
+            # only count the transcript window's own reads here.
+            return sum(
+                1
+                for call in read_history.await_args_list
+                if call.kwargs.get("history_limit") == HISTORY_RESUME_TAIL_MESSAGES
+            )
 
         updated_history = [
             history[0].model_copy(
@@ -331,7 +345,7 @@ async def test_subagent_transcript_switch_reuses_the_mounted_view(
         await app._handle_turn_event(
             ChildSessionUpdated(child.model_copy(update={"updated_at": 2}))
         )
-        assert await wait_until(pilot, lambda: read_history.await_count == 2)
+        assert await wait_until(pilot, lambda: transcript_reads() == 2)
         assert await wait_until(
             pilot,
             lambda: any(
@@ -360,8 +374,8 @@ async def test_subagent_transcript_switch_reuses_the_mounted_view(
         assert app._viewed_subagent_id is None
         await pilot.press("enter")
         assert await wait_until(pilot, lambda: app._viewed_subagent_id == child.id)
-        assert await wait_until(pilot, lambda: read_history.await_count >= 3)
-        history_reads_before_shortcuts = read_history.await_count
+        assert await wait_until(pilot, lambda: transcript_reads() >= 3)
+        history_reads_before_shortcuts = transcript_reads()
         force_quit = MagicMock()
         monkeypatch.setattr(app, "_force_quit", force_quit)
 
@@ -397,8 +411,8 @@ async def test_subagent_transcript_switch_reuses_the_mounted_view(
         assert all(
             message.severity is UserMessageSeverity.ERROR for message in local_messages
         )
-        assert read_history.await_count == history_reads_before_shortcuts
-        assert not root_messages.display
+        assert transcript_reads() == history_reads_before_shortcuts
+        assert subagent_view.display
         assert not input_box.display
 
         await pilot.press("ctrl+c")
@@ -417,6 +431,7 @@ async def test_subagent_transcript_switch_reuses_the_mounted_view(
         subagent_list.post_message(SubagentList.Selected(None))
         assert await wait_until(pilot, lambda: app._viewed_subagent_id is None)
         assert root_messages.display
+        assert not subagent_view.display
         assert input_box.display
 
         subagent_list.post_message(SubagentList.Selected(child.id))
@@ -425,7 +440,8 @@ async def test_subagent_transcript_switch_reuses_the_mounted_view(
         assert transcripts.transcript_container(child.id) is child_container
         assert app.focused is subagent_list
         assert subagent_list.highlighted == 1
-        assert root_messages.display is False
+        assert root_messages.display
+        assert subagent_view.display
         assert input_box.display is False
 
 

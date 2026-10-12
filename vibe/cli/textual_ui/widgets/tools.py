@@ -38,6 +38,7 @@ from vibe.cli.textual_ui.widgets.no_markup_static import (
     NonSelectableStatic,
 )
 from vibe.cli.textual_ui.widgets.status_message import IndicatorState, StatusMessage
+from vibe.cli.textual_ui.widgets.subagent_runs import is_subagent_run_entry
 from vibe.cli.textual_ui.widgets.tool_widgets import (
     ToolResultWidget,
     clean_output,
@@ -127,6 +128,10 @@ def entry_keeps_tool_group(entry: PublicHistoryEntry) -> bool:
         # The user typed the command to read what it printed, so it stands on
         # its own in the timeline instead of folding into the agent's summary
         # line alongside work they did not ask to see.
+        return False
+    if is_subagent_run_entry(entry):
+        # A subagent is a unit of work in its own right: it gets a live block
+        # in the timeline rather than a line inside a collapsed summary.
         return False
     return isinstance(entry, PublicEffectEntry | PublicReasoningEntry) or (
         isinstance(entry, PublicNoticeEntry)
@@ -233,7 +238,12 @@ class ToolGroupHeader(ClickWithoutDragMixin, StatusMessage):
         group = self.parent
         if group is not None and isinstance(group, ToolGroup):
             chat = next(
-                (ancestor for ancestor in self.ancestors if ancestor.id == "chat"), None
+                (
+                    ancestor
+                    for ancestor in self.ancestors
+                    if ancestor.has_class("chat-scroll")
+                ),
+                None,
             )
             if chat is not None:
                 cast("ChatScroll", chat).preserve_scroll_position()

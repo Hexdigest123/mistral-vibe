@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 
 import pytest
 
+from vibe.cli.autocompletion import native_search
 import vibe.cli.autocompletion.completers as completers_module
-from vibe.cli.autocompletion.completers import PathCompleter
+from vibe.cli.autocompletion.completers import BOOST_FIELD_COUNT, PathCompleter
 from vibe.cli.autocompletion.file_indexer.store import IndexEntry, build_ascii_mask
 from vibe.cli.autocompletion.fuzzy import fuzzy_match as real_fuzzy_match
 
@@ -131,7 +133,6 @@ def test_searches_entries_beyond_the_former_fixed_scan_limit(
             rel=f"generated/file_{index}.txt",
             rel_lower=f"generated/file_{index}.txt",
             name=f"file_{index}.txt",
-            path=Path(f"generated/file_{index}.txt"),
             is_dir=False,
             ascii_mask=build_ascii_mask(f"generated/file_{index}.txt"),
         )
@@ -142,7 +143,6 @@ def test_searches_entries_beyond_the_former_fixed_scan_limit(
             rel="src/needle.py",
             rel_lower="src/needle.py",
             name="needle.py",
-            path=Path("src/needle.py"),
             is_dir=False,
             ascii_mask=build_ascii_mask("src/needle.py"),
         )
@@ -356,7 +356,6 @@ def test_prioritizes_exact_path_prefix_before_fuzzy_search_limit(
             rel=rel,
             rel_lower=rel.lower(),
             name=Path(rel).name,
-            path=Path(rel),
             is_dir=is_dir,
             ascii_mask=build_ascii_mask(rel.lower()),
         )
@@ -515,3 +514,133 @@ def test_windows_backslash_drills_into_sibling(nested_project: Path) -> None:
 
     assert "@../sibling/note.txt" in results
     assert "@../sibling/nested/" in results
+
+
+def _index_entry(rel: str, *, is_dir: bool = False) -> IndexEntry:
+    return IndexEntry(
+        rel=rel,
+        rel_lower=rel.lower(),
+        name=rel.rsplit("/", 1)[-1],
+        is_dir=is_dir,
+        ascii_mask=build_ascii_mask(rel.lower()),
+    )
+
+
+_LARGE_INDEX_NEEDLES = [
+    "src/needle.py",
+    "lib/needle_utils.py",
+    "docs/needles.md",
+    "pkg/n_e_e_d_l_e.txt",
+    "uv.lock",
+    "needle",
+]
+
+
+def _large_index() -> list[IndexEntry]:
+    entries = [
+        _index_entry(f"generated/batch_{batch}/file_{index}.txt")
+        for batch in range(4)
+        for index in range(600)
+    ]
+    entries += [
+        _index_entry(f"generated/batch_{batch}", is_dir=True) for batch in range(4)
+    ]
+    entries.append(_index_entry("needle", is_dir=True))
+    entries += [_index_entry(rel) for rel in _LARGE_INDEX_NEEDLES[:-1]]
+    return sorted(entries, key=lambda entry: entry.rel)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "needle",
+        "needle.py",
+        "needle/",
+        "src/needle",
+        ".py",
+        "uv.lock",
+        "lock",
+        "n",
+        "batch_1/file_1",
+        "zzz",
+    ],
+)
+def test_boost_key_orders_like_the_match_rank_boost_flags(query: str) -> None:
+    completer = PathCompleter()
+    context = completer._build_search_context(query)
+    facts = completer._query_facts(context)
+
+    for entry in _large_index()[::37] + [
+        _index_entry(rel) for rel in _LARGE_INDEX_NEEDLES
+    ]:
+        flags = completer._build_match_rank(entry, context, 0.0, facts)[
+            :BOOST_FIELD_COUNT
+        ]
+        packed = sum(bit << (BOOST_FIELD_COUNT - 1 - i) for i, bit in enumerate(flags))
+        assert completer._boost_key(entry, facts) == packed, entry.rel
+
+
+@pytest.mark.skipif(shutil.which("fzf") is None, reason="needs fzf")
+def test_large_index_is_ranked_by_fzf_with_structural_boosts_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_search.reset_native_search_cache()
+    entries = _large_index()
+    completer = PathCompleter()
+    monkeypatch.setattr(completer._indexer, "get_index", lambda *_: entries)
+
+    def no_python_scoring(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("large indexes should be scored by fzf")
+
+    monkeypatch.setattr(completers_module, "fuzzy_match", no_python_scoring)
+
+    results = completer.get_completions("@needle", cursor_pos=7)
+
+    assert results[:2] == ["@needle/", "@src/needle.py"]
+    assert set(results[2:4]) == {"@lib/needle_utils.py", "@docs/needles.md"}
+    assert "@pkg/n_e_e_d_l_e.txt" in results
+    assert completer.get_completions("@zzzq", cursor_pos=5) == []
+
+
+@pytest.mark.skipif(shutil.which("fzf") is None, reason="needs fzf")
+def test_fzf_and_python_rankings_agree_on_boosted_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Below the structural boosts the two scorers may order plain fuzzy
+    # matches differently; above them, both must produce the same groups.
+    native_search.reset_native_search_cache()
+    entries = _large_index()
+    by_label = {
+        f"@{entry.rel}{'/' if entry.is_dir else ''}": entry for entry in entries
+    }
+    completer = PathCompleter()
+    monkeypatch.setattr(completer._indexer, "get_index", lambda *_: entries)
+
+    def boost_groups(query: str, results: list[str]) -> list[tuple[int, set[str]]]:
+        facts = completer._query_facts(completer._build_search_context(query[1:]))
+        groups: dict[int, set[str]] = {}
+        for label in results:
+            if key := completer._boost_key(by_label[label], facts):
+                groups.setdefault(key, set()).add(label)
+        return list(groups.items())
+
+    for query in ("@needle", "@needle.py", "@uv.lock", "@src/needle", "@.md"):
+        with_fzf = completer.get_completions(query, cursor_pos=len(query))
+        with monkeypatch.context() as patch:
+            patch.setattr(native_search, "fzf_executable", lambda cwd=None: None)
+            python_only = completer.get_completions(query, cursor_pos=len(query))
+        assert with_fzf[0] == python_only[0], query
+        assert boost_groups(query, with_fzf) == boost_groups(query, python_only)
+
+
+def test_large_index_falls_back_to_python_without_fzf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = _large_index()
+    completer = PathCompleter()
+    monkeypatch.setattr(completer._indexer, "get_index", lambda *_: entries)
+    monkeypatch.setattr(native_search, "fzf_executable", lambda cwd=None: None)
+
+    results = completer.get_completions("@needle", cursor_pos=7)
+
+    assert results[:2] == ["@needle/", "@src/needle.py"]

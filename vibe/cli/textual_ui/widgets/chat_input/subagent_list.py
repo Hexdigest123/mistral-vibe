@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from textual import events
@@ -19,19 +18,10 @@ from vibe.app_server.models import (
 )
 from vibe.cli.textual_ui.count_format import format_compact_count
 from vibe.cli.textual_ui.widgets.navigable_option_list import NavigableOptionList
+from vibe.cli.textual_ui.widgets.subagent_runs import BULLET, agent_display_name
 
 _MAIN_SESSION_ID = "\x00main"
-_WORD_BOUNDARY = re.compile(r"[-_]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
-
-
-def _display_name(value: str) -> str:
-    if " " in value:
-        return value
-    return " ".join(
-        word.capitalize() if word.islower() else word
-        for word in _WORD_BOUNDARY.split(value)
-        if word
-    )
+_display_name = agent_display_name
 
 
 def _status(session: PublicChildSession) -> tuple[str, str]:
@@ -269,11 +259,14 @@ class SubagentList(NavigableOptionList):
             if session.context_usage is not None
             else 0
         )
+        # Same "● Agent(name)" shape as the inline run blocks in the chat.
         return self._row(
             Content.assemble(
+                (BULLET, status_style),
+                " ",
                 (_display_name(session.agent_type), "bold"),
-                f" ({_display_name(session.name)}) ",
-                (f"[{status}]", status_style),
+                f"({_display_name(session.name)})",
+                (f" · {status}", status_style),
                 (f" · {format_compact_count(context_tokens)} tokens", "$text-muted"),
             ),
             selected=session.id == self._selected_session_id,

@@ -10,13 +10,17 @@ from tests.stubs.fake_tool import FakeTool, FakeToolArgs
 from vibe.app_server._shell import shell_effect_detail
 from vibe.app_server.events import HistoryEntryAdded
 from vibe.app_server.models import (
+    EffectCallDisplay,
     PublicCheckpointEntry,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
     RunningEffectState,
+    SubagentEffectDetail,
+    SubagentEffectInput,
 )
 from vibe.cli.textual_ui.handlers.event_handler import EventHandler
 from vibe.cli.textual_ui.widgets.messages import ReasoningMessage
+from vibe.cli.textual_ui.widgets.subagent_runs import SubagentRunGroup
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolGroup
 from vibe.core.tools.builtins.edit import Edit, EditArgs
 from vibe.core.tools.builtins.write_file import WriteFile, WriteFileArgs
@@ -282,3 +286,56 @@ async def test_an_agent_change_leaves_the_open_group_alone() -> None:
     groups = _mounted_groups(mount_callback)
     assert len(groups) == 1
     assert handler.current_tool_group is groups[0]
+
+
+def _spawn_entry(entry_id: str) -> PublicEffectEntry:
+    return PublicEffectEntry(
+        id=entry_id,
+        session_id="s1",
+        turn_id="t1",
+        created_at=1,
+        updated_at=1,
+        generation_status=PublicEntryGenerationStatus.IN_PROGRESS,
+        title="Spawn",
+        detail=SubagentEffectDetail(
+            tool_name="subagent.spawn",
+            display=EffectCallDisplay(
+                summary="Spawning", verb="Spawning", status_text="Spawning"
+            ),
+            input=SubagentEffectInput(task="Look around", agent="explore"),
+        ),
+        state=RunningEffectState(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_spawns_get_their_own_block_not_a_tool_group() -> None:
+    handler, mount_callback, projection = _make_handler()
+
+    await projection.dispatch(_call_event("a"), handler.handle_event)
+    assert handler.current_tool_group is not None
+
+    await handler.handle_event(HistoryEntryAdded(_spawn_entry("spawn-1")))
+    await handler.handle_event(HistoryEntryAdded(_spawn_entry("spawn-2")))
+
+    # The spawn closed the open tool group instead of folding into it...
+    assert handler.current_tool_group is None
+    run_groups = [
+        call.args[0]
+        for call in mount_callback.call_args_list
+        if call.args and isinstance(call.args[0], SubagentRunGroup)
+    ]
+    # ...and parallel spawns share one tree-shaped block.
+    assert len(run_groups) == 1
+    assert [row.entry_id for row in run_groups[0].rows] == ["spawn-1", "spawn-2"]
+    assert set(handler.subagent_rows) == {"spawn-1", "spawn-2"}
+    assert "spawn-1" not in handler.tool_calls
+
+    await projection.dispatch(_call_event("b"), handler.handle_event)
+    await handler.handle_event(HistoryEntryAdded(_spawn_entry("spawn-3")))
+    run_groups = [
+        call.args[0]
+        for call in mount_callback.call_args_list
+        if call.args and isinstance(call.args[0], SubagentRunGroup)
+    ]
+    assert len(run_groups) == 2

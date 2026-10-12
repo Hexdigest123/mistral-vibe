@@ -151,3 +151,9 @@ def test_text_lower_optimization_is_equivalent() -> None:
     without_opt = fuzzy_match("main", text)
 
     assert with_opt == without_opt
+
+
+def test_subsequence_prefilter_rejects_without_changing_matches() -> None:
+    assert fuzzy_match("xyz", "src/main.py").matched is False
+    assert fuzzy_match("mpy", "src/main.py").matched is True
+    assert fuzzy_match("MPY", "src/main.py").matched_indices == (4, 9, 10)

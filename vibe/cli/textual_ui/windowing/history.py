@@ -29,6 +29,11 @@ from vibe.cli.textual_ui.widgets.model_change import (
     ModelChangeMessage,
     model_change_model,
 )
+from vibe.cli.textual_ui.widgets.subagent_runs import (
+    SubagentRunGroup,
+    SubagentRunRow,
+    is_subagent_run_entry,
+)
 from vibe.cli.textual_ui.widgets.tools import (
     ToolCallMessage,
     ToolGroup,
@@ -66,6 +71,7 @@ def build_history_widgets(
 ) -> list[Widget]:
     widgets: list[Widget] = []
     current_group: ToolGroup | None = None
+    current_run_group: SubagentRunGroup | None = None
     pending_error_results: list[ToolResultMessage] = []
 
     fired_loops = _fired_loops(batch)
@@ -91,6 +97,13 @@ def build_history_widgets(
             current_group.finalize()
             widgets.append(current_group)
             current_group = None
+
+        if is_subagent_run_entry(entry):
+            current_run_group = _add_subagent_run(
+                entry, history_index, current_run_group, widgets, history_widget_indices
+            )
+            continue
+        current_run_group = None
 
         if entry_keeps_tool_group(entry):
             entry_widgets = _entry_widgets(
@@ -138,6 +151,25 @@ def build_history_widgets(
         widgets.append(current_group)
 
     return widgets
+
+
+def _add_subagent_run(
+    entry: PublicEffectEntry,
+    history_index: int,
+    group: SubagentRunGroup | None,
+    widgets: list[Widget],
+    history_widget_indices: WeakKeyDictionary[Widget, int],
+) -> SubagentRunGroup:
+    """Give a spawn its own run block; consecutive spawns share one."""
+    row = SubagentRunRow(entry)
+    history_widget_indices[row] = history_index
+    if group is not None:
+        group.add_pending_row(row)
+        return group
+    group = SubagentRunGroup([row])
+    widgets.append(group)
+    history_widget_indices[group] = history_index
+    return group
 
 
 def _fired_loops(batch: Sequence[PublicHistoryEntry]) -> dict[str, FiredLoop]:
@@ -283,6 +315,7 @@ def visible_history_widgets_count(children: list[Widget]) -> int:
         ToolCallMessage,
         ToolResultMessage,
         ToolGroup,
+        SubagentRunGroup,
     )
     return sum(isinstance(child, history_widget_types) for child in children)
 

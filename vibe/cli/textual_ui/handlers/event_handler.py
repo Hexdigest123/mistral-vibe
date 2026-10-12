@@ -62,6 +62,11 @@ from vibe.cli.textual_ui.widgets.model_change import (
     ModelChangeMessage,
     model_change_model,
 )
+from vibe.cli.textual_ui.widgets.subagent_runs import (
+    SubagentRunGroup,
+    SubagentRunRow,
+    is_subagent_run_entry,
+)
 from vibe.cli.textual_ui.widgets.tools import (
     ToolCallMessage,
     ToolGroup,
@@ -111,6 +116,8 @@ class EventHandler:
         self._turn_assistant_message: AssistantMessage | None = None
         self.current_streaming_reasoning: ReasoningMessage | None = None
         self.current_tool_group: ToolGroup | None = None
+        self.subagent_rows: dict[str, SubagentRunRow] = {}
+        self.current_subagent_group: SubagentRunGroup | None = None
         self.plan_file_message: PlanFileMessage | None = None
         self._hook_containers: dict[str, HookRunContainer] = {}
         self._tool_call_anchors: dict[str, Widget] = {}
@@ -172,8 +179,7 @@ class EventHandler:
             entry, PublicCheckpointEntry
         ) and not history_entry_renders_widget(entry):
             return None
-        if self.current_tool_group is not None and not entry_keeps_tool_group(entry):
-            self._finalize_tool_group()
+        self._close_open_groups(entry)
 
         match entry:
             case PublicMessageEntry(role="assistant"):
@@ -197,10 +203,7 @@ class EventHandler:
             case PublicEffectEntry():
                 await self._resolve_retry_presentation(continue_assistant=False)
                 await self.finalize_streaming()
-                tool_call = await self._handle_effect_started(entry, loading_widget)
-                if _effect_is_terminal(entry):
-                    await self._handle_effect_completed(entry, loading_widget)
-                return tool_call
+                return await self._handle_effect_added(entry, loading_widget)
             case PublicCheckpointEntry():
                 await self._resolve_retry_presentation(continue_assistant=False)
                 await self.finalize_streaming()
@@ -251,22 +254,54 @@ class EventHandler:
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
             case PublicEffectEntry():
-                call = self.tool_calls.get(entry.id)
-                if call is not None:
-                    call.update_entry(entry)
-                    if output := _appended_text(update.patch, "/state/outputText"):
-                        call.set_stream_message(output)
-                if _effect_became_terminal(update):
-                    await self.finalize_streaming()
-                    await self._handle_effect_completed(entry, loading_widget)
-                elif loading_widget is not None:
-                    loading_widget.set_status(entry.detail.display.status_text)
+                await self._handle_effect_updated(update, entry, loading_widget)
             case PublicCheckpointEntry(kind="compaction"):
                 if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
                     await self.finalize_streaming()
                     await self._handle_compact_end()
             case _:
                 pass
+
+    def _close_open_groups(self, entry: PublicHistoryEntry) -> None:
+        if self.current_tool_group is not None and not entry_keeps_tool_group(entry):
+            self._finalize_tool_group()
+        if not is_subagent_run_entry(entry):
+            self.current_subagent_group = None
+
+    async def _handle_effect_added(
+        self, entry: PublicEffectEntry, loading_widget: LoadingWidget | None
+    ) -> ToolCallMessage | None:
+        if is_subagent_run_entry(entry):
+            await self._handle_subagent_run(entry, loading_widget)
+            return None
+        tool_call = await self._handle_effect_started(entry, loading_widget)
+        if _effect_is_terminal(entry):
+            await self._handle_effect_completed(entry, loading_widget)
+        return tool_call
+
+    async def _handle_effect_updated(
+        self,
+        update: HistoryEntryUpdated,
+        entry: PublicEffectEntry,
+        loading_widget: LoadingWidget | None,
+    ) -> None:
+        became_terminal = _effect_became_terminal(update)
+        if (row := self.subagent_rows.get(entry.id)) is not None:
+            # A run row follows its child session; the spawn has no result card.
+            row.update_entry(entry)
+            if became_terminal:
+                await self.finalize_streaming()
+        else:
+            call = self.tool_calls.get(entry.id)
+            if call is not None:
+                call.update_entry(entry)
+                if output := _appended_text(update.patch, "/state/outputText"):
+                    call.set_stream_message(output)
+            if became_terminal:
+                await self.finalize_streaming()
+                await self._handle_effect_completed(entry, loading_widget)
+        if not became_terminal and loading_widget is not None:
+            loading_widget.set_status(entry.detail.display.status_text)
 
     async def _handle_effect_started(
         self, entry: PublicEffectEntry, loading_widget: LoadingWidget | None
@@ -291,6 +326,28 @@ class EventHandler:
         if loading_widget is not None:
             loading_widget.set_status(entry.detail.display.status_text)
         return tool_call
+
+    async def _handle_subagent_run(
+        self, entry: PublicEffectEntry, loading_widget: LoadingWidget | None
+    ) -> None:
+        # A spawn stands on its own in the timeline (never folded into a tool
+        # group) and parallel spawns share one tree-shaped block.
+        if (row := self.subagent_rows.get(entry.id)) is not None:
+            row.update_entry(entry)
+        else:
+            row = SubagentRunRow(entry)
+            self.subagent_rows[entry.id] = row
+            group = self.current_subagent_group
+            if group is None or (group.is_mounted and not group.is_attached):
+                group = SubagentRunGroup([row])
+                self.current_subagent_group = group
+                await self.mount_callback(group)
+            elif group.is_mounted:
+                await group.add_row(row)
+            else:
+                group.add_pending_row(row)
+        if loading_widget is not None:
+            loading_widget.set_status(entry.detail.display.status_text)
 
     def _record_todos(self, entry: PublicEffectEntry) -> str | None:
         # ``None`` means "render this the old way".

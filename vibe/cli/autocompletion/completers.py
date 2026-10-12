@@ -13,6 +13,16 @@ from vibe.cli.autocompletion.file_indexer.store import (
 from vibe.cli.autocompletion.fuzzy import fuzzy_match
 
 DEFAULT_TARGET_MATCHES = 100
+# MatchRank fields ahead of `fuzzy_score`: structural boosts that outrank it.
+BOOST_FIELD_COUNT = 8
+
+
+def _split_suffix(name: str) -> tuple[str, str]:
+    """``(Path(name).stem, Path(name).suffix)`` without building a Path."""
+    dot = name.rfind(".")
+    if 0 < dot < len(name) - 1:
+        return name[:dot], name[dot:]
+    return name, ""
 
 
 class Completer:
@@ -231,10 +241,37 @@ class PathCompleter(Completer):
         suffix = "/" if entry.is_dir else ""
         return f"@{entry.rel}{suffix}"
 
-    def _build_match_rank(
-        self, entry: IndexEntry, context: _SearchContext, fuzzy_score: float
-    ) -> MatchRank:
+    class _QueryFacts(NamedTuple):
+        """Per-query values `_build_match_rank` would otherwise recompute per entry."""
+
+        query: str
+        query_stem: str
+        query_extension: str
+        looks_like_filename: bool
+        looks_like_path: bool
+        pattern_lower: str
+
+    def _query_facts(self, context: _SearchContext) -> _QueryFacts:
         query = context.suffix.lower()
+        return self._QueryFacts(
+            query=query,
+            query_stem=Path(query).stem.lower(),
+            query_extension=Path(query).suffix.lower(),
+            looks_like_filename="." in query,
+            looks_like_path="/" in context.search_pattern,
+            pattern_lower=context.search_pattern.lower(),
+        )
+
+    def _build_match_rank(
+        self,
+        entry: IndexEntry,
+        context: _SearchContext,
+        fuzzy_score: float,
+        facts: _QueryFacts | None = None,
+    ) -> MatchRank:
+        if facts is None:
+            facts = self._query_facts(context)
+        query = facts.query
         if not query:
             return self.MatchRank(
                 exact_directory=0,
@@ -250,32 +287,32 @@ class PathCompleter(Completer):
             )
 
         name = entry.name.lower()
-        rel = entry.rel.lower()
-        stem = Path(entry.name).stem.lower()
-        extension = Path(entry.name).suffix.lower()
-        query_extension = Path(query).suffix.lower()
-        query_stem = Path(query).stem.lower()
-        query_looks_like_filename = "." in query
-        query_looks_like_path = "/" in context.search_pattern
-        exact_directory = int(entry.is_dir and rel == context.search_pattern.lower())
+        rel = entry.rel_lower
+        stem, extension = _split_suffix(name)
+        exact_directory = int(entry.is_dir and rel == facts.pattern_lower)
         immediate_child_of_exact_path = int(
-            query_looks_like_path
-            and self._is_immediate_child_of_prefix(rel, context.search_pattern.lower())
+            facts.looks_like_path
+            and self._is_immediate_child_of_prefix(rel, facts.pattern_lower)
         )
 
         return self.MatchRank(
             exact_directory=exact_directory,
             immediate_child_of_exact_path=immediate_child_of_exact_path,
-            exact_filename=int(query_looks_like_filename and name == query),
+            exact_filename=int(facts.looks_like_filename and name == query),
             preferred_stem_match=int(stem == query and extension != ".lock"),
             exact_stem=int(
-                stem == query or (query_looks_like_filename and stem == query_stem)
+                stem == query
+                or (facts.looks_like_filename and stem == facts.query_stem)
             ),
             stem_prefix=int(
-                stem.startswith(query_stem if query_looks_like_filename else query)
+                stem.startswith(
+                    facts.query_stem if facts.looks_like_filename else query
+                )
             ),
             name_prefix=int(name.startswith(query)),
-            extension_match=int(bool(query_extension) and extension == query_extension),
+            extension_match=int(
+                bool(facts.query_extension) and extension == facts.query_extension
+            ),
             fuzzy_score=fuzzy_score,
             shallow_path=-entry.rel.count("/"),
         )
@@ -314,6 +351,12 @@ class PathCompleter(Completer):
         scored_matches: list[tuple[str, PathCompleter.MatchRank]] = []
         entries = self._prioritize_exact_directory_prefix(entries, context)
 
+        if context.search_pattern:
+            native = self._score_matches_with_fzf(entries, context, should_cancel)
+            if native is not None:
+                return native
+
+        facts = self._query_facts(context)
         for i, entry in enumerate(entries):
             if should_cancel and i % 128 == 0 and should_cancel():
                 return []
@@ -332,7 +375,7 @@ class PathCompleter(Completer):
             label = self._format_label(entry)
 
             if not context.search_pattern:
-                rank = self._build_match_rank(entry, context, 0.0)
+                rank = self._build_match_rank(entry, context, 0.0, facts)
                 scored_matches.append((label, rank))
                 if len(scored_matches) >= self._target_matches:
                     break
@@ -345,7 +388,7 @@ class PathCompleter(Completer):
                 context.search_pattern, entry.rel, entry.rel_lower
             )
             if match_result.matched:
-                rank = self._build_match_rank(entry, context, match_result.score)
+                rank = self._build_match_rank(entry, context, match_result.score, facts)
                 scored_matches.append((label, rank))
 
         # Sort alphabetically first, then by descending rank; Python's stable sort
@@ -353,6 +396,110 @@ class PathCompleter(Completer):
         scored_matches.sort(key=lambda x: x[0])
         scored_matches.sort(key=lambda x: x[1], reverse=True)
         return scored_matches[: self._target_matches]
+
+    def _score_matches_with_fzf(
+        self,
+        entries: list[IndexEntry],
+        context: _SearchContext,
+        should_cancel: Callable[[], bool] | None,
+    ) -> list[tuple[str, PathCompleter.MatchRank]] | None:
+        """Rank with ``fzf --filter`` when it is installed and the index is large.
+
+        fzf replaces the per-entry Python DP, the dominant per-keystroke cost
+        on big trees. The structural boosts in `MatchRank` still apply first;
+        fzf's order stands in for the fuzzy score below them. Returns ``None``
+        to fall back to the pure-Python scorer.
+        """
+        from vibe.cli.autocompletion.native_search import (
+            FZF_MIN_CANDIDATES,
+            fzf_executable,
+            fzf_filter,
+        )
+
+        if self._max_entries_to_process is not None:
+            entries = entries[: self._max_entries_to_process]
+        if len(entries) < FZF_MIN_CANDIDATES or fzf_executable() is None:
+            return None
+
+        candidates = [
+            entry
+            for entry in entries
+            if self._matches_prefix(entry, context) and self._is_visible(entry, context)
+        ]
+        ranked = fzf_filter(
+            context.search_pattern,
+            [entry.rel for entry in candidates],
+            should_cancel=should_cancel,
+        )
+        if ranked is None:
+            return None
+
+        facts = self._query_facts(context)
+        boosted: list[tuple[int, int, IndexEntry]] = []
+        plain: list[tuple[int, int, IndexEntry]] = []
+        for position, index in enumerate(ranked):
+            if should_cancel and position % 1024 == 0 and should_cancel():
+                return []
+            entry = candidates[index]
+            if boost := self._boost_key(entry, facts):
+                boosted.append((boost, position, entry))
+            elif len(plain) < self._target_matches:
+                plain.append((0, position, entry))
+
+        # fzf order is already best-first and `position` is unique, so a stable
+        # sort on the boost key alone reproduces the Python ordering.
+        boosted.sort(key=lambda item: item[0], reverse=True)
+        return [
+            (
+                self._format_label(entry),
+                self._build_match_rank(entry, context, -float(position), facts),
+            )
+            for _, position, entry in (boosted + plain)[: self._target_matches]
+        ]
+
+    def _boost_key(self, entry: IndexEntry, facts: _QueryFacts) -> int:
+        """The `MatchRank` boost flags packed into an int, most significant first.
+
+        Comparing keys orders entries exactly as comparing the flag prefix of
+        their `MatchRank`s does, without building one for every fzf match.
+        """
+        if not facts.query:
+            return 0
+        key = 0
+        rel = entry.rel_lower
+        if entry.is_dir and rel == facts.pattern_lower:
+            key |= 1 << 7
+        if facts.looks_like_path and self._is_immediate_child_of_prefix(
+            rel, facts.pattern_lower
+        ):
+            key |= 1 << 6
+
+        query = facts.query
+        name = entry.name.lower()
+        # Every name-based flag below implies the name starts with this prefix.
+        name_flags_possible = name.startswith(
+            facts.query_stem if facts.looks_like_filename else query
+        )
+        extension_possible = bool(facts.query_extension) and name.endswith(
+            facts.query_extension
+        )
+        if not (name_flags_possible or extension_possible):
+            return key
+
+        stem, extension = _split_suffix(name)
+        if facts.looks_like_filename and name == query:
+            key |= 1 << 5
+        if stem == query and extension != ".lock":
+            key |= 1 << 4
+        if stem == query or (facts.looks_like_filename and stem == facts.query_stem):
+            key |= 1 << 3
+        if stem.startswith(facts.query_stem if facts.looks_like_filename else query):
+            key |= 1 << 2
+        if name.startswith(query):
+            key |= 1 << 1
+        if facts.query_extension and extension == facts.query_extension:
+            key |= 1
+        return key
 
     def _split_outside_root_dir(self, partial_path: str) -> tuple[str, str] | None:
         if not partial_path:

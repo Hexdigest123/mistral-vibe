@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import stat
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -27,17 +28,14 @@ class IndexEntry:
     rel: str
     rel_lower: str
     name: str
-    path: Path
     is_dir: bool
     ascii_mask: int
 
 
 def build_ascii_mask(value: str) -> int:
     mask = 0
-    for char in value:
-        codepoint = ord(char)
-        if codepoint >= ASCII_CODEPOINT_LIMIT:
-            continue
+    # Non-ASCII characters are dropped; each distinct byte is folded in once.
+    for codepoint in set(value.encode("ascii", "ignore")):
         mask |= 1 << codepoint
     return mask
 
@@ -87,7 +85,13 @@ class FileIndexStore:
 
         if git_entries is None:
             self._ignore_rules.ensure_for_root(resolved_root)
-            entries = self._walk_directory(resolved_root, cancel_check=should_cancel)
+            entries = self._list_fd_entries(resolved_root, should_cancel)
+            if should_cancel and should_cancel():
+                return False
+            if entries is None:
+                entries = self._walk_directory(
+                    resolved_root, cancel_check=should_cancel
+                )
             if entries is None:
                 return False
             self._git_backed = False
@@ -152,7 +156,7 @@ class FileIndexStore:
                 continue
 
             if path.is_dir():
-                dir_entry = self._create_entry(rel_str, path.name, path, True)
+                dir_entry = self._create_entry(rel_str, path.name, True)
                 if dir_entry:
                     self._entries_by_rel[rel_str] = dir_entry
                     modified = True
@@ -163,7 +167,7 @@ class FileIndexStore:
                     self._entries_by_rel[entry.rel] = entry
                     modified = True
             else:
-                file_entry = self._create_entry(rel_str, path.name, path, False)
+                file_entry = self._create_entry(rel_str, path.name, False)
                 if file_entry:
                     self._entries_by_rel[file_entry.rel] = file_entry
                     modified = True
@@ -215,58 +219,73 @@ class FileIndexStore:
         if process.returncode != 0:
             return None
 
+        root_str = os.fspath(root)
         entries_by_rel: dict[str, IndexEntry] = {}
         for raw_path in stdout.split(b"\0"):
             if should_cancel and should_cancel():
                 return None
             if not raw_path:
                 continue
+            # Untracked nested repositories are listed with a trailing slash.
+            rel = raw_path.decode(errors="surrogateescape").rstrip("/")
+            if not rel:
+                continue
+            # One stat answers both questions: tracked-but-deleted paths are
+            # skipped, and submodules or nested repos are directories.
             try:
-                rel = raw_path.decode(errors="surrogateescape")
-            except UnicodeDecodeError:
+                mode = os.stat(os.path.join(root_str, rel)).st_mode
+            except (OSError, ValueError):
                 continue
-            path = root / Path(rel)
-            if not path.exists():
-                continue
-            self._add_git_entry(entries_by_rel, rel, path)
+            self._add_listed_entry(entries_by_rel, rel, stat.S_ISDIR(mode))
 
         return sorted(entries_by_rel.values(), key=lambda entry: entry.rel)
 
-    def _add_git_entry(
-        self, entries_by_rel: dict[str, IndexEntry], rel: str, path: Path
-    ) -> None:
-        parts = Path(rel).parts
-        for index in range(1, len(parts)):
-            parent_parts = parts[:index]
-            parent_rel = Path(*parent_parts).as_posix()
-            entries_by_rel.setdefault(
-                parent_rel,
-                self._new_entry(
-                    parent_rel,
-                    rootless_path=path.parents[len(parts) - index - 1],
-                    is_dir=True,
-                ),
-            )
+    def _list_fd_entries(
+        self, root: Path, should_cancel: Callable[[], bool] | None
+    ) -> list[IndexEntry] | None:
+        from vibe.cli.autocompletion.native_search import fd_list_entries
 
-        normalized_rel = Path(rel).as_posix()
-        entries_by_rel[normalized_rel] = self._new_entry(
-            normalized_rel, rootless_path=path, is_dir=path.is_dir()
+        listing = fd_list_entries(
+            root, self._ignore_rules.default_exclude_patterns, should_cancel
         )
+        if listing is None:
+            return None
+        directories, others = listing
+        entries_by_rel: dict[str, IndexEntry] = {}
+        for rel in directories:
+            self._add_listed_entry(entries_by_rel, rel, True)
+        for rel in others:
+            self._add_listed_entry(entries_by_rel, rel, False)
+        return sorted(entries_by_rel.values(), key=lambda entry: entry.rel)
 
-    def _new_entry(self, rel: str, rootless_path: Path, is_dir: bool) -> IndexEntry:
+    def _add_listed_entry(
+        self, entries_by_rel: dict[str, IndexEntry], rel: str, is_dir: bool
+    ) -> None:
+        """Add ``rel`` and any missing ancestor directories.
+
+        Every stored entry already has its ancestors stored, so the upward walk
+        stops at the first ancestor that is present.
+        """
+        cut = rel.rfind("/")
+        while cut > 0:
+            parent_rel = rel[:cut]
+            if parent_rel in entries_by_rel:
+                break
+            entries_by_rel[parent_rel] = self._new_entry(parent_rel, is_dir=True)
+            cut = rel.rfind("/", 0, cut)
+        entries_by_rel[rel] = self._new_entry(rel, is_dir=is_dir)
+
+    def _new_entry(self, rel: str, is_dir: bool) -> IndexEntry:
         rel_lower = rel.lower()
         return IndexEntry(
             rel=rel,
             rel_lower=rel_lower,
-            name=rootless_path.name,
-            path=rootless_path,
+            name=rel[rel.rfind("/") + 1 :],
             is_dir=is_dir,
             ascii_mask=build_ascii_mask(rel_lower),
         )
 
-    def _create_entry(
-        self, rel_str: str, name: str, path: Path, is_dir: bool
-    ) -> IndexEntry | None:
+    def _create_entry(self, rel_str: str, name: str, is_dir: bool) -> IndexEntry | None:
         if self._ignore_rules.should_ignore(rel_str, name, is_dir):
             return None
         rel_lower = rel_str.lower()
@@ -274,7 +293,6 @@ class FileIndexStore:
             rel=rel_str,
             rel_lower=rel_lower,
             name=name,
-            path=path,
             is_dir=is_dir,
             ascii_mask=build_ascii_mask(rel_lower),
         )
@@ -295,16 +313,17 @@ class FileIndexStore:
                     is_dir = entry.is_dir(follow_symlinks=False)
                     name = entry.name
                     rel_str = f"{rel_prefix}/{name}" if rel_prefix else name
-                    path = Path(entry.path)
 
-                    index_entry = self._create_entry(rel_str, name, path, is_dir)
+                    index_entry = self._create_entry(rel_str, name, is_dir)
                     if not index_entry:
                         continue
 
                     results.append(index_entry)
 
                     if is_dir:
-                        descendants = self._walk_directory(path, rel_str, cancel_check)
+                        descendants = self._walk_directory(
+                            Path(entry.path), rel_str, cancel_check
+                        )
                         if descendants is None:
                             return None
                         results.extend(descendants)

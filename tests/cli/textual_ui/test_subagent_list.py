@@ -45,16 +45,16 @@ def test_subagent_list_renders_identity_status_and_context_usage() -> None:
     assert widget.option_count == 2
     assert str(widget.get_option_at_index(0).prompt) == "  Main conversation"
     assert str(widget.get_option_at_index(1).prompt) == (
-        "  Explore (Test Audit) [running] · 12.5k tokens"
+        "  ● Explore(Test Audit) · running · 12.5k tokens"
     )
 
 
 @pytest.mark.parametrize(
     ("agent_type", "name", "expected_identity"),
     [
-        ("code_review", "security-audit", "Code Review (Security Audit)"),
-        ("repoExplorer", "dependencyScan", "Repo Explorer (Dependency Scan)"),
-        ("API", "API audit", "API (API audit)"),
+        ("code_review", "security-audit", "Code Review(Security Audit)"),
+        ("repoExplorer", "dependencyScan", "Repo Explorer(Dependency Scan)"),
+        ("API", "API audit", "API(API audit)"),
     ],
 )
 def test_subagent_list_humanizes_identifier_names(
@@ -68,7 +68,7 @@ def test_subagent_list_humanizes_identifier_names(
     widget.update_sessions((child,))
 
     assert str(widget.get_option_at_index(1).prompt).startswith(
-        f"  {expected_identity} [running]"
+        f"  ● {expected_identity} · running"
     )
 
 
@@ -89,7 +89,7 @@ def test_subagent_list_renders_terminal_status() -> None:
     widget.update_sessions((child,), selected_session_id=child.id)
 
     assert str(widget.get_option_at_index(1).prompt) == (
-        "  Review (Code review) [stopped] · 0 tokens"
+        "  ● Review(Code review) · stopped · 0 tokens"
     )
 
 
@@ -125,7 +125,7 @@ def test_subagent_list_marks_the_selected_child_without_rebuilding_options() -> 
     assert isinstance(main_prompt, Content)
     assert isinstance(child_prompt, Content)
     assert str(main_prompt) == "  Main conversation"
-    assert str(child_prompt).startswith("  Explore (Test Audit)")
+    assert str(child_prompt).startswith("  ● Explore(Test Audit)")
     assert all("$primary" not in str(span.style) for span in main_prompt.spans)
     selected_span = child_prompt.spans[-1]
     assert (selected_span.start, selected_span.end) == (0, len(child_prompt))
@@ -345,7 +345,7 @@ async def test_idle_subagent_remains_visible_and_keeps_list_focus() -> None:
 
         assert widget.display
         assert widget.option_count == 2
-        assert "[ready]" in str(widget.get_option_at_index(1).prompt)
+        assert "· ready ·" in str(widget.get_option_at_index(1).prompt)
         assert app.focus_input_requests == 0
 
 
@@ -358,7 +358,7 @@ def test_stopped_subagent_remains_until_open_transcript_closes() -> None:
     widget.update_sessions((stopped,), selected_session_id=stopped.id)
 
     assert widget.display
-    assert "[stopped]" in str(widget.get_option_at_index(1).prompt)
+    assert "· stopped ·" in str(widget.get_option_at_index(1).prompt)
 
     widget.update_sessions((stopped,), selected_session_id=None)
 
@@ -379,7 +379,7 @@ def test_completed_sibling_remains_while_batch_is_active() -> None:
 
     assert widget.display
     assert widget.option_count == 3
-    assert "[ready]" in str(widget.get_option_at_index(1).prompt)
+    assert "· ready ·" in str(widget.get_option_at_index(1).prompt)
 
 
 def test_new_active_session_starts_a_fresh_batch() -> None:

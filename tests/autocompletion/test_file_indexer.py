@@ -472,3 +472,47 @@ def test_watcher_toggle_flow_off_on_off(
         _assert_created_file_is_not_indexed(file_indexer, tmp_path, "off_after.py")
     finally:
         file_indexer.shutdown()
+
+
+def test_git_catalog_adds_ancestors_once_and_skips_deleted_tracked_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, file_indexer: FileIndexer
+) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "a" / "b" / "deep.py").write_text("", encoding="utf-8")
+    (tmp_path / "a" / "b" / "sibling.py").write_text("", encoding="utf-8")
+    (tmp_path / "a" / "top.py").write_text("", encoding="utf-8")
+    (tmp_path / "gone.py").write_text("", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    (tmp_path / "gone.py").unlink()
+    monkeypatch.chdir(tmp_path)
+
+    entries = file_indexer.get_index(Path("."))
+
+    by_rel = {entry.rel: entry for entry in entries}
+    assert set(by_rel) == {"a", "a/b", "a/b/deep.py", "a/b/sibling.py", "a/top.py"}
+    assert [entry.rel for entry in entries] == sorted(by_rel)
+    assert by_rel["a"].is_dir and by_rel["a/b"].is_dir
+    assert not by_rel["a/b/deep.py"].is_dir
+    assert by_rel["a/b/deep.py"].name == "deep.py"
+    assert file_indexer._store.is_git_backed
+
+
+def test_git_catalog_lists_untracked_nested_repo_as_a_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, file_indexer: FileIndexer
+) -> None:
+    # `git ls-files --others` prints an untracked nested repository as one
+    # path with a trailing slash ("sub/nested/") instead of recursing into it.
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    nested = tmp_path / "sub" / "nested"
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    (nested / "inner.py").write_text("", encoding="utf-8")
+    (tmp_path / "top.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    entries = {entry.rel: entry for entry in file_indexer.get_index(Path("."))}
+
+    assert set(entries) == {"sub", "sub/nested", "top.py"}
+    assert entries["sub/nested"].is_dir
+    assert entries["sub/nested"].name == "nested"
