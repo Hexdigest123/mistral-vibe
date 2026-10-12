@@ -5,6 +5,7 @@ pub use field::{Field, MAX_INPUT_BYTES};
 pub mod input;
 pub mod items;
 mod request;
+pub mod teleport;
 
 use std::sync::Arc;
 
@@ -37,6 +38,8 @@ pub struct State {
     pub branch_area: ratatui::layout::Rect,
     pub pressed: Option<usize>,
     pub dragged_field: Option<FieldSlot>,
+    pub teleport_pending: bool,
+    pub teleport_prompt: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,7 +95,7 @@ impl State {
         self.query = Field::default();
         self.items.clear();
         self.scroll = 0;
-        self.search_focused = true;
+        self.search_focused = false;
         self.pressed = None;
         self.dragged_field = None;
         self.refresh(None);
@@ -133,20 +136,12 @@ impl State {
 
     pub fn navigate(&mut self, down: bool) {
         let len = self.items.len();
-        let Some(selected) = (1..=len)
-            .map(|offset| {
-                if down {
-                    (self.selected + offset) % len
-                } else {
-                    (self.selected + len - offset) % len
-                }
-            })
-            .find(|&index| self.items[index].selectable())
+        let selectable = |index: usize| self.items[index].selectable();
+        let Some(selected) = crate::list_nav::wrap_selectable(self.selected, len, down, selectable)
         else {
             return;
         };
         self.selected = selected;
-        self.search_focused = false;
         self.free_scroll = false;
     }
 }
@@ -155,7 +150,6 @@ pub fn open(app: &mut App, client: &Arc<Client>) {
     if app.vibe_code_project.pending {
         return;
     }
-    crate::commands::usage::record_usage(app, client, "remote-project".into(), "builtin");
     app.vibe_code_project = State::default();
     request::start(app, client, Operation::Open);
 }
@@ -174,6 +168,15 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, reply: Reply) {
     let cancel = std::mem::take(&mut app.vibe_code_project.cancel_requested);
     match reply.event {
         Event::Opened(response) => {
+            if !cancel && app.vibe_code_project.teleport_pending {
+                if let Some(project_id) = response.resolved_project_id {
+                    app.vibe_code_project.picker_id = response.picker_id;
+                    return teleport::continue_pending(app, client, project_id);
+                }
+                if response.view.saved_project_link_cleared {
+                    result(app, teleport::REMOTE_CHANGED_MESSAGE);
+                }
+            }
             let state = &mut app.vibe_code_project;
             state.picker_id = response.picker_id;
             state.view = Some(response.view);
@@ -204,6 +207,12 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, reply: Reply) {
             } else {
                 request::start(app, client, Operation::Select(response.project.project_id));
             }
+        }
+        Event::Selected(_) if app.vibe_code_project.teleport_pending && cancel => {
+            request::start(app, client, Operation::Cancel);
+        }
+        Event::Selected(response) if app.vibe_code_project.teleport_pending => {
+            teleport::continue_pending(app, client, response.project.project_id);
         }
         Event::Selected(response) => {
             result(

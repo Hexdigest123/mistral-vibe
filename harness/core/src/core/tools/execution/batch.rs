@@ -4,6 +4,9 @@ use serde_json::json;
 use crate::core::action_id;
 use crate::core::error::CoreError;
 use crate::core::features::large_output::{ResultDisposition, evaluate_result};
+use crate::core::features::permissions::{
+    ApprovalFailureReason, ApprovalOutcome, GrantKey, PermissionResolution,
+};
 use crate::core::features::programmatic_tool_calling::{
     AcceptedProgramResult, CompletedProgramResult, ProgramAdvance, ProgramInput, ProgramOutcome,
     ProgramTransition, dispatch as dispatch_program,
@@ -20,7 +23,10 @@ use crate::core::tools::execution::{
     LargeOutputSource, ToolBatch, ToolExecution, ToolExecutionState,
 };
 use crate::core::tools::external::ExternalToolCall;
-use crate::core::tools::result::{invalid_tool_call_result, model_tool_result_message};
+use crate::core::tools::result::{
+    approval_failed_result, invalid_tool_call_result, model_tool_result_message,
+    permission_denied_result,
+};
 use crate::core::wire::message::Message;
 use crate::core::wire::tool::{ProtocolError, ToolCall, ToolResult};
 
@@ -93,10 +99,12 @@ fn start_tool_execution(
             observations,
         ));
     }
-    if let Some(result) =
-        tools.with_program_context(|context| dispatch_program(context, &call, determinism))
-    {
+    let mut accepted_results = Vec::new();
+    if let Some(result) = tools.with_program_context(|context| {
+        dispatch_program(context, &call, determinism, &mut accepted_results)
+    }) {
         let (outcome, effects) = result?;
+        let mut observations = accepted_program_results(tools.turn_id, accepted_results);
         return match outcome {
             ProgramOutcome::Pending(execution) => Ok((
                 ToolExecution {
@@ -104,7 +112,7 @@ fn start_tool_execution(
                     state: ToolExecutionState::ProgramPending { execution },
                 },
                 effects,
-                Vec::new(),
+                observations,
             )),
             ProgramOutcome::Completed(completed) => {
                 if !effects.is_empty() {
@@ -118,33 +126,89 @@ fn start_tool_execution(
                     LargeOutputSource::RunTypescript,
                     *completed,
                 )?;
+                observations.extend(finalized.observations);
                 Ok((
                     ToolExecution {
                         call,
                         state: finalized.state,
                     },
                     finalized.actions,
-                    finalized.observations,
+                    observations,
                 ))
             }
         };
     }
-    match direct_tool_execution_from_resolved_tools(tools, &call) {
-        Ok((execution, effect)) => Ok((
-            ToolExecution {
+    let (execution_state, action) = match direct_tool_execution_from_resolved_tools(tools, &call) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Ok(completed_execution(
+                tools.turn_id,
                 call,
-                state: execution,
-            },
-            vec![effect],
-            Vec::new(),
-        )),
-        Err(error) => Ok(completed_execution(
-            tools.turn_id,
+                invalid_tool_call_result(error.detail().to_string()),
+                Vec::new(),
+            ));
+        }
+    };
+
+    let (execution_state, action) = match execution_state {
+        ToolExecutionState::DirectPending {
+            call: external_call,
+        } => match tools.permission_resolution(&external_call) {
+            PermissionResolution::Allow => (
+                ToolExecutionState::DirectPending {
+                    call: external_call,
+                },
+                action,
+            ),
+            PermissionResolution::Deny => {
+                return Ok(completed_execution(
+                    tools.turn_id,
+                    call,
+                    permission_denied_result(),
+                    Vec::new(),
+                ));
+            }
+            PermissionResolution::Ask(grant_key) => {
+                awaiting_direct_approval(tools, external_call, grant_key)?
+            }
+        },
+        execution_state => (execution_state, action),
+    };
+
+    Ok((
+        ToolExecution {
             call,
-            invalid_tool_call_result(error.detail().to_string()),
-            Vec::new(),
-        )),
-    }
+            state: execution_state,
+        },
+        vec![action],
+        Vec::new(),
+    ))
+}
+
+fn awaiting_direct_approval(
+    tools: ToolContext<'_>,
+    call: ExternalToolCall,
+    grant_key: GrantKey,
+) -> Result<(ToolExecutionState, Action), CoreError> {
+    let approval_action_id = action_id::approval(&call.action_id);
+    let display_name = call
+        .call
+        .direct_model_name()
+        .expect("direct approval call has a model-visible name");
+    let approval = Action::approval(
+        approval_action_id.clone(),
+        tools.turn_id,
+        &grant_key,
+        &call,
+        display_name,
+    );
+    let execution_state = ToolExecutionState::DirectAwaitingApproval {
+        approval_action_id,
+        grant_key,
+        call,
+    };
+
+    Ok((execution_state, approval))
 }
 
 fn advance_program(
@@ -158,7 +222,7 @@ fn advance_program(
     let parent_call = execution.call.clone();
     let ProgramTransition {
         advance,
-        accepted_result,
+        accepted_results,
     } = {
         let ToolExecutionState::ProgramPending { execution: program } = &mut execution.state else {
             return Err(CoreError::invariant(
@@ -169,9 +233,7 @@ fn advance_program(
             program.advance(context, &parent_call, input, determinism)
         })?
     };
-    if let Some(accepted) = accepted_result {
-        observations.push(accepted_program_result(tools.turn_id, accepted));
-    }
+    observations.extend(accepted_program_results(tools.turn_id, accepted_results));
     match advance {
         ProgramAdvance::Pending {
             actions: next_actions,
@@ -305,6 +367,16 @@ fn accepted_program_result(turn_id: &str, accepted: AcceptedProgramResult) -> Ob
     }
 }
 
+fn accepted_program_results(
+    turn_id: &str,
+    accepted_results: Vec<AcceptedProgramResult>,
+) -> Vec<Observation> {
+    accepted_results
+        .into_iter()
+        .map(|accepted| accepted_program_result(turn_id, accepted))
+        .collect()
+}
+
 fn accepted_direct_result(
     turn_id: &str,
     operation_id: &str,
@@ -325,8 +397,8 @@ fn completed_execution(
     result: ToolResult,
     mut observations: Vec<Observation>,
 ) -> (ToolExecution, Vec<Action>, Vec<Observation>) {
-    observations.push(tool_execution_finished(turn_id, &call.id, result.clone()));
     let state = completed_external_tool_state(&call, &result);
+    observations.push(tool_execution_finished(turn_id, &call.id, result));
     (ToolExecution { call, state }, Vec::new(), observations)
 }
 
@@ -381,7 +453,8 @@ pub(crate) fn finish_tool_batch_action(
             ToolExecutionState::ProgramPending { execution } => {
                 execution.handles_tool_action(action_id)
             }
-            ToolExecutionState::DirectAwaitingPreHook { .. }
+            ToolExecutionState::DirectAwaitingApproval { .. }
+            | ToolExecutionState::DirectAwaitingPreHook { .. }
             | ToolExecutionState::DirectAwaitingPostHook { .. }
             | ToolExecutionState::AwaitingLargeOutputWrite { .. } => false,
             ToolExecutionState::Completed { .. } => false,
@@ -447,7 +520,8 @@ pub(crate) fn finish_tool_batch_action(
                 &mut observations,
             )?;
         }
-        ToolExecutionState::DirectAwaitingPreHook { .. }
+        ToolExecutionState::DirectAwaitingApproval { .. }
+        | ToolExecutionState::DirectAwaitingPreHook { .. }
         | ToolExecutionState::DirectAwaitingPostHook { .. } => unreachable!(),
         ToolExecutionState::AwaitingLargeOutputWrite { .. } => unreachable!(),
         ToolExecutionState::Completed { .. } => unreachable!(),
@@ -509,6 +583,104 @@ pub(crate) fn finish_tool_batch_filesystem_write(
     Ok(ToolBatchTransition {
         resolution: resolve_tool_batch(batch, Vec::new()),
         observations,
+    })
+}
+
+pub(crate) fn finish_tool_batch_approval(
+    tools: ToolContext<'_>,
+    mut batch: ToolBatch,
+    action_id: &str,
+    resolution: Result<ApprovalOutcome, ApprovalFailureReason>,
+    determinism: DeterminismContext,
+) -> Result<ToolBatchTransition, CoreError> {
+    for execution_index in 0..batch.executions.len() {
+        let ToolExecutionState::ProgramPending { execution: program } =
+            &mut batch.executions[execution_index].state
+        else {
+            continue;
+        };
+
+        let Some(call) = program.pending_approval(action_id) else {
+            continue;
+        };
+
+        let result = match resolution {
+            Ok(ApprovalOutcome::Approve) => {
+                let action = external_tool_effect(tools, call)?;
+                program
+                    .approve_pending_approval(action_id)
+                    .expect("program approval was found before resolution");
+
+                return Ok(ToolBatchTransition {
+                    resolution: resolve_tool_batch(batch, vec![action]),
+                    observations: Vec::new(),
+                });
+            }
+            Ok(ApprovalOutcome::Reject) => permission_denied_result(),
+            Err(failure_reason) => approval_failed_result(failure_reason),
+        };
+        let mut actions = Vec::new();
+        let mut observations = Vec::new();
+        advance_program(
+            tools,
+            &mut batch.executions[execution_index],
+            ProgramInput::ApprovalResult {
+                action_id: action_id.to_owned(),
+                result,
+            },
+            determinism,
+            &mut actions,
+            &mut observations,
+        )?;
+
+        return Ok(ToolBatchTransition {
+            resolution: resolve_tool_batch(batch, actions),
+            observations,
+        });
+    }
+
+    let execution = batch
+        .executions
+        .iter_mut()
+        .find(|execution| {
+            matches!(
+                &execution.state,
+                ToolExecutionState::DirectAwaitingApproval {
+                    approval_action_id,
+                    ..
+                } if approval_action_id == action_id
+            )
+        })
+        .ok_or_else(|| {
+            CoreError::invalid_command(format!(
+                "pending approval action {action_id:?} was not found"
+            ))
+        })?;
+
+    let ToolExecutionState::DirectAwaitingApproval { call, .. } = &execution.state else {
+        unreachable!();
+    };
+    let call = call.clone();
+
+    let result = match resolution {
+        Ok(ApprovalOutcome::Approve) => {
+            let action = external_tool_effect(tools, &call)?;
+            execution.state = ToolExecutionState::DirectPending { call };
+
+            return Ok(ToolBatchTransition {
+                resolution: resolve_tool_batch(batch, vec![action]),
+                observations: Vec::new(),
+            });
+        }
+        Ok(ApprovalOutcome::Reject) => permission_denied_result(),
+        Err(failure_reason) => approval_failed_result(failure_reason),
+    };
+    execution.state = completed_external_tool_state(&execution.call, &result);
+    let observation = tool_execution_finished(tools.turn_id, &execution.call.id, result);
+
+    Ok(ToolBatchTransition {
+        resolution: resolve_tool_batch(batch, Vec::new()),
+        observations: vec![observation],
     })
 }
 
@@ -586,10 +758,30 @@ pub(crate) fn finish_tool_batch_hook(
                     effective_arguments,
                 } => {
                     let effective_call = tools.effective_call(&original, effective_arguments)?;
-                    effects.push(external_tool_effect(tools, &effective_call)?);
-                    execution.state = ToolExecutionState::DirectPending {
-                        call: effective_call,
-                    };
+                    match tools.permission_resolution(&effective_call) {
+                        PermissionResolution::Allow => {
+                            effects.push(external_tool_effect(tools, &effective_call)?);
+                            execution.state = ToolExecutionState::DirectPending {
+                                call: effective_call,
+                            };
+                        }
+                        PermissionResolution::Deny => {
+                            let result = permission_denied_result();
+                            execution.state =
+                                completed_external_tool_state(&execution.call, &result);
+                            observations.push(tool_execution_finished(
+                                tools.turn_id,
+                                &execution.call.id,
+                                result,
+                            ));
+                        }
+                        PermissionResolution::Ask(grant_key) => {
+                            let (execution_state, approval) =
+                                awaiting_direct_approval(tools, effective_call, grant_key)?;
+                            execution.state = execution_state;
+                            effects.push(approval);
+                        }
+                    }
                 }
                 PreToolCallOutput::Skip { reason } => {
                     let skipped = skipped_tool_result(reason)?;

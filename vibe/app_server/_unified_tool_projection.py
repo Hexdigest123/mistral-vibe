@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
+import os
+from pathlib import Path
 from typing import Annotated, Literal, Self, cast
 
 from pydantic import (
@@ -15,6 +18,7 @@ from pydantic import (
     model_validator,
 )
 
+from vibe.app_server._cron import CronArgs
 from vibe.app_server.models import (
     ApprovalCallbackDetail,
     CompletedEffectState,
@@ -41,6 +45,12 @@ from vibe.app_server.models import (
     PublicCallbackEntry,
     PublicEffectEntry,
     PublicHistoryEntry,
+    ScratchpadEffectDetail,
+    ScratchpadEffectInput,
+    ScratchpadEffectOutput,
+    ScratchpadListInput,
+    ScratchpadReadInput,
+    ScratchpadWriteInput,
     ShellEffectDetail,
     ShellEffectInput,
     ShellEffectOutput,
@@ -63,7 +73,9 @@ from vibe.app_server.models import (
 )
 
 _SEARCH_REPLACE_ANNOTATION_KEY = "mistralai.vibe.sdk.search_replace"
+_WRITE_FILE_ANNOTATION_KEY = "mistralai.vibe.sdk.write_file"
 type UnifiedToolCategory = Literal[
+    "cron",
     "file_edit",
     "file_read",
     "file_search",
@@ -102,6 +114,9 @@ class _WriteArguments(_SourceModel):
 
 class _WriteResult(_SourceModel):
     path: str = Field(min_length=1)
+    # Required: a Runtime that does not report this leaves the call generic
+    # rather than having it read as a creation.
+    file_existed: bool
 
 
 class _SearchReplaceChange(_SourceModel):
@@ -134,6 +149,10 @@ class _SearchReplacePreview(_SourceModel):
 
 class _SearchReplaceAnnotations(_SourceModel):
     blocks: list[_SearchReplacePreview] = Field(min_length=1)
+
+
+class _WriteFileAnnotations(_SourceModel):
+    previous_content: str
 
 
 class _ShellArguments(_SourceModel):
@@ -207,12 +226,28 @@ class _TodoResult(_SourceModel):
 class _ScratchpadArguments(_SourceModel):
     action: str = Field(min_length=1)
     path: str | None = None
+    content: str | None = None
 
 
 class _ScratchpadResult(_SourceModel):
     verb: str = Field(min_length=1)
     path: str | None = None
+    content: str | None = None
     files: list[str] = Field(default_factory=list)
+
+
+class _CronLoop(_SourceModel):
+    id: str = Field(min_length=1)
+    prompt: str = Field(min_length=1)
+    interval_seconds: int | None = Field(default=None, ge=30)
+    cron: str | None = None
+    next_fire_at: float = Field(allow_inf_nan=False)
+
+
+class _CronResult(_SourceModel):
+    message: str
+    loops: list[_CronLoop]
+    cleared_count: int | None = Field(default=None, ge=0)
 
 
 class _ToolResultEnvelope(_SourceModel):
@@ -220,6 +255,22 @@ class _ToolResultEnvelope(_SourceModel):
 
     structured_content: dict[str, JsonValue]
     meta: dict[str, JsonValue] | None = Field(default=None, alias="_meta")
+
+
+# Mirrors the tag the Harness stamps into large-output receipts
+# (format_truncated_output in harness-core/src/core/features/large_output/mod.rs).
+# If the Harness renames it, receipt detection silently breaks.
+_TRUNCATED_OUTPUT_TAG = "<truncated-output>"
+
+
+class _ReceiptBlock(_SourceModel):
+    text: str
+
+
+class _LargeOutputReceipt(_SourceModel):
+    content: list[_ReceiptBlock]
+    # Only its absence matters, so a normal result is not validated in depth.
+    structured_content: object = None
 
 
 class _ProcessStartArguments(_SourceModel):
@@ -317,16 +368,22 @@ class _ProjectedCall:
     project_result: Callable[[CompletedEffectState], CompletedEffectState]
 
 
-def project_unified_history_entry(entry: PublicHistoryEntry) -> PublicHistoryEntry:
-    """Project one migration history entry without mutating source history."""
+def project_unified_history_entry(
+    entry: PublicHistoryEntry, display_roots: Sequence[Path] = ()
+) -> PublicHistoryEntry:
+    """Project one migration history entry without mutating source history.
+
+    Displayed file paths under one of ``display_roots`` (first match wins) are
+    shown relative to it.
+    """
     if isinstance(entry, PublicEffectEntry):
-        return _project_effect(entry)
+        return _project_effect(entry, display_roots)
     if not isinstance(entry, PublicCallbackEntry):
         return entry
     detail = entry.detail
     if not isinstance(detail, ApprovalCallbackDetail):
         return entry
-    projected = _project_call(detail.effect)
+    projected = _project_call(detail.effect, display_roots)
     if projected is None:
         return entry
     return entry.model_copy(
@@ -350,12 +407,22 @@ def unified_tool_category(entry: PublicHistoryEntry) -> UnifiedToolCategory | No
     return _TOOL_CATEGORIES.get(detail.tool_name)
 
 
-def _project_effect(entry: PublicEffectEntry) -> PublicEffectEntry:
-    projected = _project_call(entry.detail)
+def _project_effect(
+    entry: PublicEffectEntry, display_roots: Sequence[Path]
+) -> PublicEffectEntry:
+    projected = _project_call(entry.detail, display_roots)
     if projected is None:
         return entry
     state = entry.state
-    if isinstance(state, CompletedEffectState):
+    semantic = not isinstance(projected.detail, GenericEffectDetail)
+    receipt = (
+        _receipt_text(state)
+        if semantic and isinstance(state, CompletedEffectState)
+        else None
+    )
+    if isinstance(state, CompletedEffectState) and receipt is not None:
+        state = _receipt_state(state, projected.detail, receipt)
+    elif isinstance(state, CompletedEffectState):
         try:
             state = projected.project_result(state)
         except (TypeError, ValueError, ValidationError):
@@ -363,22 +430,80 @@ def _project_effect(entry: PublicEffectEntry) -> PublicEffectEntry:
     return entry.model_copy(update={"detail": projected.detail, "state": state})
 
 
-def _project_call(detail: EffectDetail) -> _ProjectedCall | None:
+def is_large_output_receipt(entry: PublicHistoryEntry) -> bool:
+    """Whether the Harness swapped this call's oversized result for a text receipt."""
+    return (
+        isinstance(entry, PublicEffectEntry)
+        and isinstance(entry.state, CompletedEffectState)
+        and _receipt_text(entry.state) is not None
+    )
+
+
+def _receipt_text(state: CompletedEffectState) -> str | None:
+    try:
+        receipt = _LargeOutputReceipt.model_validate(state.output)
+    except ValidationError:
+        return None
+    text = "\n".join(block.text for block in receipt.content)
+    if receipt.structured_content is not None or _TRUNCATED_OUTPUT_TAG not in text:
+        return None
+    return text
+
+
+def _receipt_state(
+    state: CompletedEffectState, detail: EffectDetail, receipt: str
+) -> CompletedEffectState:
+    # The structured result is gone, so keep the semantic call and settle its
+    # header. The receipt does not fit the kind's output, so clients show it
+    # from output_text, unless the call already streamed its own output there.
+    call = detail.display
+    display = EffectResultDisplay(
+        success=state.display.success,
+        verb=call.settled_verb,
+        message=call.settled_message or call.message or call.summary,
+        suffix="(truncated)",
+    )
+    return _completed_state(
+        state, None, display, output_text=state.output_text or receipt
+    )
+
+
+def _project_call(
+    detail: EffectDetail, display_roots: Sequence[Path]
+) -> _ProjectedCall | None:
     if not isinstance(detail, GenericEffectDetail):
         return None
+    path_projector = _PATH_PROJECTORS.get(detail.tool_name)
     projector = _CALL_PROJECTORS.get(detail.tool_name)
-    if projector is not None:
-        try:
+    try:
+        if path_projector is not None:
+            return path_projector(detail, display_roots)
+        if projector is not None:
             return projector(detail)
-        except (TypeError, ValueError, ValidationError):
-            return None
+    except (TypeError, ValueError, ValidationError):
+        return None
     label = _TOOL_LABELS.get(detail.tool_name)
     if label is not None:
         return _project_labeled(detail, label)
     return None
 
 
-def _project_read(detail: GenericEffectDetail) -> _ProjectedCall:
+def _display_path(path: str, display_roots: Sequence[Path]) -> str:
+    """The path relative to the first display root holding it, else unchanged."""
+    target = Path(path)
+    if not target.is_absolute():
+        return path
+    target = Path(os.path.normpath(target))
+    for root in display_roots:
+        if target.is_relative_to(root):
+            relative = target.relative_to(root)
+            return target.name if relative == Path() else str(relative)
+    return path
+
+
+def _project_read(
+    detail: GenericEffectDetail, display_roots: Sequence[Path]
+) -> _ProjectedCall:
     arguments = _ReadArguments.model_validate(detail.input)
     requested_offset = _display_offset(arguments.offset)
     semantic = FileReadEffectDetail(
@@ -386,7 +511,9 @@ def _project_read(detail: GenericEffectDetail) -> _ProjectedCall:
         input=FileReadEffectInput(
             file_path=arguments.path, offset=requested_offset, limit=arguments.limit
         ),
-        display=_file_display("Reading", "Read", arguments.path),
+        display=_file_display(
+            "Reading", "Read", _display_path(arguments.path, display_roots)
+        ),
     )
 
     def project_result(state: CompletedEffectState) -> CompletedEffectState:
@@ -405,7 +532,10 @@ def _project_read(detail: GenericEffectDetail) -> _ProjectedCall:
         display = EffectResultDisplay(
             success=True,
             verb="Read",
-            message=f"{result.lines_read} {word} from {result.path}",
+            message=(
+                f"{result.lines_read} {word} from "
+                f"{_display_path(result.path, display_roots)}"
+            ),
             suffix="(truncated)" if result.was_truncated else "",
         )
         return _completed_state(state, output, display)
@@ -413,27 +543,43 @@ def _project_read(detail: GenericEffectDetail) -> _ProjectedCall:
     return _ProjectedCall(detail=semantic, project_result=project_result)
 
 
-def _project_write(detail: GenericEffectDetail) -> _ProjectedCall:
+def _project_write(
+    detail: GenericEffectDetail, display_roots: Sequence[Path]
+) -> _ProjectedCall:
     arguments = _WriteArguments.model_validate(detail.input)
     semantic = FileWriteEffectDetail(
         tool_name=detail.tool_name,
         input=FileWriteEffectInput(file_path=arguments.path, content=arguments.content),
         display=_file_display(
-            "Writing", "Created", arguments.path, content=arguments.content
+            "Writing",
+            "Created",
+            _display_path(arguments.path, display_roots),
+            content=arguments.content,
         ),
     )
 
     def project_result(state: CompletedEffectState) -> CompletedEffectState:
         envelope = _ToolResultEnvelope.model_validate(state.output)
         result = _WriteResult.model_validate(envelope.structured_content)
-        output = FileWriteEffectOutput(file_path=result.path, content=arguments.content)
-        display = EffectResultDisplay(success=True, verb="Created", message=result.path)
+        output = FileWriteEffectOutput(
+            file_path=result.path,
+            content=arguments.content,
+            file_existed=result.file_existed,
+            previous_content=_replaced_content(envelope),
+        )
+        display = EffectResultDisplay(
+            success=True,
+            verb="Updated" if result.file_existed else "Created",
+            message=_display_path(result.path, display_roots),
+        )
         return _completed_state(state, output, display)
 
     return _ProjectedCall(detail=semantic, project_result=project_result)
 
 
-def _project_search_replace(detail: GenericEffectDetail) -> _ProjectedCall:
+def _project_search_replace(
+    detail: GenericEffectDetail, display_roots: Sequence[Path]
+) -> _ProjectedCall:
     arguments = _SearchReplaceArguments.model_validate(detail.input)
     semantic = FileEditEffectDetail(
         tool_name=detail.tool_name,
@@ -448,7 +594,9 @@ def _project_search_replace(detail: GenericEffectDetail) -> _ProjectedCall:
                 for change in arguments.content
             ],
         ),
-        display=_file_display("Editing", "Edited", arguments.file_path),
+        display=_file_display(
+            "Editing", "Edited", _display_path(arguments.file_path, display_roots)
+        ),
     )
 
     def project_result(state: CompletedEffectState) -> CompletedEffectState:
@@ -467,7 +615,10 @@ def _project_search_replace(detail: GenericEffectDetail) -> _ProjectedCall:
             ],
         )
         display = EffectResultDisplay(
-            success=True, verb="Edited", message=result.file, warnings=result.warnings
+            success=True,
+            verb="Edited",
+            message=_display_path(result.file, display_roots),
+            warnings=result.warnings,
         )
         return _completed_state(state, output, display)
 
@@ -556,15 +707,21 @@ def _short_process_id(process_id: str) -> str:
 
 
 def _process_call_display(
-    verb: str, message: str, settled_verb: str, settled_message: str
+    verb: str,
+    message: str,
+    settled_verb: str,
+    settled_message: str,
+    *,
+    status_text: str | None = None,
 ) -> EffectCallDisplay:
+    summary = f"{verb} {message}".strip()
     return EffectCallDisplay(
-        summary=f"{verb} {message}".strip(),
+        summary=summary,
         verb=verb,
         message=message,
         settled_verb=settled_verb,
         settled_message=settled_message,
-        status_text=f"{verb} {message}".strip(),
+        status_text=status_text or summary,
     )
 
 
@@ -579,7 +736,11 @@ def _process_detail(
 def _project_process_start(detail: GenericEffectDetail) -> _ProjectedCall:
     arguments = _ProcessStartArguments.model_validate(detail.input)
     display = _process_call_display(
-        "Starting", arguments.command, "Started", arguments.command
+        "Starting",
+        arguments.command,
+        "Started",
+        arguments.command,
+        status_text="Starting process",
     )
     semantic = _process_detail(detail, display)
 
@@ -818,12 +979,15 @@ def _project_web_fetch(detail: GenericEffectDetail) -> _ProjectedCall:
     return _ProjectedCall(detail=semantic, project_result=project_result)
 
 
-def _project_grep(detail: GenericEffectDetail) -> _ProjectedCall:
+def _project_grep(
+    detail: GenericEffectDetail, display_roots: Sequence[Path]
+) -> _ProjectedCall:
     arguments = _GrepArguments.model_validate(detail.input)
     pattern = arguments.pattern
     message = f"'{pattern}'"
-    if arguments.path != ".":
-        message += f" in {arguments.path}"
+    searched = Path(os.path.normpath(arguments.path))
+    if arguments.path != "." and searched not in display_roots[:1]:
+        message += f" in {_display_path(arguments.path, display_roots)}"
     if arguments.max_matches is not None:
         message += f" (max {arguments.max_matches} matches)"
     if not arguments.use_default_ignore:
@@ -914,20 +1078,149 @@ def _project_todo(detail: GenericEffectDetail) -> _ProjectedCall:
     return _ProjectedCall(detail=semantic, project_result=project_result)
 
 
+def _cron_schedule(interval_seconds: int | None, cron: str | None) -> str:
+    if (interval_seconds is None) == (cron is None):
+        raise ValueError("A scheduled prompt must have exactly one schedule")
+    if interval_seconds is None:
+        return f"cron {cron} (local time)"
+    parts = []
+    for divisor, unit in (
+        (86400, "day"),
+        (3600, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ):
+        count, interval_seconds = divmod(interval_seconds, divisor)
+        if count:
+            parts.append(f"{count} {unit}{'s' if count != 1 else ''}")
+    return f"every {' '.join(parts)}"
+
+
+def _cron_prompt_summary(prompt: str) -> str:
+    return " ".join(prompt.split())[:100]
+
+
+def _cron_result_text(result: _CronResult, *, action: str) -> str:
+    if action == "clear":
+        count = result.cleared_count
+        return (
+            result.message
+            if count is None
+            else f"Cleared {count} scheduled loop{'s' if count != 1 else ''}"
+        )
+    if not result.loops:
+        return "No scheduled prompts."
+    sections = []
+    for loop in result.loops:
+        schedule = _cron_schedule(loop.interval_seconds, loop.cron)
+        prompt = loop.prompt.replace("\n", "\n  ")
+        lines = [f"Prompt: {prompt}", f"Schedule: {schedule}"]
+        if action != "cancel":
+            try:
+                next_run = datetime.fromtimestamp(loop.next_fire_at).astimezone()
+            except (OverflowError, OSError) as exc:
+                raise ValueError("Invalid scheduled prompt timestamp") from exc
+            lines.append(f"Next run: {next_run:%Y-%m-%d %H:%M:%S %Z}")
+        lines.append(f"ID: {loop.id}")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
+def _project_cron(detail: GenericEffectDetail) -> _ProjectedCall:
+    args = CronArgs.model_validate(detail.input).root
+    match args.action:
+        case "schedule":
+            verb, settled = "Scheduling", "Scheduled"
+            message = f"{_cron_schedule(args.interval_seconds, None)}: {_cron_prompt_summary(args.prompt)}"
+        case "schedule_cron":
+            verb, settled = "Scheduling", "Scheduled"
+            message = f"{_cron_schedule(None, args.cron)}: {_cron_prompt_summary(args.prompt)}"
+        case "list":
+            verb, settled, message = "Listing", "Listed", "scheduled prompts"
+        case "cancel":
+            verb, settled, message = (
+                "Cancelling",
+                "Cancelled",
+                f"scheduled prompt {args.id}",
+            )
+        case "clear":
+            verb, settled, message = "Clearing", "Cleared", "scheduled prompts"
+    display = EffectCallDisplay(
+        summary=f"{verb} {message}",
+        verb=verb,
+        message=message,
+        settled_verb=settled,
+        settled_message=message,
+        status_text=f"{verb} recurring prompts",
+    )
+
+    def project_result(state: CompletedEffectState) -> CompletedEffectState:
+        envelope = _ToolResultEnvelope.model_validate(state.output)
+        result = _CronResult.model_validate(envelope.structured_content)
+        settled_message = message
+        if args.action == "list":
+            count = len(result.loops)
+            settled_message = f"{count} scheduled prompt{'s' if count != 1 else ''}"
+        elif args.action == "cancel" and result.loops:
+            settled_message = _cron_prompt_summary(result.loops[0].prompt)
+        elif args.action == "clear":
+            count = result.cleared_count
+            settled_message = (
+                "scheduled prompts"
+                if count is None
+                else f"{count} scheduled loop{'s' if count != 1 else ''}"
+            )
+        body = _cron_result_text(result, action=args.action)
+        return state.model_copy(
+            update={
+                "display": state.display.model_copy(
+                    update={"verb": settled, "message": settled_message}
+                ),
+                "output": body,
+                "output_text": body,
+            }
+        )
+
+    return _ProjectedCall(
+        detail=detail.model_copy(update={"display": display}),
+        project_result=project_result,
+    )
+
+
+_SCRATCHPAD_VERBS: dict[str, tuple[str, str]] = {
+    "list": ("Listing", "Listed"),
+    "read": ("Reading", "Read"),
+    "write": ("Saving", "Saved"),
+}
+
+
+# An action outside these three is not a scratchpad call this surface knows, so
+# `_project_call` catches the error and the entry stays generic.
+def _scratchpad_input(arguments: _ScratchpadArguments) -> ScratchpadEffectInput:
+    match arguments.action:
+        case "list":
+            return ScratchpadListInput()
+        case "read":
+            if arguments.path is None:
+                raise ValueError("a scratchpad read names no file")
+            return ScratchpadReadInput(path=arguments.path)
+        case "write":
+            if arguments.path is None or arguments.content is None:
+                raise ValueError("a scratchpad write has no file or no note")
+            return ScratchpadWriteInput(path=arguments.path, content=arguments.content)
+        case _:
+            raise ValueError(f"unknown scratchpad action: {arguments.action}")
+
+
 def _project_scratchpad(detail: GenericEffectDetail) -> _ProjectedCall:
     arguments = _ScratchpadArguments.model_validate(detail.input)
-    # No semantic detail type: like `_project_labeled`, this rewrites the display
-    # and leaves the generic effect intact.
-    noun = arguments.path or "the scratchpad"
-    if arguments.action == "read":
-        verb, settled_verb = "Reading", "Read"
-    elif arguments.action == "write":
-        verb, settled_verb = "Saving", "Saved"
-    elif arguments.action == "list":
-        verb, settled_verb, noun = "Listing", "Listed", "the scratchpad"
-    else:
-        verb, settled_verb = "Running", "Ran"
-        noun = f"unknown scratchpad action: {arguments.action}"
+    semantic_input = _scratchpad_input(arguments)
+    verb, settled_verb = _SCRATCHPAD_VERBS[semantic_input.action]
+    noun = (
+        "the scratchpad"
+        if isinstance(semantic_input, ScratchpadListInput)
+        else semantic_input.path
+    )
     display = EffectCallDisplay(
         summary=f"{verb} {noun}",
         verb=verb,
@@ -936,21 +1229,46 @@ def _project_scratchpad(detail: GenericEffectDetail) -> _ProjectedCall:
         settled_message=noun,
         status_text="Using the scratchpad",
     )
-    semantic = detail.model_copy(update={"display": display})
+    semantic = ScratchpadEffectDetail(
+        tool_name=detail.tool_name, input=semantic_input, display=display
+    )
 
     def project_result(state: CompletedEffectState) -> CompletedEffectState:
         envelope = _ToolResultEnvelope.model_validate(state.output)
         result = _ScratchpadResult.model_validate(envelope.structured_content)
         settled = result.path or f"{len(result.files)} files"
+        # The executor does not echo a write's note back, so it comes from the call.
+        content = (
+            semantic_input.content
+            if isinstance(semantic_input, ScratchpadWriteInput)
+            else result.content
+        )
+        output = ScratchpadEffectOutput(
+            path=result.path, content=content, files=result.files
+        )
         return state.model_copy(
             update={
                 "display": state.display.model_copy(
                     update={"verb": result.verb, "message": settled}
-                )
+                ),
+                "output": cast(
+                    JsonValue,
+                    output.model_dump(mode="json", by_alias=True, exclude_none=False),
+                ),
             }
         )
 
     return _ProjectedCall(detail=semantic, project_result=project_result)
+
+
+def _replaced_content(envelope: _ToolResultEnvelope) -> str | None:
+    """What the write replaced, absent for a creation or an unreadable file."""
+    annotation = (
+        None if envelope.meta is None else envelope.meta.get(_WRITE_FILE_ANNOTATION_KEY)
+    )
+    if annotation is None:
+        return None
+    return _WriteFileAnnotations.model_validate(annotation).previous_content
 
 
 def _search_replace_annotations(
@@ -965,7 +1283,7 @@ def _search_replace_annotations(
 
 def _completed_state(
     state: CompletedEffectState,
-    output: BaseModel,
+    output: BaseModel | None,
     display: EffectResultDisplay,
     *,
     output_text: str | None = None,
@@ -983,7 +1301,9 @@ def _completed_state(
     if carry:
         display = display.model_copy(update=carry)
     update: dict[str, object] = {
-        "output": cast(
+        "output": None
+        if output is None
+        else cast(
             JsonValue, output.model_dump(mode="json", by_alias=True, exclude_none=False)
         ),
         "display": display,
@@ -1218,6 +1538,22 @@ _TOOL_LABELS: dict[str, _ToolLabel] = {
     "connector_google_drive_mcp.search_files": _ToolLabel(
         "Searching", "Drive files", "Searched"
     ),
+    # ── Document Library connector ──────────────────────────────────────
+    "connector_document_library.library_search": _ToolLabel(
+        "Searching", "documents", "Searched"
+    ),
+    "connector_document_library.library_list_documents": _ToolLabel(
+        "Listing", "documents", "Listed"
+    ),
+    "connector_document_library.open_library_result": _ToolLabel(
+        "Opening", "a document", "Opened"
+    ),
+    "connector_document_library.library_fetch": _ToolLabel(
+        "Fetching", "a document", "Fetched"
+    ),
+    "connector_document_library.library_open_image": _ToolLabel(
+        "Opening", "an image", "Opened"
+    ),
     # ── Mistral AI connector ────────────────────────────────────────────
     "connector_mistral_ai.delete_skill": _ToolLabel("Deleting", "a skill", "Deleted"),
     "connector_mistral_ai.list_skills": _ToolLabel("Listing", "skills", "Listed"),
@@ -1357,13 +1693,19 @@ def _project_labeled(detail: GenericEffectDetail, label: _ToolLabel) -> _Project
     return _ProjectedCall(detail=semantic, project_result=project_result)
 
 
-_CALL_PROJECTORS: dict[str, Callable[[GenericEffectDetail], _ProjectedCall]] = {
+_PATH_PROJECTORS: dict[
+    str, Callable[[GenericEffectDetail, Sequence[Path]], _ProjectedCall]
+] = {
     "read_file": _project_read,
     "file_system.read_file": _project_read,
     "write_file": _project_write,
     "file_system.write_file": _project_write,
     "search_replace": _project_search_replace,
     "file_system.search_replace": _project_search_replace,
+    "grep": _project_grep,
+}
+
+_CALL_PROJECTORS: dict[str, Callable[[GenericEffectDetail], _ProjectedCall]] = {
     "bash": _project_shell,
     "file_system.bash": _project_shell,
     "skill.read": _project_skill,
@@ -1375,9 +1717,9 @@ _CALL_PROJECTORS: dict[str, Callable[[GenericEffectDetail], _ProjectedCall]] = {
     "ui.ask_user_question": _project_ask_user_question,
     "web_search": _project_web_search,
     "web_fetch": _project_web_fetch,
-    "grep": _project_grep,
     "todo": _project_todo,
     "vibe.todo": _project_todo,
+    "vibe.cron": _project_cron,
     "vibe.unified_harness_scratchpad": _project_scratchpad,
 }
 
@@ -1396,12 +1738,14 @@ _TOOL_CATEGORIES: dict[str, UnifiedToolCategory] = {
     "grep": "file_search",
     "todo": "todo",
     "vibe.todo": "todo",
+    "vibe.cron": "cron",
     "vibe.unified_harness_scratchpad": "scratchpad",
 }
 
 
 __all__ = [
     "UnifiedToolCategory",
+    "is_large_output_receipt",
     "project_unified_history_entry",
     "unified_tool_category",
 ]

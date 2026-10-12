@@ -23,10 +23,12 @@ from mcp.client.auth import (
 from mcp.client.auth.oauth2 import OAuthContext
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 from mcp.types import LATEST_PROTOCOL_VERSION
-from pydantic import AnyUrl, BaseModel, ConfigDict
+from pydantic import AnyUrl, BaseModel, ConfigDict, ValidationError
 
 from vibe import __version__
 from vibe.core.config import MCPHttp, MCPOAuth, MCPStreamableHttp
+from vibe.core.utils.exceptions import first_of_type
+from vibe.observability.logging import logger
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
 from vibe.utils.keyring import (
     delete_api_key_from_keyring,
@@ -191,6 +193,18 @@ async def _kr_delete(username: str) -> None:
         pass
 
 
+async def _kr_load[M: BaseModel](username: str, model: type[M]) -> M | None:
+    raw = await _kr_get(username)
+    if raw is None:
+        return None
+    try:
+        return model.model_validate_json(raw)
+    except ValidationError:
+        # Never log the exception: its message embeds the stored secret.
+        logger.warning("Ignoring unreadable keyring entry %s", username)
+        return None
+
+
 class Fingerprint(BaseModel):
     """Config-drift detection marker for OAuth MCP servers.
 
@@ -225,10 +239,7 @@ class Fingerprint(BaseModel):
 
     @classmethod
     async def load(cls, alias: str) -> Fingerprint | None:
-        raw = await _kr_get(_kr_username(alias, "fingerprint"))
-        if raw is None:
-            return None
-        return cls.model_validate_json(raw)
+        return await _kr_load(_kr_username(alias, "fingerprint"), cls)
 
     async def save(self, alias: str) -> None:
         await _kr_set(_kr_username(alias, "fingerprint"), self.model_dump_json())
@@ -277,11 +288,10 @@ class KeyringTokenStorage(TokenStorage):
         self.token_expiry_time: float | None = None
 
     async def get_tokens(self) -> OAuthToken | None:
-        raw = await _kr_get(_kr_username(self._alias, "tokens"))
-        if raw is None:
+        stored = await _kr_load(_kr_username(self._alias, "tokens"), StoredOAuthTokens)
+        if stored is None:
             self.token_expiry_time = None
             return None
-        stored = StoredOAuthTokens.model_validate_json(raw)
         self.token_expiry_time = stored.expires_at
         if stored.expires_at is None and stored.expires_in is not None:
             self.token_expiry_time = _EXPIRED_TOKEN_TIME
@@ -297,10 +307,10 @@ class KeyringTokenStorage(TokenStorage):
         self.token_expiry_time = None
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
-        raw = await _kr_get(_kr_username(self._alias, "client_info"))
-        if raw is None:
-            return self._fallback_client_info
-        return OAuthClientInformationFull.model_validate_json(raw)
+        info = await _kr_load(
+            _kr_username(self._alias, "client_info"), OAuthClientInformationFull
+        )
+        return self._fallback_client_info if info is None else info
 
     async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
         await _kr_set(
@@ -600,25 +610,15 @@ async def _classify_refresh_error(response: httpx.Response) -> tuple[str, bool]:
     return reason, error == _OAUTH_INVALID_GRANT
 
 
-def _first_of_type[E: BaseException](exc: BaseException, target: type[E]) -> E | None:
-    if isinstance(exc, target):
-        return exc
-    if isinstance(exc, BaseExceptionGroup):
-        for sub in exc.exceptions:
-            if (found := _first_of_type(sub, target)) is not None:
-                return found
-    return None
-
-
 def unwrap_oauth_refresh_error(
     exc: BaseException,
 ) -> MCPOAuthInvalidGrant | MCPOAuthTransientRefreshError | OAuthFlowError | None:
     """Find a known OAuth error inside a possibly-grouped exception (streamable_http wraps auth-flow errors in an ExceptionGroup)."""
-    if (invalid_grant := _first_of_type(exc, MCPOAuthInvalidGrant)) is not None:
+    if (invalid_grant := first_of_type(exc, MCPOAuthInvalidGrant)) is not None:
         return invalid_grant
-    if (transient := _first_of_type(exc, MCPOAuthTransientRefreshError)) is not None:
+    if (transient := first_of_type(exc, MCPOAuthTransientRefreshError)) is not None:
         return transient
-    return _first_of_type(exc, OAuthFlowError)
+    return first_of_type(exc, OAuthFlowError)
 
 
 class _ServerIssuedSecretContext(OAuthContext):

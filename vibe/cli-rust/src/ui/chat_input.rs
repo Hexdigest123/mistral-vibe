@@ -1,15 +1,18 @@
 //! Chat input: the editable prompt with a `>` marker and top/bottom borders.
 
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
-use super::composer_layout::ComposerLayout;
+use super::composer_layout::{ComposerLayout, Row};
+use super::tab_cells::{cells, cells_width};
 use super::theme;
 use crate::agents;
 use crate::app::{App, Status};
+use crate::mentions::Mention;
 use crate::server::AgentSafety;
 
 /// Border and border-title colors per agent safety (Python's
@@ -23,7 +26,8 @@ fn safety_colors(safety: AgentSafety) -> (Color, Color) {
     }
 }
 
-pub fn draw(app: &App, f: &mut Frame, area: Rect) {
+/// Draw the chat input, returning the caret's screen cell while it is in view and takes keys.
+pub fn draw(app: &App, f: &mut Frame, area: Rect) -> Option<Position> {
     // The chat input is usable as soon as the cached startup config is shown; it
     // buffers input locally while the app server is still loading (`Starting`),
     // so the caret and normal text show throughout. Only a failed start stays inert.
@@ -67,9 +71,17 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     } else {
         theme::muted_style()
     };
-    let caret = (editable && !selecting && app.view.cursor_on).then_some(body_off);
+    let owns_keys = editable && !selecting && !app.subagents.list.focused;
+    let caret = (owns_keys && app.main_input_cursor_on()).then_some(body_off);
     let sel =
         crate::chat_input::selection_range(&app.chat_input.input, cursor, app.chat_input.anchor);
+    let hint = crate::commands::argument_hint(app.chat_input.mode.prefix(), body);
+    let mentions = app.chat_input.mentions.spans(body);
+    let mention_style = if editable {
+        theme::text(theme::text_primary())
+    } else {
+        input_style
+    };
 
     // A pasted block keeps its line breaks: the marker leads the first row and
     // continuation rows align under the text with a two-space gutter.
@@ -77,7 +89,6 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
     let lines: Vec<Line> = layout
         .rows()
         .map(|row| {
-            let text = row.text;
             let gutter = if row.index == 0 {
                 Span::styled(marker.clone(), prompt_style)
             } else {
@@ -92,7 +103,13 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
                     (a - row.start, b - row.start)
                 })
             });
-            render_body_line(gutter, text, line_sel, caret_col, input_style)
+            let styles = BodyStyles {
+                input: input_style,
+                mention: mention_style,
+                mentions: row_mentions(mentions, row),
+            };
+            let row_hint = hint.filter(|_| row.end() == body.len());
+            render_body_line(gutter, row, line_sel, caret_col, &styles, row_hint)
         })
         .collect();
     // When the chat input has grown to its cap and the caret is below the visible
@@ -106,24 +123,38 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) {
         .min(max_scroll);
     let cursor_line_bg = theme::input_cursor_line_bg();
     let cursor_row = layout.caret_row();
-    if caret.is_some()
-        && cursor_line_bg != theme::background()
-        && cursor_row >= scroll as usize
-        && cursor_row < scroll as usize + content_h
-    {
-        let y = area.y + 1 + (cursor_row - scroll as usize) as u16;
+    let caret_y = (cursor_row >= scroll as usize && cursor_row < scroll as usize + content_h)
+        .then(|| area.y + 1 + (cursor_row - scroll as usize) as u16)
+        .filter(|_| owns_keys);
+    if let Some(y) = caret_y.filter(|_| caret.is_some() && cursor_line_bg != theme::background()) {
         let row = Rect::new(area.x + 2, y, area.width.saturating_sub(2), 1);
         f.buffer_mut().set_style(
             row,
             Style::default().fg(theme::foreground()).bg(cursor_line_bg),
         );
     }
+    let caret_cell = caret_y.and_then(|y| caret_position(&layout, cursor_row, &marker, area.x, y));
     let para = Paragraph::new(lines).scroll((scroll, 0)).block(block);
     f.render_widget(para, area);
     if scroll > 0 && area.height > 2 {
         f.buffer_mut()
             .set_string(area.x, area.y + 1, marker, prompt_style);
     }
+    caret_cell
+}
+
+/// Screen cell of the caret on visual row `index`, drawn at screen row `y`, whatever the blink phase.
+fn caret_position(
+    layout: &ComposerLayout,
+    index: usize,
+    marker: &str,
+    x: u16,
+    y: u16,
+) -> Option<Position> {
+    let row = layout.rows().nth(index)?;
+    let gutter = if row.index == 0 { marker.width() } else { 2 };
+    let column = gutter + cells_width(&row.text[..layout.caret_in(row)?], row.column);
+    Some(Position::new(x.saturating_add(column as u16), y))
 }
 
 fn composer_layout(app: &App, width: u16) -> ComposerLayout<'_> {
@@ -163,17 +194,53 @@ pub fn vertical_cursor(app: &App, down: bool) -> (usize, bool) {
     composer_layout(app, app.view.input_area.width).vertical_offset(down)
 }
 
+/// Base text styles for one row: plain input, and accepted mentions as row-local byte ranges.
+struct BodyStyles {
+    input: Style,
+    mention: Style,
+    mentions: Vec<(usize, usize)>,
+}
+
+impl BodyStyles {
+    fn at(&self, byte: usize) -> Style {
+        match self
+            .mentions
+            .iter()
+            .any(|&(lo, hi)| lo <= byte && byte < hi)
+        {
+            true => self.mention,
+            false => self.input,
+        }
+    }
+}
+
+/// Mentions overlapping `row`, clamped to row-local byte ranges.
+fn row_mentions(mentions: &[Mention], row: Row<'_>) -> Vec<(usize, usize)> {
+    mentions
+        .iter()
+        .filter(|mention| mention.start < row.end() && mention.end > row.start)
+        .map(|mention| {
+            (
+                mention.start.max(row.start) - row.start,
+                mention.end.min(row.end()) - row.start,
+            )
+        })
+        .collect()
+}
+
 /// Build one chat input row: base text, the selection range reversed, and the caret
 /// cell as a solid block (trailing when the caret is at the line end). `sel` and
-/// `caret` are byte columns within `text`. Adjacent chars sharing a style are
-/// coalesced into one span.
+/// `caret` are byte columns within the row. Adjacent graphemes sharing a style are
+/// coalesced into one span; a tab draws as spaces up to its stop. `hint` trails the text muted.
 fn render_body_line(
     gutter: Span<'static>,
-    text: &str,
+    row: Row<'_>,
     sel: Option<(usize, usize)>,
     caret: Option<usize>,
-    input_style: Style,
+    styles: &BodyStyles,
+    hint: Option<&'static str>,
 ) -> Line<'static> {
+    let input_style = styles.input;
     // The caret block matches Textual's TextArea: a solid $input-cursor-background
     // cell, or reverse-video for ansi themes (terminal-default background).
     let block = if theme::input_cursor_reverse() {
@@ -188,19 +255,21 @@ fn render_body_line(
     };
     let reversed = input_style.add_modifier(Modifier::REVERSED);
     let mut spans = vec![gutter];
+    let text = row.text;
     if text.is_empty() {
         // A word joiner is invisible but not Ratatui-wrappable whitespace.
         spans.push(Span::raw("\u{2060}"));
     }
     let mut buf = String::new();
     let mut buf_style: Option<Style> = None;
-    for (b, ch) in text.char_indices() {
-        let style = if caret == Some(b) {
+    for cell in cells(text, row.column) {
+        let b = cell.byte;
+        let style = if caret.is_some_and(|c| b <= c && c < b + cell.symbol.len()) {
             block
         } else if sel.is_some_and(|(lo, hi)| b >= lo && b < hi) {
             reversed
         } else {
-            input_style
+            styles.at(b)
         };
         if buf_style != Some(style) {
             if let Some(s) = buf_style {
@@ -208,14 +277,21 @@ fn render_body_line(
             }
             buf_style = Some(style);
         }
-        buf.push(ch);
+        buf.push_str(cell.shown());
     }
     if let Some(s) = buf_style {
         spans.push(Span::styled(buf, s));
     }
-    // Caret at (or past) the line end: a solid block on the trailing cell.
+    // Caret at the line end: a block on the trailing cell, or on the hint's first char.
+    let mut hint = hint.unwrap_or_default();
     if caret.is_some_and(|c| c >= text.len()) {
-        spans.push(Span::styled(" ", block));
+        let split = hint.chars().next().map_or(0, char::len_utf8);
+        let cell = if split == 0 { " " } else { &hint[..split] };
+        spans.push(Span::styled(cell, block));
+        hint = &hint[split..];
+    }
+    if !hint.is_empty() {
+        spans.push(Span::styled(hint, theme::muted_style()));
     }
     Line::from(spans)
 }

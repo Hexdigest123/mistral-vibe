@@ -47,12 +47,17 @@ client_args = ("--continue",)
 capture_startup = False
 
 _ATTACHED_ROWS = (
+    "┝ attached image: ~/pics/cat.png",
+    "┝ attached image: /opt/data/charts.png",
+    "└ attached image: pasted-chart.png",
+)
+_PYTHON_ATTACHED_ROWS = (
     "└ attached image: ~/pics/cat.png",
     "└ attached image: /opt/data/charts.png",
     "└ attached image: pasted-chart.png",
 )
 
-screen_contains = {"rust": _ATTACHED_ROWS, "python": _ATTACHED_ROWS}
+screen_contains = {"rust": _ATTACHED_ROWS, "python": _PYTHON_ATTACHED_ROWS}
 
 _CAT_URL = "file:///home/e2e-user/pics/cat.png"
 _CHARTS_URL = "file:///opt/data/charts.png"
@@ -71,8 +76,8 @@ expected_actions = {
 
 timeline: Timeline = [
     "x",
-    _click(25, 25),  # rust: the `~/pics/cat.png` link; python: the prompt row
+    _click(25, 13),  # rust: the `~/pics/cat.png` link; python: the prompt row
     _click(
-        25, 26
+        25, 14
     ),  # rust: the `/opt/data/charts.png` link; python: the `~/pics/cat.png` link
 ]

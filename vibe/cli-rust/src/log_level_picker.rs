@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::app::App;
 use crate::observability::level::{self, LogLevelChain, DEFAULT_LOG_LEVEL, LOG_LEVELS};
-use crate::server::{method, Client};
+use crate::server::Client;
 
 pub const BADGE_SESSION: &str = "session";
 pub const BADGE_CONFIG: &str = "config";
@@ -34,13 +34,10 @@ pub fn open(app: &mut App) {
     app.log_level_picker.open = true;
 }
 
+/// Move the highlight up/down by one, wrapping at the ends.
 pub fn navigate(app: &mut App, down: bool) {
-    let last = options().len() - 1;
-    if down {
-        app.log_level_picker.selected = (app.log_level_picker.selected + 1).min(last);
-    } else {
-        app.log_level_picker.selected = app.log_level_picker.selected.saturating_sub(1);
-    }
+    let picker = &mut app.log_level_picker;
+    picker.selected = crate::list_nav::wrap(picker.selected, options().len(), down);
 }
 
 pub fn focus_badge(app: &mut App, badge: &'static str) {
@@ -172,19 +169,13 @@ fn write_config(
         } else {
             json!({"op": "set", "path": LOG_LEVEL_PATH, "value": level, "targetLayer": null})
         };
-        let params = json!({
-            "sessionId": session_id,
-            "ops": [op],
-            "reason": "log level picker",
-            "reloadRuntime": false,
-        });
-        let event = match client.request(method::CONFIG_WRITE, params).await {
-            Ok(_) => Event::Applied,
-            Err(error) => Event::Failed {
-                error: error.to_string(),
-                restore,
-            },
-        };
+        let event =
+            match crate::config_write::write(&client, &session_id, vec![op], "log level picker")
+                .await
+            {
+                Ok(_) => Event::Applied,
+                Err(error) => Event::Failed { error, restore },
+            };
         crate::input::deliver(tx, event, &pending).await;
     });
 }

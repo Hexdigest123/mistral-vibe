@@ -37,6 +37,8 @@ class CaptureSpec:
     exit_after_last_step: bool = False
     terminal_responses: tuple[tuple[bytes, bytes], ...] = ()
     """Terminal output queries and the input replies they trigger."""
+    exit_responses: tuple[tuple[bytes, bytes], ...] = ()
+    """Post-exit output triggers and the input replies they unlock, FIFO."""
 
 
 # Keys whose effect depends on what the UI already shows (a submit acts on the
@@ -92,6 +94,7 @@ def capture(
     spec: CaptureSpec,
     *,
     releases: tuple[int, ...] = (),
+    releases_after: tuple[int, ...] = (),
     capture_startup: bool = True,
     capture_steps: Set[int] | None = None,
     step_fd: int | None = None,
@@ -114,7 +117,7 @@ def capture(
                 buffered = _settle(fd, terminal, clipboard, buffered, spec)
             if spec.exit_after_last_step and index == len(spec.steps) - 1:
                 _write_all(fd, step.encode())
-                _wait_for_exit(pid, fd, spec.failsafe)
+                _wait_for_exit(pid, fd, spec.failsafe, spec.exit_responses)
                 continue
             resize = spec.resizes[index] if index < len(spec.resizes) else None
             if resize is None:
@@ -123,6 +126,11 @@ def capture(
                 rows, columns = resize
                 _set_window_size(fd, rows, columns)
                 terminal.resize(rows, columns)
+                buffered = _settle(fd, terminal, clipboard, buffered, spec)
+            for _ in range(releases_after[index] if index < len(releases_after) else 0):
+                if step_fd is None:
+                    raise RuntimeError("replay release has no step FIFO")
+                os.write(step_fd, b"\0")
                 buffered = _settle(fd, terminal, clipboard, buffered, spec)
             if capture_steps is None or index in capture_steps:
                 snapshots.append(terminal.snapshot(f"step{index}", clipboard.text))
@@ -248,10 +256,16 @@ def _answer_terminal_queries(
             _write_all(fd, response)
 
 
-def _wait_for_exit(pid: int, fd: int, failsafe: float) -> None:
+def _wait_for_exit(
+    pid: int,
+    fd: int,
+    failsafe: float,
+    exit_responses: tuple[tuple[bytes, bytes], ...] = (),
+) -> None:
     """Drain terminal cleanup until the client exits, then verify the exit."""
     deadline = time.monotonic() + failsafe
     drained = bytearray()
+    pending = list(exit_responses)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -266,6 +280,13 @@ def _wait_for_exit(pid: int, fd: int, failsafe: float) -> None:
         if not chunk:
             break
         drained += chunk
+        # A post-exit prompt (the client asks before it lets go) unlocks its
+        # reply the moment its text lands in the drain, ordered FIFO. The
+        # match spans the whole drain, pre-exit bytes included: triggers must
+        # be text only the exit path can print.
+        while pending and pending[0][0] in drained:
+            _, reply = pending.pop(0)
+            _write_all(fd, reply)
     # A full-screen client must leave the alternate screen and give the cursor back.
     assert b"\x1b[?1049l" in drained, (
         "client did not leave the alternate screen on exit"
@@ -290,11 +311,8 @@ def _wait_for_exit(pid: int, fd: int, failsafe: float) -> None:
 
 
 def _terminate(pid: int, fd: int) -> None:
-    """Close the PTY and kill its process group without blocking."""
-    try:
-        os.close(fd)
-    except OSError:
-        pass
+    """Kill the process group, then close the PTY, without blocking."""
+    # Kill first: a PTY hangup lets the client run its exit path and send requests.
     for target in (
         lambda: os.killpg(os.getpgid(pid), signal.SIGKILL),
         lambda: os.kill(pid, signal.SIGKILL),
@@ -303,6 +321,10 @@ def _terminate(pid: int, fd: int) -> None:
             target()
         except (ProcessLookupError, PermissionError, OSError):
             pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
     try:
         os.waitpid(pid, os.WNOHANG)
     except (ChildProcessError, OSError):

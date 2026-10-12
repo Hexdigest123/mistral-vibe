@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Coroutine, Mapping, Sequence
-from concurrent.futures import CancelledError
+from collections.abc import Mapping, Sequence
 from html import escape
-from http import HTTPStatus
-import logging
+import json
 import re
 from typing import Any, Literal, cast
 
@@ -45,44 +42,28 @@ from mistralai_vibe_local_harness.vibe._runtime_config import (
     LocalModelRoute,
     LocalRuntimeAdapterConfig,
     ProviderDeltaObserver,
-    ProviderRetry,
     ProviderRetryObserver,
     ProviderStreamDelta,
 )
 from mistralai_vibe_local_harness.vibe._ssl import build_ssl_context
 from mistralai_vibe_local_harness.vibe.adapters._correlation import correlation_hook
+from mistralai_vibe_local_harness.vibe.adapters._provider_failure import (
+    IncompleteProviderStream,
+    until_connection_lost,
+)
+from mistralai_vibe_local_harness.vibe.adapters._retry import (
+    RetryNotices,
+    call_with_retries,
+)
+from mistralai_vibe_local_harness.vibe.adapters._stream_idle import StreamIdleGuard
 
-logger = logging.getLogger(__name__)
-
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
-_RETRYABLE_ERRORS = (httpx.NetworkError, httpx.TimeoutException)
-# A retry notice is a UI nicety. A loop that is servicing callbacks answers in
-# microseconds; anything past this is a loop that has stopped, and the notice is
-# not worth blocking a worker thread on.
-_RETRY_NOTICE_TIMEOUT_S = 5.0
-
-
-class _RetryNoticeHook:
-    def __init__(self, report: Callable[[Exception], None]) -> None:
-        self._report = report
-
-    def after_error(
-        self, hook_ctx: Any, response: httpx.Response | None, error: Exception | None
-    ) -> tuple[httpx.Response | None, Exception | None]:
-        if error is not None:
-            self._report(error)
-        return response, error
-
-
-def _register_retry_hook(client: Mistral, hook: _RetryNoticeHook) -> None:
-    registry = client.sdk_configuration.__dict__.get("_hooks")
-    register = getattr(registry, "register_after_error_hook", None)
-    if not callable(register):
-        logger.warning(
-            "Mistral SDK does not expose retry hooks; retry notices are disabled"
-        )
-        return
-    register(hook)
+# Mistral's in-band signal that it aborted a generation part way.
+_ABORTED_FINISH_REASON = "error"
+# Retries run in call_with_retries, which announces each backoff before sleeping
+# and covers reading the stream, not only opening it.
+_NO_SDK_RETRIES = RetryConfig(
+    strategy="none", backoff=BackoffStrategy(0, 0, 0, 0), retry_connection_errors=False
+)
 
 
 type ReasoningEffort = Literal["none", "high"]
@@ -107,61 +88,7 @@ async def execute_mistral_completion(
     on_retry: ProviderRetryObserver | None = None,
     on_delta: ProviderDeltaObserver | None = None,
 ) -> RustCompletionResult:
-    loop = asyncio.get_running_loop()
-    retry_active = False
-
-    async def report_retry(retry: ProviderRetry | None) -> None:
-        nonlocal retry_active
-        retry_active = retry is not None
-        if on_retry is not None:
-            await on_retry(retry)
-
-    async def report_retryable_response(response: httpx.Response) -> None:
-        if on_retry is None:
-            return
-        if response.status_code in _RETRYABLE_STATUS_CODES:
-            category = (
-                "rate_limited"
-                if response.status_code == HTTPStatus.TOO_MANY_REQUESTS
-                else "server_error"
-            )
-            await report_retry(
-                ProviderRetry(category=category, detail=f"HTTP {response.status_code}")
-            )
-        elif response.is_success and retry_active:
-            await report_retry(None)
-
-    def report_error(error: Exception) -> None:
-        if on_retry is None or not isinstance(error, _RETRYABLE_ERRORS):
-            return
-        # The SDK runs error hooks on a worker thread. Wait for the event-loop
-        # notification so completion cleanup cannot clear before this report
-        # lands -- but only while there is a loop to answer, and never for long:
-        # shutdown stops the loop without closing it, and an unbounded wait there
-        # pins a non-daemon worker thread and hangs interpreter exit.
-        if not loop.is_running():
-            return
-        category = (
-            "timed_out" if isinstance(error, httpx.TimeoutException) else "connection"
-        )
-        notice = cast(
-            Coroutine[Any, Any, None],
-            report_retry(ProviderRetry(category=category, detail=type(error).__name__)),
-        )
-        try:
-            future = asyncio.run_coroutine_threadsafe(notice, loop)
-        except RuntimeError:
-            # The loop closed in the gap above. Nothing will await the notice.
-            notice.close()
-            return
-        try:
-            future.result(timeout=_RETRY_NOTICE_TIMEOUT_S)
-        except CancelledError:
-            return
-        except Exception:
-            future.cancel()
-            logger.warning("Could not report retry", exc_info=True)
-
+    notices = RetryNotices(on_retry)
     async with httpx.AsyncClient(
         timeout=config.timeout_s,
         verify=build_ssl_context(),
@@ -169,17 +96,15 @@ async def execute_mistral_completion(
         # Capture the provider correlation id at the transport level so both the
         # streaming and non-streaming paths report it; the parsed complete_async
         # response drops headers.
-        event_hooks={"response": [correlation_hook(config), report_retryable_response]},
+        event_hooks={"response": [correlation_hook(config), notices.clear_on_success]},
     ) as http_client:
         client = Mistral(
             api_key=credential.token,
             server_url=_server_url_from_api_base(config.base_url),
             async_client=http_client,
-            retry_config=_retry_config(config.retry_max_elapsed_time_s),
+            retry_config=_NO_SDK_RETRIES,
             timeout_ms=int(config.timeout_s * 1000),
         )
-        if on_retry is not None:
-            _register_retry_hook(client, _RetryNoticeHook(report_error))
         kwargs: dict[str, Any] = {
             "model": route.model,
             "messages": [_message_payload(message) for message in messages],
@@ -187,8 +112,10 @@ async def execute_mistral_completion(
         }
         if reasoning_effort := _THINKING_TO_REASONING_EFFORT.get(route.thinking):
             kwargs["reasoning_effort"] = reasoning_effort
-        if config.max_tokens is not None:
-            kwargs["max_tokens"] = config.max_tokens
+        if route.top_p is not None:
+            kwargs["top_p"] = route.top_p
+        if (max_tokens := config.output_token_cap(route)) is not None:
+            kwargs["max_tokens"] = max_tokens
         if metadata:
             kwargs["metadata"] = dict(metadata)
         if headers := config.request_headers():
@@ -197,9 +124,28 @@ async def execute_mistral_completion(
             kwargs["tools"] = [_tool_payload(tool) for tool in tools]
             kwargs["parallel_tool_calls"] = True
         if stream:
-            response_stream = await client.chat.stream_async(**kwargs)
-            return await _read_stream(response_stream, on_delta)
-        response = await client.chat.complete_async(**kwargs)
+
+            async def stream_once() -> RustCompletionResult:
+                async with await client.chat.stream_async(**kwargs) as events:
+                    idle_guard = StreamIdleGuard(
+                        config.stream_idle_timeout_s, read_timeout_s=config.timeout_s
+                    )
+                    return await _read_stream(
+                        idle_guard.watch(events, starts_output=_carries_model_output),
+                        on_delta,
+                        emits_finish_reason=config.emits_finish_reason,
+                    )
+
+            return await call_with_retries(
+                stream_once,
+                max_elapsed_time_s=config.retry_max_elapsed_time_s,
+                notices=notices,
+            )
+        response = await call_with_retries(
+            lambda: client.chat.complete_async(**kwargs),
+            max_elapsed_time_s=config.retry_max_elapsed_time_s,
+            notices=notices,
+        )
         return _read_completion(response)
 
 
@@ -222,26 +168,60 @@ def _read_completion(response: Any) -> RustCompletionResult:
         text = _delta_text(content)
         if text:
             parts.append(RustTextContentBlock(text=text))
+    tool_call_parts = _message_tool_call_parts(_read_field(message, "tool_calls"))
+    parts.extend(tool_call_parts)
     if not parts:
-        raise ValueError("Completion response has no text content")
+        raise ValueError("Completion response has no content")
     reason = _read_field(choice, "finish_reason")
+    finish_reason = _finish_reason(reason) if isinstance(reason, str) else "stop"
+    # Core rejects tool_call finish without tool call parts and rejects any
+    # other finish that carries tool call parts, so align finish_reason with
+    # what we actually parsed — mirroring the streaming path.
+    if tool_call_parts:
+        finish_reason = "tool_call"
+    elif finish_reason == "tool_call":
+        finish_reason = "stop"
     return RustCompletionResult(
         parts=parts,
-        finish_reason=_finish_reason(reason) if isinstance(reason, str) else "stop",
+        finish_reason=finish_reason,
         usage=_usage(_read_field(response, "usage")),
     )
 
 
+def _carries_model_output(event: Any) -> bool:
+    """Whether a stream event holds model output rather than a preamble.
+
+    The first event often carries only the assistant role and empty content.
+    """
+    choice = _first_choice(_event_data(event))
+    if choice is None:
+        return False
+    delta = _read_field(choice, "delta")
+    content = _read_field(delta, "content")
+    return bool(
+        _delta_text(content)
+        or _delta_reasoning(content)[0]
+        or _read_field(delta, "tool_calls")
+    )
+
+
 async def _read_stream(
-    stream: Any, on_delta: ProviderDeltaObserver | None = None
+    stream: Any,
+    on_delta: ProviderDeltaObserver | None = None,
+    *,
+    emits_finish_reason: bool,
 ) -> RustCompletionResult:
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
     reasoning_meta: JsonObject = {}
     tool_calls: dict[int, dict[str, str]] = {}
     usage: RustTokenUsage | None = None
-    finish_reason = "stop"
-    async for event in stream:
+    finish_reason: RustCompletionFinishReason | None = None
+    async for event in until_connection_lost(
+        # Read when the stream fails, so it must see the latest finish reason.
+        stream,
+        complete=lambda: finish_reason is not None,  # noqa: B023
+    ):
         chunk = _event_data(event)
         if parsed_usage := _usage(_read_field(chunk, "usage")):
             usage = parsed_usage
@@ -260,11 +240,23 @@ async def _read_stream(
             reasoning_meta.update(delta_meta)
         _collect_tool_call_deltas(tool_calls, _read_field(delta, "tool_calls"))
         if isinstance(reason := _read_field(choice, "finish_reason"), str):
+            if reason == _ABORTED_FINISH_REASON:
+                raise IncompleteProviderStream(
+                    "Model stream ended with the error finish reason."
+                )
             finish_reason = _finish_reason(reason)
         if on_delta is not None and (delta_text or delta_reasoning):
             await on_delta(
                 ProviderStreamDelta(text=delta_text, reasoning=delta_reasoning)
             )
+    if finish_reason is None:
+        # The last chunk of a complete stream carries a finish reason, and the
+        # SDK also ends iteration when the body closes early.
+        if emits_finish_reason:
+            raise IncompleteProviderStream(
+                "Model stream ended without a finish reason."
+            )
+        finish_reason = "stop"
     parts: list[RustCompletionResultPart] = []
     if reasoning_parts:
         parts.append(
@@ -370,19 +362,6 @@ def _thinking_meta(chunk: object) -> JsonObject:
     if isinstance(closed := _read_field(chunk, "closed"), bool):
         meta["closed"] = closed
     return meta
-
-
-def _retry_config(max_elapsed_time_s: float) -> RetryConfig:
-    return RetryConfig(
-        strategy="backoff",
-        backoff=BackoffStrategy(
-            initial_interval=500,
-            max_interval=30000,
-            exponent=1.5,
-            max_elapsed_time=int(max_elapsed_time_s * 1000),
-        ),
-        retry_connection_errors=True,
-    )
 
 
 def _server_url_from_api_base(api_base: str) -> str | None:
@@ -558,6 +537,48 @@ def _tool_call_parts(
         for index, values in sorted(tool_calls.items())
         if values["name"]
     ]
+
+
+def _message_tool_call_parts(
+    tool_calls: object,
+) -> list[RustCompletionResultToolCallPart]:
+    """Convert a non-streaming message's ``tool_calls`` array to result parts.
+
+    The streaming path accumulates deltas into ``{index: {id, name, arguments}}``
+    and renders them through :func:`_tool_call_parts`. The non-streaming response
+    carries complete tool calls under ``message.tool_calls`` with ``id`` and
+    ``function.name``/``function.arguments`` fields; this maps that shape to the
+    same result parts so both paths produce equivalent ``RustCompletionResult``
+    values.
+    """
+    if not isinstance(tool_calls, list):
+        return []
+    parts: list[RustCompletionResultToolCallPart] = []
+    for index, call in enumerate(tool_calls):
+        identifier = _read_field(call, "id")
+        function = _read_field(call, "function")
+        name = _read_field(function, "name")
+        arguments = _read_field(function, "arguments")
+        if not isinstance(name, str) or not name:
+            continue
+        # The SDK types arguments as dict | str; serialise object-shaped
+        # arguments so the payload is not silently dropped.
+        if isinstance(arguments, str):
+            arguments_json = arguments or "{}"
+        elif isinstance(arguments, dict):
+            arguments_json = json.dumps(arguments, separators=(",", ":"))
+        else:
+            arguments_json = "{}"
+        parts.append(
+            RustCompletionResultToolCallPart(
+                id=identifier
+                if isinstance(identifier, str) and identifier
+                else f"tool_call_{index}",
+                name=name,
+                arguments_json=arguments_json,
+            )
+        )
+    return parts
 
 
 def _event_data(event: object) -> object:

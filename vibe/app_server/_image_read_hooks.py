@@ -36,14 +36,13 @@ from mistralai_vibe_local_harness.protocol import (
     RustToolSuccessResult,
 )
 from mistralai_vibe_local_harness.vibe import CompiledHooks, HookHandlers
-
 from vibe.app_server._agents_md_hooks import _read_file_path
 from vibe.utils.images import IMAGE_EXTENSIONS, MAX_IMAGE_BYTES
 
 if TYPE_CHECKING:
-    from mistralai_vibe_local_harness.vibe import HookContext
     from pydantic import JsonValue
 
+    from mistralai_vibe_local_harness.vibe import HookContext
     from vibe.app_server._vision import SessionImageDescriber
 
 logger = logging.getLogger(__name__)

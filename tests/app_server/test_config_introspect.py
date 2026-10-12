@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+from typing import Any
 
 import pytest
 
@@ -12,8 +13,10 @@ from vibe.app_server._config_introspect import (
     build_field_wires,
     classify_annotation,
     collect_layer_values,
+    effective_config_response,
 )
 from vibe.app_server.protocol import ConfigFieldKind, ConfigLayerValueWire
+from vibe.core.config.layers.default import DefaultConfigLayer
 from vibe.core.config.layers.growthbook import GrowthbookLayer
 from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.layers.user import UserConfigLayer
@@ -63,7 +66,11 @@ def test_build_field_wires_covers_schema_and_defaults(
     config = make_config()
     by_name = {wire.name: wire for wire in build_field_wires(config, {})}
 
-    assert by_name.keys() == set(type(config).model_fields) - HIDDEN_SETTINGS
+    # ``max_context_length`` is per-model only, so it arrives as a synthetic
+    # row on top of the schema's own fields.
+    assert by_name.keys() == (
+        set(type(config).model_fields) - HIDDEN_SETTINGS | {"max_context_length"}
+    )
     assert not HIDDEN_SETTINGS & by_name.keys()
     assert by_name["autocopy_to_clipboard"].kind is ConfigFieldKind.BOOL
     assert by_name["show_subagent_status_list"].kind is ConfigFieldKind.BOOL
@@ -141,6 +148,11 @@ def test_build_field_wires_keeps_admin_lock_for_global_compaction_threshold(
     assert threshold.value == 50_000
     assert threshold.path == "/auto_compact_threshold"
     assert threshold.origin == "admin"
+    # The unset sentinel is not a value a layer set; it must never surface as
+    # the row's default origin.
+    assert [(entry.layer, entry.value) for entry in threshold.layer_values] == [
+        ("admin", 50_000)
+    ]
 
 
 @pytest.mark.asyncio
@@ -158,6 +170,18 @@ async def test_collect_layer_values_groups_fields_by_priority(tmp_path) -> None:
     assert [(entry.layer, entry.value) for entry in values["api_timeout"]] == [
         ("overrides", 1.0)
     ]
+
+
+@pytest.mark.asyncio
+async def test_collect_layer_values_hides_the_unset_threshold_sentinel() -> None:
+    # The default layer materializes the sentinel for every threshold; it
+    # means "no layer set one" and must never surface as provenance.
+    defaults = DefaultConfigLayer(schema=VibeConfigSchema)
+
+    values = await collect_layer_values([defaults])
+
+    assert "auto_compact_threshold" not in values
+    assert not [path for path in values if path.endswith("/auto_compact_threshold")]
 
 
 @pytest.mark.asyncio
@@ -193,3 +217,216 @@ async def test_build_field_wires_projects_growthbook_routed_model_threshold(
     assert threshold.value == 168_000
     assert threshold.path == "/models/routed/auto_compact_threshold"
     assert threshold.origin == "growthbook"
+
+
+def test_build_field_wires_surfaces_the_active_model_window(
+    make_config: Callable[..., VibeConfigSchema],
+) -> None:
+    config = make_config(
+        active_model="custom",
+        models=[
+            ModelConfig(
+                name="custom",
+                provider="mistral",
+                alias="custom",
+                max_context_length=262_144,
+            )
+        ],
+    )
+    wires = build_field_wires(
+        config,
+        {
+            "/models/custom/max_context_length": [
+                ConfigLayerValueWire(layer="user-toml", value=262_144)
+            ]
+        },
+    )
+
+    window = next(wire for wire in wires if wire.name == "max_context_length")
+    assert window.value == 262_144
+    assert window.path == "/models/custom/max_context_length"
+    assert window.origin == "user-toml"
+    assert window.kind is ConfigFieldKind.INT
+
+
+def test_build_field_wires_shows_an_unset_window_as_default(
+    make_config: Callable[..., VibeConfigSchema],
+) -> None:
+    config = make_config(
+        active_model="custom",
+        models=[ModelConfig(name="custom", provider="mistral", alias="custom")],
+    )
+
+    window = next(
+        wire
+        for wire in build_field_wires(config, {})
+        if wire.name == "max_context_length"
+    )
+
+    assert window.value is None
+    assert window.origin == DEFAULT_ORIGIN
+    assert window.path == "/models/custom/max_context_length"
+
+
+def test_build_field_wires_shows_the_derived_threshold_on_the_global_row(
+    make_config: Callable[..., VibeConfigSchema],
+) -> None:
+    # Nothing is set anywhere, so the row must display the derived value,
+    # never the raw unset sentinel the merged config carries.
+    config = make_config(
+        active_model="custom",
+        models=[
+            ModelConfig(
+                name="custom",
+                provider="mistral",
+                alias="custom",
+                max_context_length=262_144,
+            )
+        ],
+    )
+
+    threshold = next(
+        wire
+        for wire in build_field_wires(config, {})
+        if wire.name == "auto_compact_threshold"
+    )
+
+    assert threshold.value == 209_715
+    assert threshold.origin == DEFAULT_ORIGIN
+
+
+def test_effective_config_hides_credentials_and_applies_approval_bypass() -> None:
+    """*Prepare*: A config with header and environment secrets.
+    *Do*: Build the effective-config response for a session that bypasses
+    tool approval.
+    *Assert*: Secret values are redacted and the session's bypass wins.
+    """
+    # Prepare
+    config = VibeConfigSchema.model_validate({
+        "providers": [
+            {
+                "name": "custom",
+                "api_base": "https://example.invalid/v1",
+                "extra_headers": {"Authorization": "Bearer secret"},
+            }
+        ],
+        "mcp_servers": [
+            {
+                "name": "local",
+                "transport": "stdio",
+                "command": "server",
+                "env": {"TOKEN": "secret"},
+            }
+        ],
+    })
+
+    # Do
+    dumped: dict[str, Any] = effective_config_response(
+        config, bypass_tool_permissions=True
+    ).config
+
+    # Assert
+    assert "secret" not in str(dumped)
+    provider = next(p for p in dumped["providers"] if p["name"] == "custom")
+    assert provider["extra_headers"] == {"Authorization": "<redacted>"}
+    assert dumped["mcp_servers"][0]["env"] == {"TOKEN": "<redacted>"}
+    assert dumped["bypass_tool_permissions"] is True
+
+
+def test_effective_config_hides_url_credentials_and_mcp_arguments() -> None:
+    """*Prepare*: A config with credentials in a provider URL, an MCP URL and
+    an MCP command line.
+    *Do*: Build the effective-config response.
+    *Assert*: The URLs keep their host and path but lose their user info and
+    query string, and the MCP arguments are redacted.
+    """
+    # Prepare
+    config = VibeConfigSchema.model_validate({
+        "providers": [
+            {
+                "name": "custom",
+                "api_base": "https://user:secret@example.invalid/v1?key=secret",
+            }
+        ],
+        "mcp_servers": [
+            {
+                "name": "remote",
+                "transport": "http",
+                "url": "https://mcp.example.invalid/mcp?token=secret",
+            },
+            {
+                "name": "local",
+                "transport": "stdio",
+                "command": "server",
+                "args": ["--token", "secret"],
+            },
+        ],
+    })
+
+    # Do
+    dumped: dict[str, Any] = effective_config_response(
+        config, bypass_tool_permissions=False
+    ).config
+
+    # Assert
+    assert "secret" not in str(dumped)
+    provider = next(p for p in dumped["providers"] if p["name"] == "custom")
+    assert provider["api_base"] == "https://<redacted>@example.invalid/v1?<redacted>"
+    remote, local = dumped["mcp_servers"]
+    assert remote["url"] == "https://mcp.example.invalid/mcp?<redacted>"
+    assert local["args"] == ["<redacted>", "<redacted>"]
+    assert dumped["vibe_base_url"] == config.vibe_base_url
+
+
+@pytest.mark.parametrize(
+    ("command", "redacted"),
+    [
+        ("npx server --api-key=secret", "npx <redacted>"),
+        (
+            ["npx", "server", "--token", "secret"],
+            ["npx", "<redacted>", "<redacted>", "<redacted>"],
+        ),
+        ("server", "server"),
+        (["server"], ["server"]),
+    ],
+)
+def test_effective_config_keeps_only_the_program_of_an_mcp_command(
+    command: str | list[str], redacted: str | list[str]
+) -> None:
+    """*Prepare*: A local MCP server whose command line may carry a credential.
+    *Do*: Build the effective-config response.
+    *Assert*: The command keeps its program and loses the rest, in the form it
+    was written in.
+    """
+    # Prepare
+    config = VibeConfigSchema.model_validate({
+        "mcp_servers": [{"name": "local", "transport": "stdio", "command": command}]
+    })
+
+    # Do
+    dumped: dict[str, Any] = effective_config_response(
+        config, bypass_tool_permissions=False
+    ).config
+
+    # Assert
+    assert "secret" not in str(dumped)
+    assert dumped["mcp_servers"][0]["command"] == redacted
+
+
+def test_effective_config_keeps_a_command_outside_mcp_servers() -> None:
+    """*Prepare*: A tool config with its own ``command`` entry.
+    *Do*: Build the effective-config response.
+    *Assert*: Only MCP server commands are redacted, so the tool's is kept.
+    """
+    # Prepare
+    config = VibeConfigSchema.model_validate({
+        "tools": {"custom": {"command": "make test --verbose"}}
+    })
+
+    # Do
+    dumped: dict[str, Any] = effective_config_response(
+        config, bypass_tool_permissions=False
+    ).config
+
+    # Assert
+    assert dumped["tools"]["custom"]["command"] == "make test --verbose"

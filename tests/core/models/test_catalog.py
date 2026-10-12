@@ -96,14 +96,14 @@ class TestCache:
         assert not read_cached_catalog("other", "https://x/v1/models").ok
 
     def test_invalid_cache_is_ignored(self, config_dir: Path) -> None:
-        (config_dir / "model_catalog_cache.json").write_text(
+        (config_dir / "discovered_models_cache.json").write_text(
             "{not json", encoding="utf-8"
         )
         assert load_catalog_cache().providers == {}
 
     def test_stale_version_is_ignored(self, config_dir: Path) -> None:
         payload = {"version": 999, "providers": {"openrouter": {}}}
-        (config_dir / "model_catalog_cache.json").write_text(
+        (config_dir / "discovered_models_cache.json").write_text(
             json.dumps(payload), encoding="utf-8"
         )
         assert load_catalog_cache().providers == {}

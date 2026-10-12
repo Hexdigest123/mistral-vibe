@@ -17,6 +17,7 @@ from vibe.app_server.protocol import (
 )
 from vibe.app_server.transport import memory_transport_pair
 from vibe.core.config import ModelConfig, build_default_orchestrator
+from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.vibe_schema import VibeConfigSchema
 from vibe.core.trusted_folders import trusted_folders_manager
 from vibe.observability.logging import get_log_level_chain, set_config_log_level
@@ -112,7 +113,7 @@ async def test_config_write_materializes_a_model_that_is_not_active_yet() -> Non
         routed_model_config=_routed_model().model_dump_json(),
         routed_extra_models=[
             ModelConfig(
-                name="glm-5.3", provider="mistral", alias="glm-5-3", thinking="off"
+                name="glm-5.9", provider="mistral", alias="glm-5-9", thinking="off"
             )
         ],
     )
@@ -120,16 +121,16 @@ async def test_config_write_materializes_a_model_that_is_not_active_yet() -> Non
     models = await _write_model_ops(
         config=config,
         ops=[
-            ConfigWriteOpWire(op="set", path="/active_model", value="glm-5-3"),
-            ConfigWriteOpWire(op="set", path="/models/glm-5-3/thinking", value="high"),
+            ConfigWriteOpWire(op="set", path="/active_model", value="glm-5-9"),
+            ConfigWriteOpWire(op="set", path="/models/glm-5-9/thinking", value="high"),
         ],
     )
 
-    persisted = models["glm-5-3"]
+    persisted = models["glm-5-9"]
     assert persisted["thinking"] == "high"
-    assert persisted["name"] == "glm-5.3"
+    assert persisted["name"] == "glm-5.9"
     assert persisted["provider"] == "mistral"
-    assert persisted["alias"] == "glm-5-3"
+    assert persisted["alias"] == "glm-5-9"
 
 
 @pytest.mark.asyncio
@@ -159,18 +160,34 @@ async def test_config_write_batch_model_fields_accumulate_into_one_upsert() -> N
 
 @pytest.mark.asyncio
 async def test_config_write_model_field_sparse_when_model_in_durable_layer() -> None:
-    # "local" is a built-in default, so DefaultConfigLayer reconstructs it
-    # on restart: the write must stay sparse (only the changed field), never
-    # materializing identity fields into the user's config.
-    config = build_test_vibe_config(active_model="local")
+    # "mistral-medium-3.5" is a built-in default, so DefaultConfigLayer
+    # reconstructs it on restart: the write must stay sparse (only the changed
+    # field), never materializing identity fields into the user's config.
+    config = build_test_vibe_config(active_model="mistral-medium-3.5")
     persisted = await _write_model_field(
-        config=config, alias="local", field="thinking", value="low"
+        config=config, alias="mistral-medium-3.5", field="thinking", value="off"
     )
 
     # Only the changed field is persisted; alias is back-filled from the map key.
     # Identity fields (name, provider) are NOT materialized — they come from
     # DefaultConfigLayer at merge time.
-    assert persisted == {"thinking": "low", "alias": "local"}
+    assert persisted == {"thinking": "off", "alias": "mistral-medium-3.5"}
+
+
+@pytest.mark.asyncio
+async def test_config_write_model_window_stays_sparse() -> None:
+    # Declaring a window on a built-in must persist only that field. The
+    # write-then-derive path is proven end to end by the unified harness
+    # adapter test.
+    config = build_test_vibe_config(active_model="mistral-medium-3.5")
+    persisted = await _write_model_field(
+        config=config,
+        alias="mistral-medium-3.5",
+        field="max_context_length",
+        value=131_072,
+    )
+
+    assert persisted == {"max_context_length": 131_072, "alias": "mistral-medium-3.5"}
 
 
 @pytest.mark.asyncio
@@ -308,7 +325,6 @@ async def test_a_profile_owned_model_is_not_session_writable() -> None:
     from vibe.core.agents.registry import apply_profile_overrides
     from vibe.core.config.layers.agent_profile import AgentProfileLayer
     from vibe.core.config.layers.default import DefaultConfigLayer
-    from vibe.core.config.layers.overrides import OverridesLayer
     from vibe.core.config.orchestrator import ConfigOrchestrator
 
     # Prepare
@@ -351,7 +367,6 @@ async def test_a_model_the_session_owns_stays_session_writable() -> None:
     )
     from vibe.core.config.layers.agent_profile import AgentProfileLayer
     from vibe.core.config.layers.default import DefaultConfigLayer
-    from vibe.core.config.layers.overrides import OverridesLayer
     from vibe.core.config.orchestrator import ConfigOrchestrator
 
     # Prepare
@@ -370,13 +385,13 @@ async def test_a_model_the_session_owns_stays_session_writable() -> None:
     # Do
     writable = model_thinking_is_session_writable(orchestrator, alias)
     failures = await set_session_reasoning_effort_override(
-        orchestrator, "low", reason="test"
+        orchestrator, "off", reason="test"
     )
 
     # Assert
     assert writable is True
     assert failures == []
-    assert orchestrator.config.models[alias].thinking == "low"
+    assert orchestrator.config.models[alias].thinking == "off"
 
 
 @pytest.mark.asyncio
@@ -394,7 +409,6 @@ async def test_a_profile_that_sets_no_level_leaves_it_to_the_session() -> None:
     from vibe.core.agents.registry import apply_profile_overrides
     from vibe.core.config.layers.agent_profile import AgentProfileLayer
     from vibe.core.config.layers.default import DefaultConfigLayer
-    from vibe.core.config.layers.overrides import OverridesLayer
     from vibe.core.config.orchestrator import ConfigOrchestrator
 
     # Prepare
@@ -426,13 +440,13 @@ async def test_a_profile_that_sets_no_level_leaves_it_to_the_session() -> None:
     # Do
     writable = model_thinking_is_session_writable(orchestrator, alias)
     failures = await set_session_reasoning_effort_override(
-        orchestrator, "low", reason="test"
+        orchestrator, "off", reason="test"
     )
 
     # Assert
     assert writable is True
     assert failures == []
-    assert orchestrator.config.models[alias].thinking == "low"
+    assert orchestrator.config.models[alias].thinking == "off"
 
 
 @pytest.mark.asyncio
@@ -446,7 +460,6 @@ async def test_a_session_level_survives_the_layer_that_declared_its_model() -> N
     """
     from vibe.app_server._session_model import set_session_reasoning_effort_override
     from vibe.core.config.layers.default import DefaultConfigLayer
-    from vibe.core.config.layers.overrides import OverridesLayer
     from vibe.core.config.orchestrator import ConfigOrchestrator
 
     # Prepare

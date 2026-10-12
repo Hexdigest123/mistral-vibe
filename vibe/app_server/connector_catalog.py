@@ -75,6 +75,7 @@ from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.config.types import ConcurrencyConflictError
 from vibe.core.identity_cache import IdentityCache
 from vibe.core.paths import CONNECTOR_BOOTSTRAP_CACHE_FILE
+from vibe.core.tools.connectors.connector_registry import builtin_connectors
 from vibe.core.tools.mcp_settings import persist_mcp_toggle
 from vibe.core.utils.matching import name_matches
 from vibe.observability.logging import logger
@@ -84,7 +85,7 @@ from vibe.utils.http import (
     get_server_url_from_api_base,
 )
 
-type BootstrapFetcher = Callable[[str, str], Awaitable[object]]
+type BootstrapFetcher = Callable[[str, str, tuple[str, ...]], Awaitable[object]]
 type CacheDisposition = Literal["memory", "fresh_cache", "not_loaded"]
 type Notify = Callable[[str, ProtocolModel], Awaitable[None]]
 type SessionlessCatalogFactory = Callable[
@@ -92,6 +93,15 @@ type SessionlessCatalogFactory = Callable[
 ]
 
 _DEFAULT_BASE_URL = "https://api.mistral.ai"
+# Sent as a repeated query param; a comma-joined string is read as one bogus name.
+# Off-by-default safe set: document_library stays gated off unless a caller opts
+# in via ``builtin_connectors``, so any default-valued parameter below never
+# silently re-exposes it.
+_DEFAULT_BUILTIN_CONNECTORS = builtin_connectors(
+    enable_document_library_connector=False
+)
+
+
 # Resolves the caller's org/workspace once per (base_url, api_key) for the console link.
 _IDENTITY_CACHE = IdentityCache()
 _BOOTSTRAP_CACHE_FORMAT = 2
@@ -186,6 +196,7 @@ class _ConnectorProvider:
     fingerprint: str
     base_url: str
     api_key: str
+    builtins: tuple[str, ...] = _DEFAULT_BUILTIN_CONNECTORS
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,9 +254,16 @@ def normalize_connector_alias(name: str) -> str:
     return result or "unnamed"
 
 
-def connector_cache_fingerprint(api_key: str, base_url: str | None) -> str:
+def connector_cache_fingerprint(
+    api_key: str,
+    base_url: str | None,
+    builtins: tuple[str, ...] = _DEFAULT_BUILTIN_CONNECTORS,
+) -> str:
     normalized_base_url = (base_url or _DEFAULT_BASE_URL).rstrip("/")
-    return hashlib.sha256(f"{normalized_base_url}\0{api_key}".encode()).hexdigest()
+    builtins_key = ",".join(builtins)
+    return hashlib.sha256(
+        f"{normalized_base_url}\0{api_key}\0{builtins_key}".encode()
+    ).hexdigest()
 
 
 def resolve_connector_selection(
@@ -651,11 +669,14 @@ class ConnectorCatalogService:
                 f"Connector alias not found in the accepted session catalog: {params.alias}",
             )
 
-        catalog_result = self.read_catalog(context.orchestrator)
-        catalog = catalog_result.catalog
-        if accepted is not None and (
-            catalog is None or catalog.revision != accepted.accepted_catalog_revision
-        ):
+        catalog = (
+            self._catalog_at_revision(
+                context.orchestrator, accepted.accepted_catalog_revision
+            )
+            if accepted is not None
+            else self.read_catalog(context.orchestrator).catalog
+        )
+        if accepted is not None and catalog is None:
             raise RequestFailure(
                 ProtocolErrorCode.CONFLICT,
                 "The host connector catalog does not match the target session",
@@ -767,6 +788,10 @@ class ConnectorCatalogService:
         root: SessionBackend | None,
         notify: Notify,
     ) -> ConnectorRuntimeAuthorization | None:
+        # An event, not a request: one for a session this server does not serve
+        # is dropped, never raised into the loop that forwards every event.
+        if root is None or root.session_id != params.session_id:
+            return None
         context = await self._target(params.session_id, root)
         request = await context.require_control().request_connector_auth(
             alias=params.alias
@@ -1184,6 +1209,19 @@ class ConnectorCatalogService:
         )
         return _catalog_read_result(hit.catalog, "fresh_cache", backend=self._backend)
 
+    def _catalog_at_revision(
+        self, orchestrator: ConfigOrchestrator[VibeConfigSchema], revision: str
+    ) -> ResolvedConnectorCatalog | None:
+        # Freshness decides when to refetch, not which catalog a session accepted.
+        provider = _resolve_provider(orchestrator.config)
+        memory = (
+            self._memory.get(provider.fingerprint) if provider is not None else None
+        )
+        if memory is not None and memory.catalog.revision == revision:
+            return memory.catalog
+        catalog = self.read_catalog(orchestrator).catalog
+        return catalog if catalog is not None and catalog.revision == revision else None
+
     async def _read_catalog_async(
         self, orchestrator: ConfigOrchestrator[VibeConfigSchema]
     ) -> ConnectorCatalogReadResult:
@@ -1230,7 +1268,7 @@ class ConnectorCatalogService:
             span.set_attribute("mistral_ai.vibe.harness.backend", self._backend)
             try:
                 payload = await self._fetch_bootstrap(
-                    provider.base_url, provider.api_key
+                    provider.base_url, provider.api_key, provider.builtins
                 )
                 catalog = await asyncio.to_thread(
                     _resolve_catalog, payload, provider.fingerprint
@@ -1319,7 +1357,9 @@ class ConnectorCatalogService:
         return catalog
 
 
-async def _fetch_bootstrap(base_url: str, api_key: str) -> object:
+async def _fetch_bootstrap(
+    base_url: str, api_key: str, builtins: tuple[str, ...] = _DEFAULT_BUILTIN_CONNECTORS
+) -> object:
     url = f"{base_url.rstrip('/')}/v1/connectors/bootstrap"
     client = await asyncio.to_thread(_build_bootstrap_http_client)
     async with client:
@@ -1328,7 +1368,7 @@ async def _fetch_bootstrap(base_url: str, api_key: str) -> object:
             headers={"Authorization": f"Bearer {api_key}"},
             params={
                 "include_auth_actionable_connectors": "true",
-                "builtin_connectors": "web_search",
+                "builtin_connectors": builtins,
                 "supports_mcp": "true",
             },
         )
@@ -1497,10 +1537,16 @@ def _resolve_provider(config: VibeConfigSchema) -> _ConnectorProvider | None:
         return None
     base_url = get_server_url_from_api_base(provider.api_base) or _DEFAULT_BASE_URL
     base_url = base_url.rstrip("/")
+    builtins = builtin_connectors(
+        enable_document_library_connector=(
+            config.experimental_enable_document_library_connector
+        )
+    )
     return _ConnectorProvider(
-        fingerprint=connector_cache_fingerprint(api_key, base_url),
+        fingerprint=connector_cache_fingerprint(api_key, base_url, builtins),
         base_url=base_url,
         api_key=api_key,
+        builtins=builtins,
     )
 
 

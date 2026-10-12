@@ -261,6 +261,7 @@ async def test_model_picker_arrow_selects_non_top_match() -> None:
         for _ in range(option_list.option_count):
             await pilot.press("down")
             await pilot.pause(0.1)
+            assert option_list.highlighted is not None
             highlighted_id = option_list.get_option_at_index(option_list.highlighted).id
             if highlighted_id == "kimi-k3:batch":
                 break
@@ -450,8 +451,27 @@ async def test_thinking_picker_shows_all_levels() -> None:
         await pilot.pause(0.2)
 
         picker = app.query_one(ThinkingPickerApp)
-        assert picker._thinking_levels == THINKING_LEVELS
+        assert picker._thinking_levels == list(THINKING_LEVELS)
         assert picker._current_thinking == "off"
+
+
+@pytest.mark.asyncio
+async def test_thinking_picker_shows_the_model_set() -> None:
+    narrowed = ModelConfig(
+        name="model-a",
+        provider="mistral",
+        alias="alpha",
+        thinking_levels=["off", "high"],
+    )
+    config = build_test_vibe_config(models=[narrowed], active_model="alpha")
+    app = build_test_vibe_app(config=config)
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await app._show_thinking()
+        await pilot.pause(0.2)
+
+        picker = app.query_one(ThinkingPickerApp)
+        assert picker._thinking_levels == ["off", "high"]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,7 @@
 //! Cached transcript heights and cumulative positions for fast viewport lookup.
 
+use crate::transcript::Transcript;
+
 #[derive(Clone, Copy)]
 pub struct EntryGeometry {
     pub height: u16,
@@ -24,10 +26,38 @@ pub struct TranscriptLayout {
     revision: u64,
     pub height: u16,
     pub entries: Vec<LayoutEntry>,
+    /// Layout row of the first queued prompt, if any.
+    pub queue_top: Option<u16>,
+}
+
+impl TranscriptLayout {
+    /// The blank rows that push the queued run down by `free` rows, to the viewport bottom.
+    pub fn queue_spacer(&self, free: u16) -> QueueSpacer {
+        self.queue_top
+            .map_or_else(QueueSpacer::default, |at| QueueSpacer { at, height: free })
+    }
+}
+
+/// Blank rows inserted at layout row `at`, above the queued run.
+#[derive(Clone, Copy, Default)]
+pub struct QueueSpacer {
+    pub at: u16,
+    pub height: u16,
+}
+
+impl QueueSpacer {
+    /// Shift a layout row at or below the spacer past it.
+    pub fn offset(self, top: u16) -> u16 {
+        match top >= self.at {
+            true => top.saturating_add(self.height),
+            false => top,
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct TranscriptCache {
+    history_from: Option<usize>,
     heights: Vec<EntryHeights>,
     layouts: [TranscriptLayout; 2],
     widths: (u16, u16),
@@ -36,6 +66,42 @@ pub struct TranscriptCache {
 }
 
 impl TranscriptCache {
+    pub fn start_history(&mut self, entries: usize) {
+        self.history_from = Some(entries);
+        self.invalidate_layouts();
+    }
+
+    /// Keep cached heights on their shifted entries and prepare `count` prepended ones.
+    pub fn start_older_history(&mut self, count: usize) {
+        self.heights.splice(
+            0..0,
+            std::iter::repeat_with(EntryHeights::default).take(count),
+        );
+        self.start_history(count);
+    }
+
+    pub fn history_from(&self) -> usize {
+        self.history_from.unwrap_or(0)
+    }
+
+    pub fn preparing_history(&self) -> bool {
+        self.history_from.is_some()
+    }
+
+    /// Advance automatically each frame; no scroll input or additional RPC is needed.
+    pub fn advance_history(&mut self, transcript: &Transcript) -> bool {
+        let Some(end) = self.history_from else {
+            return false;
+        };
+        if end == 0 {
+            self.history_from = None;
+            return false;
+        }
+        self.history_from = Some(transcript.history_batch_start(end));
+        self.invalidate_layouts();
+        true
+    }
+
     /// Drop cached geometry when width, theme, or queue-header copy changes.
     pub fn ensure_context(&mut self, full: u16, content: u16, theme: usize, queue_paused: bool) {
         let context_changed = self.widths != (full, content)
@@ -86,12 +152,14 @@ impl TranscriptCache {
         width: u16,
         height: u16,
         entries: Vec<LayoutEntry>,
+        queue_top: Option<u16>,
     ) {
         let slot = self.width_slot(width);
         self.layouts[slot] = TranscriptLayout {
             revision,
             height,
             entries,
+            queue_top,
         };
     }
 

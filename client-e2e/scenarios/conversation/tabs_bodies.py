@@ -13,8 +13,10 @@ from e2e.app_server.scenario import Timeline
 
 _PROMPT = "write the makefile"
 
-# The settled bash disclosure header lands on SGR row 32.
-_CLICK = "\x1b[<0;1;32M\x1b[<0;1;32m"
+# The folded group header, then the write and bash headers under it.
+_EXPAND_GROUP = "\x1b[<0;1;15M\x1b[<0;1;15m"
+_EXPAND_WRITE = "\x1b[<0;1;16M\x1b[<0;1;16m"
+_EXPAND_BASH = "\x1b[<0;1;20M\x1b[<0;1;20m"
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -26,5 +28,7 @@ timeline: Timeline = [
     ),
     bash("make -n run", "cargo run\n\techo done\n\tdone\n"),
     turn_completed(),
-    _CLICK,
+    _EXPAND_GROUP,
+    _EXPAND_WRITE,
+    _EXPAND_BASH,
 ]

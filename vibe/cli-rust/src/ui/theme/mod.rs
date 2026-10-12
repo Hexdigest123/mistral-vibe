@@ -2,7 +2,11 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+pub mod fixed;
 mod registry;
+pub(crate) mod syntax;
+
+pub use fixed::{LOADING_GRADIENT, ORANGE};
 
 pub use registry::{
     active, active_index, ansi_background, resolve, selection_fg, set_active_index,
@@ -74,8 +78,6 @@ pub fn foreground() -> Color {
 pub fn secondary() -> Color {
     active().secondary
 }
-/// $mistral_orange #FF8205 — the prompt marker and brand accent (theme-independent).
-pub const ORANGE: Color = Color::Rgb(0xFF, 0x82, 0x05);
 /// $text-muted — the muted blend Textual computes for dim/secondary labels.
 pub fn muted() -> Color {
     blend(background(), auto_contrast(), 0.6)
@@ -138,6 +140,10 @@ pub fn block_cursor_bg() -> Color {
 }
 pub fn block_cursor_fg() -> Color {
     active().block_cursor_fg
+}
+/// A text field's block caret (and its selection) over `base`, in block-cursor colors.
+pub fn block_caret(base: Style) -> Style {
+    base.fg(block_cursor_fg()).bg(block_cursor_bg())
 }
 
 /// Input caret block, including Textual's light-theme `$foreground 70%` rule.
@@ -219,6 +225,58 @@ pub fn md_link() -> Color {
 pub fn md_table_border() -> Color {
     blend(background(), foreground(), 0.2)
 }
+/// Horizontal rule — Textual's `MarkdownHorizontalRule` border, `$secondary`.
+pub fn md_rule() -> Color {
+    secondary()
+}
+
+// Colors of a standalone `Markdown` widget (Textual defaults, no vibe overrides).
+
+/// MarkdownBullet — $text-primary (dark) / $text-secondary (light).
+pub fn md_widget_marker() -> Color {
+    if is_dark() {
+        text_primary()
+    } else {
+        text_secondary()
+    }
+}
+/// MarkdownBlockQuote border-left — $text-primary 50% (dark) / $text-secondary (light).
+pub fn md_widget_quote_bar() -> Color {
+    if is_ansi() || !is_dark() {
+        return md_widget_marker();
+    }
+    blend(background(), text_primary(), 0.5)
+}
+/// Standalone `.code_inline` — $text-warning 95% over $warning 10% (dark),
+/// $text-error 95% over $error 5% (light); ANSI keeps the raw tint, no bg.
+pub fn md_widget_code_inline() -> (Color, Color) {
+    if is_ansi() {
+        let fg = if is_dark() { warning() } else { error() };
+        return (fg, background());
+    }
+    let dark = is_dark();
+    let wash = if dark { warning() } else { error() };
+    let tint = if dark { text_warning() } else { text_error() };
+    let alpha = if dark { 0.10 } else { 0.05 };
+    let bg = blend(background(), wash, alpha);
+    (blend(bg, tint, 0.95), bg)
+}
+/// Standalone MarkdownFence background — black 10% (dark) / white 30% (light).
+pub fn md_widget_fence_bg() -> Option<Color> {
+    if is_ansi() {
+        return None;
+    }
+    let wash = if is_dark() {
+        Color::Rgb(0, 0, 0)
+    } else {
+        Color::Rgb(255, 255, 255)
+    };
+    Some(blend(
+        background(),
+        wash,
+        if is_dark() { 0.10 } else { 0.30 },
+    ))
+}
 
 // Blends Textual computes at render time rather than storing in the theme table.
 
@@ -286,12 +344,3 @@ fn tint(color: Color) -> Color {
         blend(auto_contrast(), color, 0.66)
     }
 }
-
-/// Warm gradient the loading label cycles through (yellow → orange → red).
-pub const LOADING_GRADIENT: [Color; 5] = [
-    Color::Rgb(0xFF, 0xD8, 0x00), // YELLOW
-    Color::Rgb(0xFF, 0xAF, 0x00), // ORANGE_LIGHT
-    Color::Rgb(0xFF, 0x82, 0x05), // ORANGE
-    Color::Rgb(0xFA, 0x50, 0x0F), // ORANGE_DARK
-    Color::Rgb(0xE1, 0x05, 0x00), // RED
-];

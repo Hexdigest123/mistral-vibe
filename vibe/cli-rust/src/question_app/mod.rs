@@ -1,9 +1,13 @@
 //! `ask_user_question` bottom-app state, mirroring Python's `QuestionApp`.
 
 mod answers;
+mod other;
 mod scroll;
 
-pub use answers::{cancel, select, select_option, submit_other, toggle_selection};
+pub use answers::{
+    cancel, dismiss, select, select_option, submit_other, toggle_focused, toggle_selection,
+};
+pub use other::{handle_other_key, other_caret_at, paste_other, OtherField};
 pub use scroll::{reconcile_scroll, visible_option_rows};
 
 use std::sync::OnceLock;
@@ -17,9 +21,24 @@ use crate::app::App;
 /// Keys buffered before the app appeared must not answer it (Python
 /// `_INPUT_GRACE_PERIOD_S`).
 pub const INPUT_GRACE_PERIOD: Duration = Duration::from_millis(500);
+const INPUT_GRACE_PERIOD_ENV_VAR: &str = "VIBE_INPUT_GRACE_PERIOD_MS";
 
 const DEFAULT_TYPING_DEBOUNCE_MS: u64 = 1000;
 const TYPING_DEBOUNCE_ENV_VAR: &str = "VIBE_TYPING_GRACE_PERIOD_MS";
+
+/// Who answers the open question (Python `_active_callback` vs `_pending_local_question`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuestionSource {
+    Callback(String),
+    TeleportPush,
+}
+
+/// Whether a `user_input` callback question is open or waiting to open.
+pub fn callback_active(app: &App) -> bool {
+    let state = &app.question_app;
+    matches!(state.pending, Some((QuestionSource::Callback(_), _)))
+        || (state.open && matches!(state.source, Some(QuestionSource::Callback(_))))
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct Viewport {
@@ -63,13 +82,13 @@ pub fn show_pending(app: &mut App) {
     if typing_pause_deadline(app).is_some_and(|deadline| Instant::now() < deadline) {
         return;
     }
-    let Some((callback_id, request)) = app.question_app.pending.take() else {
+    let Some((source, request)) = app.question_app.pending.take() else {
         return;
     };
     crate::terminal_notifier::action_required(app);
     let state = &mut app.question_app;
     state.open = true;
-    state.callback_id = callback_id;
+    state.source = Some(source);
     state.questions = request.questions;
     state.footer_note = request.footer_note;
     state.current_question_idx = 0;
@@ -80,6 +99,8 @@ pub fn show_pending(app: &mut App) {
     state.multi_selections.clear();
     state.other_texts.clear();
     state.other_cursor = 0;
+    state.other_scroll = 0;
+    state.other_field = None;
     state.mount_time = Some(Instant::now());
 }
 
@@ -108,7 +129,7 @@ pub fn on_callback_call(app: &mut App, params: &Value) {
     if let Some(title) = callback.get("title").and_then(Value::as_str) {
         app.view.loading.begin_action_required(title);
     }
-    app.question_app.pending = Some((callback_id.to_owned(), request));
+    app.question_app.pending = Some((QuestionSource::Callback(callback_id.to_owned()), request));
     show_pending(app);
 }
 
@@ -149,7 +170,16 @@ pub fn is_submit_selected(app: &App) -> bool {
 pub fn is_within_grace_period(app: &App) -> bool {
     app.question_app
         .mount_time
-        .is_some_and(|at| at.elapsed() < INPUT_GRACE_PERIOD)
+        .is_some_and(|at| at.elapsed() < input_grace_period())
+}
+
+/// `INPUT_GRACE_PERIOD`, overridable so replayed keys can answer at once.
+pub fn input_grace_period() -> Duration {
+    let ms = std::env::var(INPUT_GRACE_PERIOD_ENV_VAR)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(INPUT_GRACE_PERIOD.as_millis() as u64);
+    Duration::from_millis(ms)
 }
 
 /// The free-text answer typed for `question_idx` (Python `_get_other_text`).
@@ -174,12 +204,18 @@ pub fn navigate_to_option(app: &mut App, option_idx: usize) {
 
 pub fn move_up(app: &mut App) {
     let total = total_options(app);
-    navigate_to_option(app, (app.question_app.selected_option + total - 1) % total);
+    navigate_to_option(
+        app,
+        crate::list_nav::wrap(app.question_app.selected_option, total, false),
+    );
 }
 
 pub fn move_down(app: &mut App) {
     let total = total_options(app);
-    navigate_to_option(app, (app.question_app.selected_option + 1) % total);
+    navigate_to_option(
+        app,
+        crate::list_nav::wrap(app.question_app.selected_option, total, true),
+    );
 }
 
 pub fn next_question(app: &mut App) {
@@ -202,6 +238,7 @@ pub fn prev_question(app: &mut App) {
 
 pub(super) fn switch_question(app: &mut App, new_idx: usize) {
     app.question_app.current_question_idx = new_idx;
+    app.question_app.other_scroll = 0;
     navigate_to_option(app, restore_cursor(app, new_idx));
 }
 

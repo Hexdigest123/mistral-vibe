@@ -6,6 +6,8 @@ import pytest
 
 pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
+from pydantic import BaseModel
+
 from mistralai_vibe_local_harness.protocol import (
     RustAlwaysHookSelector,
     RustHarnessHookBinding,
@@ -21,9 +23,8 @@ from mistralai_vibe_local_harness.vibe import (
     CompiledHooks,
     HookContext,
     LocalRuntimeAdapterConfig,
+    SessionWorkspace,
 )
-from pydantic import BaseModel
-
 from vibe.app_server._image_read_hooks import (
     IMAGE_DESCRIBE_HOOK_BINDING_ID,
     ImageDescribePort,
@@ -67,8 +68,7 @@ def _context(
 ) -> HookContext:
     return HookContext(
         config=LocalRuntimeAdapterConfig(
-            cwd=tmp_path,
-            workspace_roots=(tmp_path,),
+            workspace=SessionWorkspace(cwd=tmp_path, roots=(tmp_path,)),
             image_describer=describer,  # type: ignore[arg-type]
         ),
         messages=(),

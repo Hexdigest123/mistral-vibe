@@ -97,7 +97,7 @@ impl RuntimeBuiltinToolName {
         }
     }
 
-    fn programmatic_name(self, invocation_name: &str) -> Option<String> {
+    fn programmatic_runtime_name(self, invocation_name: &str) -> Option<String> {
         match self {
             Self::SelfSleep => Some("sleep".to_string()),
             Self::FileSystemReadFile => Some("read_file".to_string()),
@@ -150,6 +150,9 @@ fn command_invocation_name(name: &str) -> Option<String> {
     (name == "bash").then(|| name.to_string())
 }
 
+pub(crate) fn provided_tool_qualified_name(namespace: &str, tool_name: &str) -> String {
+    format!("{namespace}.{tool_name}")
+}
 pub(crate) fn provided_tool_runtime_name(group_name: &str, tool_name: &str) -> String {
     format!("provided_tool::{group_name}::{tool_name}")
 }
@@ -196,7 +199,7 @@ impl ToolTarget {
                 tool_name,
             } => HookToolKey {
                 target: HookToolTarget::Provided,
-                qualified_name: format!("{group_name}.{tool_name}"),
+                qualified_name: provided_tool_qualified_name(group_name, tool_name),
             },
         }
     }
@@ -321,13 +324,13 @@ impl ExternalTool {
         }
     }
 
-    pub(crate) fn programmatic_name(&self) -> Option<String> {
+    pub(crate) fn programmatic_runtime_name(&self) -> Option<String> {
         match self {
             Self::RuntimeBuiltin {
                 name,
                 invocation_name,
                 ..
-            } => name.programmatic_name(invocation_name),
+            } => name.programmatic_runtime_name(invocation_name),
             Self::Provided {
                 group_name,
                 tool_name,

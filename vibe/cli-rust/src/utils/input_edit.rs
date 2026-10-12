@@ -4,6 +4,8 @@
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::graphemes::split_graphemes;
+
 /// A word char, matching Python's `\w` (unicode alphanumerics plus underscore).
 pub(crate) fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -37,17 +39,41 @@ pub(crate) fn line_bounds(input: &str, cursor: usize) -> (usize, usize) {
     (start, end)
 }
 
-/// Byte length of the grapheme starting at `cursor`, or 0 at end of text.
+/// Bytes from `cursor` to the end of its grapheme, split from the line start; 0 at end of text.
 fn grapheme_len_at(input: &str, cursor: usize) -> usize {
-    input[cursor..].graphemes(true).next().map_or(0, str::len)
+    let (start, end) = line_bounds(input, cursor);
+    if cursor == end {
+        return input[cursor..].chars().next().map_or(0, char::len_utf8);
+    }
+    split_graphemes(&input[start..end])
+        .map(|(byte, grapheme)| start + byte + grapheme.len())
+        .find(|&grapheme_end| grapheme_end > cursor)
+        .map_or(0, |grapheme_end| grapheme_end - cursor)
 }
 
 /// Byte length of the grapheme ending at `cursor`, or 0 at start of text.
 fn grapheme_len_before(input: &str, cursor: usize) -> usize {
-    input[..cursor]
-        .graphemes(true)
-        .next_back()
-        .map_or(0, str::len)
+    let (start, _) = line_bounds(input, cursor);
+    if start == cursor {
+        return input[..cursor]
+            .graphemes(true)
+            .next_back()
+            .map_or(0, str::len);
+    }
+    split_graphemes(&input[start..cursor])
+        .last()
+        .map_or(0, |(_, grapheme)| grapheme.len())
+}
+
+/// Byte offset of the `index`-th character, or the input end when `index`
+/// runs past it. Mouse clicks place the caret by displayed column (a
+/// character count); the edit pipeline works in byte offsets, so clicks
+/// convert here to stay on char boundaries.
+pub(crate) fn char_index_to_byte_offset(input: &str, index: usize) -> usize {
+    input
+        .char_indices()
+        .nth(index)
+        .map_or(input.len(), |(byte, _)| byte)
 }
 
 /// Insert `s` at the cursor and advance past it (Textual paste / typed char).
@@ -140,9 +166,14 @@ pub(crate) fn cursor_word_right(input: &str, cursor: &mut usize) {
     *cursor = word_right_target(input, *cursor);
 }
 
-/// Move the cursor to the start of the current line, smart-home (`home`, `ctrl+a`).
+/// Move the cursor to the start of the current line, smart-home (`home`, `ctrl+a`);
+/// from column 0 it climbs to the start of the previous line.
 pub(crate) fn cursor_line_start(input: &str, cursor: &mut usize) {
     let (start, end) = line_bounds(input, *cursor);
+    if *cursor == start && start > 0 {
+        *cursor = line_bounds(input, start - 1).0;
+        return;
+    }
     let first_non_ws = input[start..end]
         .char_indices()
         .find(|(_, c)| !c.is_whitespace())
@@ -155,9 +186,14 @@ pub(crate) fn cursor_line_start(input: &str, cursor: &mut usize) {
     };
 }
 
-/// Move the cursor to the end of the current line (`end`, `ctrl+e`).
+/// Move the cursor to the end of the current line (`end`, `ctrl+e`); from a
+/// line end it moves on to the end of the next line.
 pub(crate) fn cursor_line_end(input: &str, cursor: &mut usize) {
-    *cursor = line_bounds(input, *cursor).1;
+    let end = line_bounds(input, *cursor).1;
+    *cursor = match *cursor == end && end < input.len() {
+        true => line_bounds(input, end + 1).1,
+        false => end,
+    };
 }
 
 /// Delete the word left of the cursor (`ctrl+w`, `alt+backspace`, `ctrl+backspace`).

@@ -1,11 +1,13 @@
 //! Edit-effect diff rows, mirroring the Textual `diff_rendering` widget.
 
 mod line_numbers;
+mod wrap;
 
 use line_numbers::next_line_number;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use unicode_width::UnicodeWidthStr;
+pub use wrap::{banded, wrap_row};
 
 use super::super::{highlight, theme};
 use super::difflib;
@@ -39,8 +41,8 @@ pub fn occurrences(output: &crate::server::FileEditEffectOutput) -> Vec<DiffOccu
     if output.occurrences.is_empty() {
         return vec![DiffOccurrence {
             start_line: None,
-            old_lines: output.old_string.clone(),
-            new_lines: output.new_string.clone(),
+            old_lines: output.old_string.clone().unwrap_or_default(),
+            new_lines: output.new_string.clone().unwrap_or_default(),
         }];
     }
     output

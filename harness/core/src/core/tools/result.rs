@@ -1,6 +1,7 @@
 use serde_json::Value;
 use serde_json::json;
 
+use crate::core::features::permissions::ApprovalFailureReason;
 use crate::core::wire::content::{
     ContentBlock, Role, strip_model_hidden_content_fields, text_content,
 };
@@ -23,6 +24,38 @@ pub(crate) fn invalid_tool_call_result(reason: String) -> ToolResult {
         error: ProtocolError {
             code: "invalid_tool_call".to_string(),
             message: reason,
+            retryable: false,
+            details: Value::Null,
+        },
+    }
+}
+
+pub(crate) fn permission_denied_result() -> ToolResult {
+    const MESSAGE: &str = "Tool call denied by permission policy.";
+
+    ToolResult::Failure {
+        content: text_content(MESSAGE),
+        structured_content: StructuredContent::Absent,
+        meta: None,
+        error: ProtocolError {
+            code: "permission_denied".to_string(),
+            message: MESSAGE.to_string(),
+            retryable: false,
+            details: Value::Null,
+        },
+    }
+}
+
+pub(crate) fn approval_failed_result(reason: ApprovalFailureReason) -> ToolResult {
+    let message = reason.model_message();
+
+    ToolResult::Failure {
+        content: text_content(message),
+        structured_content: StructuredContent::Absent,
+        meta: None,
+        error: ProtocolError {
+            code: "approval_failed".to_string(),
+            message: message.to_string(),
             retryable: false,
             details: Value::Null,
         },

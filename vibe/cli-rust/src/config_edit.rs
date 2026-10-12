@@ -90,12 +90,11 @@ pub fn handle_key(
         KeyCode::Tab if !app.config_screen.targets.is_empty() => {
             edit.target = (edit.target + 1) % app.config_screen.targets.len()
         }
-        KeyCode::Up | KeyCode::Char('k') if !choices.is_empty() => {
-            let index = choice_index(edit, &choices).saturating_sub(1);
-            select_choice(edit, &choices, index);
-        }
-        KeyCode::Down | KeyCode::Char('j') if !choices.is_empty() => {
-            let index = (choice_index(edit, &choices) + 1).min(choices.len() - 1);
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j')
+            if !choices.is_empty() =>
+        {
+            let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
+            let index = crate::list_nav::wrap(choice_index(edit, &choices), choices.len(), down);
             select_choice(edit, &choices, index);
         }
         _ => {}
@@ -234,7 +233,15 @@ fn raw_text(value: &Value, kind: &str) -> String {
         _ => value
             .as_str()
             .map(str::to_owned)
-            .unwrap_or_else(|| value.to_string()),
+            // A null scalar (an unknown context window) edits from an empty
+            // draft, not from the literal text "null".
+            .unwrap_or_else(|| {
+                if value.is_null() {
+                    String::new()
+                } else {
+                    value.to_string()
+                }
+            }),
     }
 }
 

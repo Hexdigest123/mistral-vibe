@@ -68,9 +68,9 @@ def _parse_model_ids(payload: Any) -> list[str]:
 
 
 def _catalog_cache_path() -> Any:
-    from vibe.core.paths import MODEL_CATALOG_CACHE_FILE
+    from vibe.core.paths import DISCOVERED_MODELS_CACHE_FILE
 
-    return MODEL_CATALOG_CACHE_FILE.path
+    return DISCOVERED_MODELS_CACHE_FILE.path
 
 
 def load_catalog_cache() -> ModelCatalogCache:

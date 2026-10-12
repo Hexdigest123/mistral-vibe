@@ -6,8 +6,8 @@ generated golden is uncommitted until reviewed.
 
 On failure, live SVGs are saved under ``goldens/_live/<scenario>/`` next to
 the committed goldens so a simple ``diff`` reveals the platform-specific
-difference. CI artifact globs already cover ``goldens/**/*.svg`` so the live
-SVGs are uploaded automatically — no separate store step needed.
+difference. CI artifact globs already cover ``goldens/_live/**/*.svg`` so the
+live SVGs are uploaded automatically — no separate store step needed.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import difflib
 import json
 import os
 from pathlib import Path
+import re
 import warnings
 from xml.etree import ElementTree
 
@@ -48,7 +49,10 @@ _LIVE_DIR = golden_path("_live")
 
 def _assert_scenario_expectations(captured: Capture, scenario: Scenario) -> None:
     if (expected := scenario.expected_actions.get("rust")) is not None:
-        assert captured.actions == expected
+        assert len(captured.actions) == len(expected) and all(
+            want.matches(got)
+            for want, got in zip(expected, captured.actions, strict=True)
+        ), f"rust actions {captured.actions!r} do not match {expected!r}"
     if not captured.snapshots:
         return
 
@@ -60,6 +64,8 @@ def _assert_scenario_expectations(captured: Capture, scenario: Scenario) -> None
         assert text not in screen, f"rust screen contains {text!r}"
     for row, text in scenario.screen_rows.get("rust", {}).items():
         assert snapshot.rows[row] == text, f"rust screen row {row} differs"
+    if (cursor := scenario.screen_cursor.get("rust")) is not None:
+        assert snapshot.cursor == cursor, f"rust cursor {snapshot.cursor} != {cursor}"
 
     clipboard_expected = (
         scenario.expected_clipboard is not None
@@ -86,7 +92,14 @@ def _assert_scenario_expectations(captured: Capture, scenario: Scenario) -> None
 
 @pytest.mark.parametrize(
     ("expected", "actual"),
-    [([Action("open_url", "expected")], []), ([], [Action("open_url", "unexpected")])],
+    [
+        ([Action("open_url", "expected")], []),
+        ([], [Action("open_url", "unexpected")]),
+        (
+            [Action("open_url", re.compile(r"file:///tmp/a-\w+\.png"))],
+            [Action("open_url", "file:///tmp/a-1.png.txt")],
+        ),
+    ],
 )
 def test_scenario_expectations_reject_wrong_actions(
     expected: list[Action], actual: list[Action]
@@ -97,9 +110,26 @@ def test_scenario_expectations_reject_wrong_actions(
         _assert_scenario_expectations(Capture([], actual, []), scenario)
 
 
+def test_scenario_expectations_accept_a_pattern_action() -> None:
+    expected = [Action("open_url", re.compile(r"file:///tmp/a-\w+\.png"))]
+    scenario = Scenario(name="test", steps=[], expected_actions={"rust": expected})
+
+    _assert_scenario_expectations(
+        Capture([], [Action("open_url", "file:///tmp/a-x1.png")], []), scenario
+    )
+
+
 def test_scenario_expectations_reject_wrong_clipboard() -> None:
     scenario = Scenario(name="test", steps=[], expected_clipboard="expected")
     captured = Capture([Snapshot("final", (), "actual")], [], [])
+
+    with pytest.raises(AssertionError):
+        _assert_scenario_expectations(captured, scenario)
+
+
+def test_scenario_expectations_reject_wrong_cursor() -> None:
+    scenario = Scenario(name="test", steps=[], screen_cursor={"rust": (0, 0)})
+    captured = Capture([Snapshot("final", (), cursor=(0, 1))], [], [])
 
     with pytest.raises(AssertionError):
         _assert_scenario_expectations(captured, scenario)
@@ -149,6 +179,8 @@ def test_svg_groups_text_without_merging_styles() -> None:
         ("\u2500\u2500\u2588\u2588", [("\u2500\u2500\u2588\u2588", "0")]),
         ("ab界X", [("ab", "0"), ("界", "24.4"), ("X", "61")]),
         ("abx\u0301Y", [("ab", "0"), ("x\u0301", "24.4"), ("Y", "36.6")]),
+        ("❤\ufe0fX", [("❤\ufe0f", "0"), ("X", "24.4")]),
+        ("1\ufe0f\u20e3X", [("1\ufe0f\u20e3", "0"), ("X", "24.4")]),
         ("\x1b[4ma b\x1b[0m", [("a", "0"), ("b", "24.4")]),
         ("\x1b[9ma b\x1b[0m", [("a", "0"), ("b", "24.4")]),
     ],
@@ -207,6 +239,19 @@ def test_golden_keeps_snapshots_in_each_scenario(
     assert load_golden_svgs("two") == []
 
 
+@pytest.mark.parametrize("ending", ["", "\n"])
+def test_golden_loading_ignores_only_the_file_terminator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    monkeypatch.setattr(golden, "GOLDEN_DIR", tmp_path)
+    directory = tmp_path / "one"
+    directory.mkdir()
+    svg = "<svg>\n<text> keep spaces </text>\n</svg>"
+    (directory / "snapshot_00_step0.svg").write_text(svg + ending)
+
+    assert load_golden_svgs("one") == [svg]
+
+
 def test_golden_requests_are_written_with_sorted_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -228,7 +273,7 @@ def test_rust_matches_golden(name: str) -> None:
     expected_titles = scenario.expected_titles
     if expected_titles is not None and scenario.capture_startup:
         expected_titles = expected_titles[1:]
-    scenario.capture_startup = False
+    scenario.clamp_capture_startup()
     if not os.path.exists(CLIENTS["rust"][0]) or not os.path.exists(REPLAY_BIN):
         pytest.skip("Rust binary missing (run `make build_rs`)")
 

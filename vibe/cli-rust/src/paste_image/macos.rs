@@ -4,13 +4,10 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use tempfile::Builder;
 
-use super::PNG_MAGIC;
-
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+use super::{run_with_timeout, PNG_MAGIC};
 
 pub fn read() -> Option<Vec<u8>> {
     // Preview's Copy, Screenshot, browser Copy Image, etc. each pick their own
@@ -31,7 +28,7 @@ fn read_macos_class(four_cc: &str) -> Option<Vec<u8>> {
     );
     let mut command = Command::new("osascript");
     command.args(["-e", &script]);
-    if !run_with_timeout(&mut command) {
+    if !run_with_timeout(&mut command, Stdio::null()) {
         return None;
     }
     fs::read(file.path()).ok().filter(|data| !data.is_empty())
@@ -53,30 +50,12 @@ fn convert_to_png_via_sips(data: &[u8]) -> Option<Vec<u8>> {
         "--out",
         output_path.to_str()?,
     ]);
-    if !run_with_timeout(&mut command) {
+    if !run_with_timeout(&mut command, Stdio::null()) {
         return None;
     }
     fs::read(&output_path)
         .ok()
         .filter(|bytes| bytes.starts_with(PNG_MAGIC))
-}
-
-fn run_with_timeout(command: &mut Command) -> bool {
-    let Ok(mut child) = command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() else {
-        return false;
-    };
-    let deadline = Instant::now() + READ_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
 }
 
 fn applescript_string(path: &Path) -> String {

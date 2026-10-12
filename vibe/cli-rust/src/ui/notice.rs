@@ -20,6 +20,7 @@ const NATIVE_COPY_HINT: &str = "if paste fails, hold Shift (Option in iTerm2, Fn
 
 /// Copy `text` and surface the same inline notice as Python.
 pub fn copied(app: &mut App, text: &str) {
+    crate::telemetry::user_copied_text(app, text);
     let message = if clipboard::copy_to_clipboard(text) {
         "Copied to clipboard".to_string()
     } else {
@@ -53,16 +54,7 @@ fn show_with_severity(app: &mut App, text: &str, secs: u64, severity: ToastSever
     app.overlays.notice = Some(Notice {
         text: text.to_string(),
         severity,
-        until: Some(until),
-    });
-}
-
-/// Show an inline notice that stays up until cleared (Python `timeout=None`).
-pub fn pin(app: &mut App, text: &str) {
-    app.overlays.notice = Some(Notice {
-        text: text.to_string(),
-        severity: ToastSeverity::Information,
-        until: None,
+        until,
     });
 }
 
@@ -75,7 +67,7 @@ pub fn width(app: &App) -> u16 {
     let Some(notice) = &app.overlays.notice else {
         return 0;
     };
-    if notice.until.is_some_and(|until| Instant::now() >= until) {
+    if Instant::now() >= notice.until {
         return 0;
     }
     u16::try_from(Line::from(notice.text.as_str()).width()).unwrap_or(u16::MAX)
@@ -86,7 +78,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     let Some(notice) = &app.overlays.notice else {
         return;
     };
-    if notice.until.is_some_and(|until| Instant::now() >= until) {
+    if Instant::now() >= notice.until {
         app.overlays.notice = None;
         return;
     }

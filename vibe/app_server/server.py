@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum, auto
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import JsonValue, ValidationError
@@ -30,6 +31,8 @@ from vibe.app_server._session_backend_port import (
     SessionBackendHostBackgroundTasks,
     SessionBackendHostConfigRead,
     SessionBackendHostDelete,
+    SessionBackendHostHistoryList,
+    SessionBackendHostLeaseWatch,
     SessionBackendHostPin,
     SessionBackendHostSeenState,
     SessionBackendNotificationSink,
@@ -41,6 +44,7 @@ from vibe.app_server._session_backend_port import (
     SessionEventSubscription,
 )
 from vibe.app_server._session_backend_services import SessionBackendServices
+from vibe.app_server._session_lease_subscription import SessionLeaseSubscription
 from vibe.app_server.connector_catalog import ConnectorCatalogService
 from vibe.app_server.events import (
     CallbackRequested,
@@ -91,6 +95,7 @@ from vibe.app_server.protocol import (
     SessionHandoffParams,
     SessionHistoryClearParams,
     SessionHistoryClearResponse,
+    SessionHistoryListParams,
     SessionListParams,
     SessionMarkAsSeenParams,
     SessionPinParams,
@@ -245,6 +250,7 @@ class AppServer:
         self._client_requests: dict[int, PendingClientRequest] = {}
         self._abandoned_client_request_ids: set[int] = set()
         self._request_tasks: set[asyncio.Task[None]] = set()
+        self._leases = SessionLeaseSubscription(self._send_notification)
         self._backend_event_task: asyncio.Task[None] | None = None
         self._backend_event_backend: SessionBackend | None = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -541,6 +547,7 @@ class AppServer:
         self, current: asyncio.Task[object] | None
     ) -> list[BaseException]:
         tasks = [task for task in self._request_tasks if task is not current]
+        tasks.extend(self._leases.take())
         backend_events = self._backend_event_task
         self._backend_event_task = None
         self._backend_event_backend = None
@@ -557,6 +564,7 @@ class AppServer:
         self, current: asyncio.Task[object] | None
     ) -> list[BaseException]:
         tasks = [task for task in self._request_tasks if task is not current]
+        tasks.extend(self._leases.take())
         backend_events = self._backend_event_task
         self._backend_event_task = None
         self._backend_event_backend = None
@@ -750,6 +758,9 @@ class AppServer:
         if method in {
             "config/schema",
             "session/history/get",
+            "setup/status",
+            "setup/store-credential",
+            "setup/submit-choices",
             "workspace/git/checkouts",
             "workspace/git/worktrees/limit/update",
             "workspace/git/worktrees/list",
@@ -760,9 +771,23 @@ class AppServer:
             "workspace/trust/status",
             "workspace/trust/untrustedConfig",
         } or method.startswith("projectLinks/"):
-            return await self._host_handler.dispatch(method, raw_params)
+            # The attached session is the caller; its own worktree holder does
+            # not count as in use for the worktree-remove questions it asks.
+            # The setup methods are session-less by construction: the wizard
+            # runs before any session, so they never build or read a runtime.
+            return await self._host_handler.dispatch(
+                method,
+                raw_params,
+                session_id=self._root.session_id if self._root is not None else None,
+                client_info=self._initialized_client_info(),
+            )
         if method == "session/delete":
             return await self._delete_session(raw_params)
+        if method == "session/lease/subscribe":
+            host = self._session_backend_host
+            if not isinstance(host, SessionBackendHostLeaseWatch):
+                raise method_not_found(method)
+            return await self._leases.subscribe(host)
         if _omits_session_id(method, raw_params):
             return await self._host_handler.dispatch(method, raw_params)
         if self._root is None:
@@ -826,6 +851,8 @@ class AppServer:
             return await self._open_initial_session(method, raw_params)
         if result := await self._dispatch_backend_host_operation(method, raw_params):
             return result
+        if method == "session/history/list":
+            return await self._dispatch_stored_session(method, raw_params)
         if self._host_handler.handles(method):
             return await self._host_handler.dispatch(method, raw_params)
         return await self._open_initial_session(method, raw_params)
@@ -861,7 +888,7 @@ class AppServer:
                 "session/read",
                 "session/history/list",
             }:
-                return await self._host_handler.dispatch(method, raw_params)
+                return await self._dispatch_stored_session(method, raw_params)
             raise
         if result.session_attached and root.session_id != previous_session_id:
             subscription = await root.subscribe(
@@ -875,6 +902,24 @@ class AppServer:
             )
         await self._flush_backend_events(root)
         return result
+
+    async def _dispatch_stored_session(
+        self, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult:
+        host = self._session_backend_host
+        if method == "session/history/list" and isinstance(
+            host, SessionBackendHostHistoryList
+        ):
+            try:
+                return DispatchResult(
+                    await host.list_history(
+                        validate_wire(SessionHistoryListParams, raw_params)
+                    )
+                )
+            except SessionBackendError as exc:
+                if exc.code is not ProtocolErrorCode.NOT_FOUND:
+                    raise
+        return await self._host_handler.dispatch(method, raw_params)
 
     async def _dispatch_backend_host_operation(
         self, method: str, raw_params: dict[str, Any]
@@ -1323,7 +1368,8 @@ class AppServer:
         self._client_capabilities = params.capabilities
         self._initialization = InitializationState.INITIALIZE_RECEIVED
         return InitializeResponse(
-            server_info=ServerInfo(name="vibe-app-server", version=__version__)
+            server_info=ServerInfo(name="vibe-app-server", version=__version__),
+            process_id=os.getpid(),
         )
 
     def _initialized_client_info(self) -> ClientInfo:

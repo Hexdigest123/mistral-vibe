@@ -11,9 +11,13 @@ use crate::chat_input::Action;
 /// The chat input editing action a key triggers, or `None` for keys the chat input
 /// does not edit with (submit, history, scroll, popup nav are handled elsewhere).
 pub fn action_for(k: &KeyEvent) -> Option<Action> {
+    if let Some(action) = history_action_for(k, cfg!(unix)) {
+        return Some(action);
+    }
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+    let command = k.modifiers.contains(KeyModifiers::SUPER);
     // Ctrl or Alt turns caret/delete keys into their word-wise variant.
     let word = ctrl || alt;
     match k.code {
@@ -47,6 +51,8 @@ pub fn action_for(k: &KeyEvent) -> Option<Action> {
         // Shift extends a selection; Shift+Ctrl/Alt extends by word (Textual
         // `cursor_*(select=True)`). Shift+Up/Down are left unmapped so the app
         // handles them as scroll.
+        KeyCode::Left if command && shift => Some(Action::SelectLineStart),
+        KeyCode::Right if command && shift => Some(Action::SelectLineEnd),
         KeyCode::Left if shift && word => Some(Action::SelectWordLeft),
         KeyCode::Left if shift => Some(Action::SelectLeft),
         KeyCode::Right if shift && word => Some(Action::SelectWordRight),
@@ -55,12 +61,28 @@ pub fn action_for(k: &KeyEvent) -> Option<Action> {
         KeyCode::End if shift => Some(Action::SelectLineEnd),
         KeyCode::F(7) => Some(Action::SelectAll),
         KeyCode::F(6) => Some(Action::SelectLine),
+        // Kitty-protocol Cmd+Left/Right; other terminals send Ctrl+A/E or Home/End.
+        KeyCode::Left if command => Some(Action::CursorLineStart),
+        KeyCode::Right if command => Some(Action::CursorLineEnd),
         KeyCode::Left if word => Some(Action::CursorWordLeft),
         KeyCode::Left => Some(Action::CursorLeft),
         KeyCode::Right if word => Some(Action::CursorWordRight),
         KeyCode::Right => Some(Action::CursorRight),
         KeyCode::Home => Some(Action::CursorLineStart),
         KeyCode::End => Some(Action::CursorLineEnd),
+        _ => None,
+    }
+}
+
+/// Super bindings mirror Textual; Ctrl bindings are reserved for job control on Unix.
+pub fn history_action_for(key: &KeyEvent, can_suspend: bool) -> Option<Action> {
+    let modifiers = key.modifiers;
+    if modifiers != KeyModifiers::SUPER && (can_suspend || modifiers != KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('z') => Some(Action::Undo),
+        KeyCode::Char('y') => Some(Action::Redo),
         _ => None,
     }
 }

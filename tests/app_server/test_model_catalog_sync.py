@@ -27,7 +27,7 @@ def _seed_catalog_cache(model_ids: list[str]) -> None:
             }
         },
     }
-    (VIBE_HOME.path / "model_catalog_cache.json").write_text(
+    (VIBE_HOME.path / "discovered_models_cache.json").write_text(
         json.dumps(cache), encoding="utf-8"
     )
 

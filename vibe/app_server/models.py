@@ -29,6 +29,12 @@ from vibe.app_server._effect_models import (
     FileWriteEffectOutput as FileWriteEffectOutput,
     GenericEffectDetail as GenericEffectDetail,
     ProcessEffectDetail as ProcessEffectDetail,
+    ScratchpadEffectDetail as ScratchpadEffectDetail,
+    ScratchpadEffectInput as ScratchpadEffectInput,
+    ScratchpadEffectOutput as ScratchpadEffectOutput,
+    ScratchpadListInput as ScratchpadListInput,
+    ScratchpadReadInput as ScratchpadReadInput,
+    ScratchpadWriteInput as ScratchpadWriteInput,
     ShellEffectDetail as ShellEffectDetail,
     ShellEffectInput as ShellEffectInput,
     ShellEffectOutput as ShellEffectOutput,
@@ -54,6 +60,7 @@ from vibe.app_server._effect_models import (
     WebSearchEffectSource as WebSearchEffectSource,
     WorktreeEffectDetail as WorktreeEffectDetail,
     WorktreeEffectInput as WorktreeEffectInput,
+    WorktreeEffectProgress as WorktreeEffectProgress,
     effect_input_json as effect_input_json,
 )
 from vibe.app_server._model import ProtocolModel
@@ -102,6 +109,13 @@ class AccountAction(ProtocolModel):
     url: str
 
 
+class AccountApiKeyView(ProtocolModel):
+    preview: str
+    scope: str
+    # "shared_only" or "personal_and_shared"; None on older backends.
+    access_scope: str | None = None
+
+
 class AccountView(ProtocolModel):
     status: AccountStatus
     plan: AccountPlanView | None = None
@@ -109,6 +123,7 @@ class AccountView(ProtocolModel):
     rate_limit_action: AccountAction | None = None
     teleport_eligible: bool = False
     teleport_action: AccountAction | None = None
+    api_key: AccountApiKeyView | None = None
 
 
 class IdentityEntityView(ProtocolModel):
@@ -360,7 +375,22 @@ class PublicTurnStatus(StrEnum):
 
 
 class PublicTurnStopReason(StrEnum):
+    """Why a completed Turn stopped short of the agent finishing on its own."""
+
+    LIMIT = auto()  # an iteration, token or price limit
+    LENGTH = auto()  # the last answer was cut off at the output-token cap
+
+
+class TurnStop(StrEnum):
+    """Why a Turn ended before the agent finished, read one way for every client.
+
+    Clients map it to their own vocabulary instead of re-reading the Turn's
+    status and stop reason, so an interrupted Turn always wins over its reason.
+    """
+
+    INTERRUPTED = auto()
     LIMIT = auto()
+    LENGTH = auto()
 
 
 class PublicRetryCategory(StrEnum):
@@ -375,6 +405,8 @@ class PublicRetryState(ProtocolModel):
     turn_id: str
     category: PublicRetryCategory
     detail: str
+    retry_at: int | None = None
+    retry_attempt: int | None = None
 
 
 class TurnErrorCode(StrEnum):
@@ -406,6 +438,10 @@ class TokenUsage(ProtocolModel):
 
 class AgentStatsSnapshot(ProtocolModel):
     steps: int = 0
+    # Model calls the session's own agent made: neither its subagents' calls nor
+    # utility calls such as compaction. None until one is counted, or when the
+    # runtime does not count them.
+    model_calls: int | None = None
     session_prompt_tokens: int = 0
     session_completion_tokens: int = 0
     session_cached_tokens: int = 0
@@ -775,6 +811,23 @@ class MCPState(ProtocolModel):
     connector_error: str | None = None
     manage_connectors_url: str | None = None
 
+    def resolve_source(self, query: str) -> MCPSourceSummary | None:
+        # `/mcp <query>` takes an alias, or the display name the browser shows.
+        by_alias = next(
+            (source for source in self.sources if source.name == query), None
+        )
+        if by_alias is not None:
+            return by_alias
+        needle = query.casefold()
+        return next(
+            (
+                source
+                for source in self.sources
+                if source.display_name.casefold() == needle
+            ),
+            None,
+        )
+
     @property
     def needs_auth(self) -> list[str]:
         return sorted(
@@ -921,6 +974,7 @@ class _PublicHistoryEntryBase(ProtocolModel):
     id: str
     session_id: str
     turn_id: str | None = None
+    input_entry_id: str | None = None
     created_at: int
     updated_at: int
     generation_status: PublicEntryGenerationStatus
@@ -1128,6 +1182,23 @@ PublicSessionStatus = Annotated[
 ]
 
 
+class PublicSessionWorktree(ProtocolModel):
+    """The managed worktree a session runs in, as the session state reports it.
+
+    Carried on ``PublicSession`` so a client learns the move the moment the
+    session does, without waiting for the deferred first turn's transcript
+    effect: a session opened and quit without a prompt still knows its
+    worktree, which is what an exit cleanup prompt needs.
+    """
+
+    name: str
+    branch: str
+    path: str
+    # Whether the run that moved the session created the worktree; reused
+    # ones are never auto-cleaned.
+    created: bool
+
+
 class PublicSession(ProtocolModel):
     id: str
     root_session_id: str | None = None
@@ -1143,6 +1214,9 @@ class PublicSession(ProtocolModel):
     is_unseen: bool = False
     cwd: str | None = None
     workspace_roots: list[str] = Field(default_factory=list)
+    # The managed worktree the session runs in, when it does; the additive
+    # default keeps old clients and old servers working (ADR 0014).
+    worktree: PublicSessionWorktree | None = None
     # What this session runs; ``None`` follows the current default.
     model: str | None = None
     reasoning_effort: str | None = None
@@ -1187,11 +1261,35 @@ class PublicTurn(ProtocolModel):
     id: str
     session_id: str
     status: PublicTurnStatus
+    input_entry_id: str | None = None
     started_at: int
     completed_at: int | None = None
     error: PublicError | None = None
     stop_reason: PublicTurnStopReason | None = None
     queue_item_id: str | None = None
+
+
+def turn_stop(turn: PublicTurn | None) -> TurnStop | None:
+    if turn is None:
+        return None
+    if turn.status is PublicTurnStatus.INTERRUPTED:
+        return TurnStop.INTERRUPTED
+    match turn.stop_reason:
+        case PublicTurnStopReason.LIMIT:
+            return TurnStop.LIMIT
+        case PublicTurnStopReason.LENGTH:
+            return TurnStop.LENGTH
+        case None:
+            return None
+
+
+class PublicBackgroundProcess(ProtocolModel):
+    process_id: str
+    command: str
+    # Mirrors the independently versioned Harness PublicBackgroundProcess status.
+    status: Literal["running", "completed", "failed", "stopped", "orphaned"]
+    exit_code: int | None = None
+    created_at: str
 
 
 class PublicSessionState(ProtocolModel):
@@ -1204,6 +1302,7 @@ class PublicSessionState(ProtocolModel):
     turns: list[PublicTurn] | None = None
     active_callbacks: list[PublicCallbackEntry] = Field(default_factory=list)
     child_sessions: list[PublicChildSession] = Field(default_factory=list)
+    background_processes: list[PublicBackgroundProcess] = Field(default_factory=list)
     turn_queue: PublicTurnQueue = Field(default_factory=PublicTurnQueue)
     retrying: PublicRetryState | None = None
 
@@ -1223,7 +1322,8 @@ class JsonPatchOperation(ProtocolModel):
 class ScheduledLoop(ProtocolModel):
     id: str
     prompt: str
-    interval_seconds: int
+    interval_seconds: int | None = None
+    cron: str | None = Field(default=None, exclude_if=lambda value: value is None)
     next_fire_at: float
 
 

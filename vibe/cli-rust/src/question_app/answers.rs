@@ -9,7 +9,7 @@ use serde_json::json;
 
 use super::{
     current_question, is_other_selected, is_submit_selected, is_within_grace_period,
-    other_option_idx, other_text, switch_question,
+    other_option_idx, other_text, switch_question, QuestionSource,
 };
 use crate::app::App;
 
@@ -32,6 +32,17 @@ pub fn select(app: &mut App, client: &Arc<Client>) {
         {
             advance_or_submit(app, client);
         }
+        return;
+    }
+    toggle_selection(app, app.question_app.selected_option);
+}
+
+/// Space on a multi-select option (Python `action_toggle_focused`).
+pub fn toggle_focused(app: &mut App) {
+    if is_within_grace_period(app) {
+        return;
+    }
+    if !current_question(app).multi_select || is_submit_selected(app) {
         return;
     }
     toggle_selection(app, app.question_app.selected_option);
@@ -176,11 +187,40 @@ fn submit(app: &mut App, client: &Arc<Client>) {
     );
 }
 
+/// Drop the question from `source` when its operation ended unanswered.
+pub fn dismiss(app: &mut App, source: &QuestionSource) {
+    let question = &mut app.question_app;
+    if question
+        .pending
+        .as_ref()
+        .is_some_and(|(pending, _)| pending == source)
+    {
+        question.pending = None;
+    }
+    if question.open && question.source.as_ref() == Some(source) {
+        question.source = None;
+        close(app);
+    }
+}
+
+/// Hide the app without answering; the caller owns `source`.
+fn close(app: &mut App) {
+    app.question_app.open = false;
+    app.question_app.mouse_press_row = None;
+    app.view.bottom_app_selection_chrome.clear();
+    app.view.bottom_app_selection_folds = crate::selection::Folds::default();
+    crate::selection::clear_region(app, crate::selection::RegionId::BottomApp);
+    crate::selection::clear_region(app, crate::selection::RegionId::Loading);
+    crate::terminal_notifier::restore_running(app);
+    app.view.loading.end_action_required();
+}
+
 /// Esc (Python `action_cancel`): answer nothing and let the tool report it.
 pub fn cancel(app: &mut App, client: &Arc<Client>) {
     if is_within_grace_period(app) {
         return;
     }
+    crate::telemetry::user_cancelled_action(app, "cancel_question");
     respond(
         app,
         client,
@@ -193,14 +233,14 @@ pub fn cancel(app: &mut App, client: &Arc<Client>) {
 
 /// Close the app and answer the callback the turn is blocked on.
 fn respond(app: &mut App, client: &Arc<Client>, result: UserQuestionResult) {
-    app.question_app.open = false;
-    app.question_app.mouse_press_row = None;
-    app.view.question_selection_chrome.clear();
-    crate::selection::clear_region(app, crate::selection::RegionId::Question);
-    crate::selection::clear_region(app, crate::selection::RegionId::Loading);
-    crate::terminal_notifier::restore_running(app);
-    app.view.loading.end_action_required();
-    let callback_id = std::mem::take(&mut app.question_app.callback_id);
+    close(app);
+    let callback_id = match app.question_app.source.take() {
+        Some(QuestionSource::Callback(callback_id)) => callback_id,
+        Some(QuestionSource::TeleportPush) => {
+            return crate::teleport::answer_push(app, client, &result)
+        }
+        None => return,
+    };
     let Some(session_id) = app.session.session_id.clone() else {
         return;
     };

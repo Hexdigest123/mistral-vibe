@@ -4,51 +4,39 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use super::text::{pad_line, wrap};
-use super::{Block, Frame, Item, Out};
+use super::text::{cell_width, pad, pad_line, wrap_chars_folded};
+use super::{Block, Frame, Item, Out, Profile, Sc};
+use crate::selection::Fold;
 use crate::ui::{styled_text, theme};
 
 pub(super) fn render_block(b: &Block, width: u16, frame: Frame, out: &mut Out) {
     match b {
         Block::Heading(1, inline) => {
             let inner = (width as usize).saturating_sub(2 * frame.pad);
-            if frame.center_h1 {
-                for row in wrap(inline, inner) {
-                    let row_width = styled_text::width(&row);
-                    let start = frame.pad + inner.saturating_sub(row_width) / 2;
-                    let mut spans = vec![Span::raw(" ".repeat(start))];
-                    spans.extend(row);
-                    out.lines.push(Line::from(spans));
-                }
-            } else {
-                for row in wrap(inline, inner) {
-                    out.lines.push(pad_line(row, frame.pad));
-                }
-            }
+            push_wrapped(out, inline, inner, |_, row| match frame.center_h1 {
+                true => vec![pad(frame.pad + inner.saturating_sub(cell_width(row)) / 2)],
+                false => vec![pad(frame.pad)],
+            });
         }
-        Block::Heading(_, inline) => {
-            for row in wrap(inline, (width as usize).saturating_sub(2 * frame.pad)) {
-                out.lines.push(pad_line(row, frame.pad));
-            }
-        }
-        Block::Paragraph(inline) => {
+        Block::Heading(_, inline) | Block::Paragraph(inline) => {
             let body = (width as usize).saturating_sub(2 * frame.pad);
-            for row in wrap(inline, body) {
-                out.lines.push(pad_line(row, frame.pad));
-            }
+            push_wrapped(out, inline, body, |_, _| vec![pad(frame.pad)]);
         }
-        Block::Code(lines) => {
+        Block::Rule => {
             let inner = (width as usize).saturating_sub(2 * frame.pad);
-            for line in lines {
-                if line.iter().all(|span| span.content.trim().is_empty()) {
-                    out.lines.push(Line::default());
-                    continue;
-                }
-                for row in styled_text::wrap_hard(line, inner) {
-                    out.lines.push(pad_line(row, frame.pad));
-                }
+            let rule = |out: &mut Out| {
+                out.lines.push(Line::from(vec![
+                    pad(frame.pad),
+                    Span::styled("─".repeat(inner), Style::default().fg(theme::md_rule())),
+                ]));
+            };
+            // The widget's `padding-top: 1` renders inside the block.
+            if frame.profile == Profile::Widget {
+                out.lines.push(Line::from(""));
             }
+            rule(out);
         }
+        Block::Code(lines) => render_code(lines, width, frame, out),
         Block::List { start, items } => render_list(*start, items, (0, 0), width, frame, out),
         Block::Table { headers, rows } => {
             super::table::render_table(headers, rows, width, frame.pad, out);
@@ -56,15 +44,98 @@ pub(super) fn render_block(b: &Block, width: u16, frame: Frame, out: &mut Out) {
         }
         Block::Quote(inline) => {
             let inner = (width as usize).saturating_sub(2 * frame.pad + 2);
-            for row in wrap(inline, inner) {
-                let mut spans = vec![
-                    Span::styled("▌", Style::default().fg(theme::md_quote_bar())),
+            let bar = match frame.profile {
+                Profile::Assistant => theme::md_quote_bar(),
+                Profile::Widget => theme::md_widget_quote_bar(),
+            };
+            push_wrapped(out, inline, inner, |_, _| {
+                vec![
+                    pad(frame.pad),
+                    Span::styled("▌", Style::default().fg(bar)),
                     Span::raw(" "),
-                ];
-                spans.extend(row);
-                out.lines.push(pad_line(spans, frame.pad));
-            }
+                ]
+            });
         }
+    }
+}
+
+/// Push the rows `inline` wraps into after their `lead`, folding continuation rows.
+fn push_wrapped(
+    out: &mut Out,
+    inline: &[Sc],
+    width: usize,
+    lead: impl Fn(usize, &[Sc]) -> Vec<Span<'static>>,
+) {
+    for (index, (row, gap)) in wrap_chars_folded(inline, width).into_iter().enumerate() {
+        let lead = lead(index, &row);
+        let hang = lead.iter().map(Span::width).sum::<usize>() as u16;
+        out.lines.push_row(lead, &row);
+        out.lines.fold_last(Fold::hung(gap, hang));
+    }
+}
+
+/// A fence body. A standalone widget keeps the `MarkdownFence > Label`
+/// padding (one blank row above and below, two indent columns on truecolor)
+/// and washes the label box in the fence background; the chat tcss zeroes it.
+fn render_code(lines: &[Vec<Span<'static>>], width: u16, frame: Frame, out: &mut Out) {
+    let content = (width as usize).saturating_sub(2 * frame.pad);
+    let (wrap, indent, bg) = match frame.profile {
+        Profile::Assistant => (content, 0, None),
+        Profile::Widget => {
+            let label = if theme::is_ansi() { 0 } else { 2 };
+            (
+                content.saturating_sub(2 * label),
+                label,
+                theme::md_widget_fence_bg(),
+            )
+        }
+    };
+    let widget = frame.profile == Profile::Widget;
+    let wash = |spans: &mut Vec<Span<'static>>, fill: usize| {
+        spans.push(Span::styled(" ".repeat(fill), bg_style(bg)));
+    };
+    if widget {
+        let mut row = Vec::new();
+        wash(&mut row, content);
+        out.lines.push(pad_line(row, frame.pad));
+    }
+    let hang = (frame.pad + indent) as u16;
+    for line in lines {
+        if line.iter().all(|span| span.content.trim().is_empty()) {
+            out.lines.push(Line::default());
+            continue;
+        }
+        for (row, gap) in styled_text::wrap_hard_folded(line, wrap) {
+            let mut spans = Vec::new();
+            if indent > 0 {
+                wash(&mut spans, indent);
+            }
+            let mut used = indent;
+            for mut span in row {
+                if let Some(bg) = bg {
+                    span.style = span.style.bg(bg);
+                }
+                used += span.content.width();
+                spans.push(span);
+            }
+            if widget {
+                wash(&mut spans, content.saturating_sub(used));
+            }
+            out.lines
+                .push_folded(pad_line(spans, frame.pad), Fold::hung(gap, hang));
+        }
+    }
+    if widget {
+        let mut row = Vec::new();
+        wash(&mut row, content);
+        out.lines.push(pad_line(row, frame.pad));
+    }
+}
+
+fn bg_style(bg: Option<ratatui::style::Color>) -> Style {
+    match bg {
+        Some(bg) => Style::default().bg(bg),
+        None => Style::default(),
     }
 }
 
@@ -78,21 +149,21 @@ fn render_list(
     out: &mut Out,
 ) {
     let (depth, indent) = nesting;
-    let fg = Style::default().fg(theme::foreground());
+    let marker_color = match frame.profile {
+        Profile::Assistant => theme::foreground(),
+        Profile::Widget => theme::md_widget_marker(),
+    };
+    let fg = Style::default().fg(marker_color);
     for (marker, item) in markers(start, items.len(), depth).iter().zip(items) {
         let marker_len = marker.width();
         let avail = (width as usize).saturating_sub(2 * frame.pad + indent + marker_len);
-        let rows = wrap(&item.inline, avail);
-        for (i, row) in rows.into_iter().enumerate() {
-            let mut spans = vec![Span::raw(" ".repeat(indent))];
-            if i == 0 {
-                spans.push(Span::styled(marker.clone(), fg));
-            } else {
-                spans.push(Span::raw(" ".repeat(marker_len)));
-            }
-            spans.extend(row);
-            out.lines.push(pad_line(spans, frame.pad));
-        }
+        push_wrapped(out, &item.inline, avail, |i, _| {
+            let marker = match i {
+                0 => Span::styled(marker.clone(), fg),
+                _ => pad(marker_len),
+            };
+            vec![pad(frame.pad), pad(indent), marker]
+        });
         let child_indent = indent + marker_len;
         for child in &item.children {
             match child {

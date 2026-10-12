@@ -2,19 +2,20 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthChar;
 
-use crate::mcp::rows::{Row, SourceRow, ToolRow};
+use crate::mcp::rows::{Row, SourceRow, ToolRow, MANAGE_CONNECTORS_LABEL};
 use crate::ui::theme;
-use crate::ui::theme_picker::marker_green;
 
 /// A styled character, the unit the wrapper works on.
-type Sc = (char, Style);
+pub(crate) type Sc = (char, Style);
 
 /// One rendered line of an option row.
 pub struct VisualLine {
     /// Index of the row this line belongs to, for click routing.
     pub row: usize,
     pub highlighted: bool,
+    pub selectable: bool,
     pub spans: Vec<Span<'static>>,
 }
 
@@ -27,6 +28,7 @@ pub fn lines(rows: &[Row], selected: usize, width: usize) -> Vec<VisualLine> {
             out.push(VisualLine {
                 row: index,
                 highlighted,
+                selectable: row.selectable(),
                 spans: merge(&chars),
             });
         }
@@ -36,23 +38,8 @@ pub fn lines(rows: &[Row], selected: usize, width: usize) -> Vec<VisualLine> {
 
 /// The styled characters of one row, before wrapping.
 fn styled(row: &Row, highlighted: bool) -> Vec<Sc> {
-    let bg = if highlighted {
-        theme::block_cursor_bg()
-    } else {
-        theme::background()
-    };
-    let fg = if highlighted {
-        theme::block_cursor_fg()
-    } else {
-        theme::foreground()
-    };
     // The block cursor bolds the whole highlighted option, dim spans included.
-    let mut base = Style::default().fg(fg).bg(bg);
-    let mut dim = theme::dim(theme::muted()).bg(bg);
-    if highlighted {
-        base = base.add_modifier(Modifier::BOLD);
-        dim = theme::dim(fg).bg(bg).add_modifier(Modifier::BOLD);
-    }
+    let (base, dim) = crate::ui::list_cursor::styles(highlighted);
     match row {
         Row::Header(title) => text(title, base.add_modifier(Modifier::BOLD)),
         Row::Blank => Vec::new(),
@@ -64,18 +51,22 @@ fn styled(row: &Row, highlighted: bool) -> Vec<Sc> {
             chars.extend(text(after, dim));
             chars
         }
-        Row::Source(source) => source_chars(source, base, dim, bg),
+        Row::Source(source) => source_chars(source, base, dim, base.bg.unwrap_or_default()),
         Row::Tool(tool) => tool_chars(tool, base, dim),
+        Row::Manage => text(
+            MANAGE_CONNECTORS_LABEL,
+            base.add_modifier(Modifier::UNDERLINED),
+        ),
     }
 }
 
-/// `  name  [transport]  n tools  ● status`, columns padded by the row builder.
+/// `  name  [transport]  [plugin:x]  n tools  ● status`, columns padded by the row builder.
 fn source_chars(source: &SourceRow, base: Style, dim: Style, bg: Color) -> Vec<Sc> {
     // Column separators carry no modifier, so each span re-emits its own bold
     // and dim; ratatui's diff would otherwise drop bold after a dim span.
     let gap = Style::default().bg(bg);
     let symbol = if source.connected {
-        base.fg(marker_green())
+        base.fg(crate::ui::list_cursor::current_color())
     } else {
         dim
     };
@@ -84,6 +75,10 @@ fn source_chars(source: &SourceRow, base: Style, dim: Style, bg: Color) -> Vec<S
     chars.extend(text("  ", gap));
     chars.extend(text(&source.transport, dim));
     chars.extend(text("  ", gap));
+    if !source.owner.is_empty() {
+        chars.extend(text(&source.owner, dim));
+        chars.extend(text("  ", gap));
+    }
     chars.extend(text(&source.tools, dim));
     chars.extend(text("  ", gap));
     chars.extend(text(source.symbol, symbol));
@@ -109,13 +104,26 @@ fn tool_chars(tool: &ToolRow, base: Style, dim: Style) -> Vec<Sc> {
     chars
 }
 
-fn text(value: &str, style: Style) -> Vec<Sc> {
-    value.chars().map(|character| (character, style)).collect()
+/// Keeps `\n` for `wrap` to break on; other control characters never render.
+pub(crate) fn text(value: &str, style: Style) -> Vec<Sc> {
+    value
+        .chars()
+        .filter(|character| *character == '\n' || !character.is_control())
+        .map(|character| (character, style))
+        .collect()
+}
+
+/// Hard-break on `\n` as Rich does, then word-wrap each line.
+pub(crate) fn wrap(chars: &[Sc], width: usize) -> Vec<Vec<Sc>> {
+    chars
+        .split(|(character, _)| *character == '\n')
+        .flat_map(|line| wrap_line(line, width))
+        .collect()
 }
 
 /// Greedy word wrap keeping runs of spaces, so padded columns stay aligned.
 /// The space run a break happens on is dropped, like Textual's fold.
-fn wrap(chars: &[Sc], width: usize) -> Vec<Vec<Sc>> {
+fn wrap_line(chars: &[Sc], width: usize) -> Vec<Vec<Sc>> {
     let width = width.max(1);
     let mut rows: Vec<Vec<Sc>> = Vec::new();
     let mut row: Vec<Sc> = Vec::new();
@@ -126,7 +134,7 @@ fn wrap(chars: &[Sc], width: usize) -> Vec<Vec<Sc>> {
             spaces = word;
             continue;
         }
-        if !row.is_empty() && row.len() + spaces.len() + word.len() > width {
+        if !row.is_empty() && columns(&row) + columns(&spaces) + columns(&word) > width {
             rows.push(std::mem::take(&mut row));
         } else {
             row.append(&mut spaces);
@@ -137,6 +145,14 @@ fn wrap(chars: &[Sc], width: usize) -> Vec<Vec<Sc>> {
     row.append(&mut spaces);
     rows.push(row);
     rows
+}
+
+/// Terminal columns a run occupies, so wide glyphs wrap by the cells they fill.
+fn columns(chars: &[Sc]) -> usize {
+    chars
+        .iter()
+        .map(|(character, _)| character.width().unwrap_or(0))
+        .sum()
 }
 
 /// Split into alternating runs of spaces and non-spaces.
@@ -153,7 +169,7 @@ fn words(chars: &[Sc]) -> Vec<Vec<Sc>> {
 }
 
 /// Merge consecutive same-style characters into spans.
-fn merge(chars: &[Sc]) -> Vec<Span<'static>> {
+pub(crate) fn merge(chars: &[Sc]) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut buffer = String::new();
     let mut style: Option<Style> = None;

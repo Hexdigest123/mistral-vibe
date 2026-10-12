@@ -136,6 +136,98 @@ fn large_text(label: &str) -> String {
     format!("{label} {}", "0123456789abcdef".repeat(12_000))
 }
 
+const PRE_LLM_BINDING_IDS: [&str; 1] = ["test-hook-0-PreLlmCall"];
+
+/// Starts a turn whose pre-LLM hook returns `github` context. Checks that the
+/// turn fails before a compaction call because no replacement can hold it.
+fn fail_turn_with_unfittable_context(
+    runtime: &mut SynchronousRuntime,
+    compaction_id: &str,
+    turn_id: &str,
+    context: &str,
+) {
+    let error = json!({
+        "code": "compaction_replacement_too_large",
+        "message": "compaction summary and required continuation context cannot fit the configured token threshold",
+        "retryable": false,
+        "details": null,
+    });
+    let hook = runtime
+        .apply(
+            user_message(turn_id, "inspect the repository", "queue"),
+            running(turn_id)
+                .dispatch(hook_call("pre_llm_call", &PRE_LLM_BINDING_IDS, Value::Null))
+                .observe(turn_started(turn_id, "inspect the repository")),
+        )
+        .only_action();
+    runtime.apply(
+        hook_completed(
+            &hook,
+            "pre_llm_call",
+            pre_llm_continue_with_context(&[("github", context)]),
+        ),
+        failed(turn_id, error.clone())
+            .observe(json!({
+                "type": "context_compaction_failed",
+                "turn_id": turn_id,
+                "action_id": compaction_id,
+                "compaction_id": compaction_id,
+                "attempt": 1,
+                "trigger": "automatic",
+                "error": error.clone(),
+            }))
+            .observe(turn_failed(turn_id, error)),
+    );
+}
+
+/// Starts a turn whose pre-LLM hook returns `output` before and after an
+/// automatic compaction. Returns the agent completion that follows.
+fn compact_turn_after_pre_llm_hook(
+    runtime: &mut SynchronousRuntime,
+    turn_id: &str,
+    output: Value,
+) -> Value {
+    let first_hook = runtime
+        .apply(
+            user_message(turn_id, "inspect it again", "queue"),
+            running(turn_id)
+                .dispatch(hook_call("pre_llm_call", &PRE_LLM_BINDING_IDS, Value::Null))
+                .observe(turn_started(turn_id, "inspect it again")),
+        )
+        .only_action();
+    let compaction = runtime
+        .apply(
+            hook_completed(&first_hook, "pre_llm_call", output.clone()),
+            running(turn_id).dispatch(compaction_call("automatic", 0, 1)),
+        )
+        .only_action();
+    let second_hook = runtime
+        .apply(
+            summary_completion(&compaction, "repository summary"),
+            running(turn_id)
+                .dispatch(hook_call("pre_llm_call", &PRE_LLM_BINDING_IDS, Value::Null))
+                .observe(context_compacted(
+                    turn_id,
+                    &compaction,
+                    "repository summary",
+                )),
+        )
+        .only_action();
+    runtime
+        .apply(
+            hook_completed(&second_hook, "pre_llm_call", output),
+            running(turn_id).dispatch(llm_call(0)),
+        )
+        .only_action()
+}
+
+fn model_texts(action: &Value) -> Vec<&str> {
+    action_messages(action)
+        .iter()
+        .filter_map(message_text)
+        .collect()
+}
+
 fn user_message_with_content(turn_id: &str, content: Value) -> Value {
     user_message_with_content_and_mode(turn_id, content, "queue")
 }
@@ -183,6 +275,100 @@ fn first_action_block_with_type<'a>(action: &'a Value, block_type: &str) -> &'a 
 }
 
 #[test]
+fn preserves_stored_message_fields_in_completion_actions() {
+    let turn_id = "turn-content-metadata";
+    let content = json!([{
+        "type": "resource_link",
+        "uri": "https://example.test/image.png",
+        "name": "image.png",
+        "annotations": {"audience": ["assistant"]},
+        "_meta": {"provider.example/materialization": {"type": "image_url"}},
+    }]);
+    let assistant_message = json!({
+        "role": "assistant",
+        "content": [
+            {
+                "type": "text",
+                "text": "answer",
+                "annotations": {"audience": ["assistant"]},
+                "_meta": {"provider.example/content": "content-metadata"},
+            },
+            {
+                "type": "reasoning",
+                "content": [{"type": "text", "text": "thinking"}],
+                "_meta": {"provider.example/reasoning": "reasoning-metadata"},
+            },
+            {
+                "type": "tool_call",
+                "id": "call-1",
+                "name": "lookup",
+                "arguments": {"type": "json", "raw": "{}", "value": {}},
+                "_meta": {"provider.example/tool-call": "tool-call-metadata"},
+            },
+        ],
+    });
+    let tool_message = json!({
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "name": "lookup",
+        "outcome": "success",
+        "content": [{
+            "type": "text",
+            "text": "result",
+            "_meta": {"provider.example/content": "tool-content-metadata"},
+        }],
+        "_meta": {"provider.example/tool-message": "tool-message-metadata"},
+    });
+    let history = [&assistant_message, &tool_message]
+        .into_iter()
+        .map(|message| serde_json::from_value(message.clone()).expect("history message is valid"))
+        .collect();
+    let mut runtime = SynchronousRuntime::new_with_history(config(), history);
+
+    let action = runtime
+        .apply(
+            user_message_with_content(turn_id, content.clone()),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started_with_content(turn_id, content.clone())),
+        )
+        .only_action();
+
+    let messages = action_messages(&action);
+    assert!(messages.contains(&assistant_message));
+    assert!(messages.contains(&tool_message));
+    assert!(messages.contains(&json!({"role": "user", "content": content})));
+}
+
+#[test]
+fn preserves_assistant_resource_link_metadata_in_completion_actions() {
+    let turn_id = "turn-assistant-resource-link-metadata";
+    let assistant_message = json!({
+        "role": "assistant",
+        "content": [{
+            "type": "resource_link",
+            "uri": "provider://references",
+            "name": "references",
+            "_meta": {"provider.example/materialization": {"type": "reference"}},
+        }],
+    });
+    let history =
+        vec![serde_json::from_value(assistant_message.clone()).expect("history message is valid")];
+    let mut runtime = SynchronousRuntime::new_with_history(config(), history);
+
+    let action = runtime
+        .apply(
+            user_message(turn_id, "use the previous references", "queue"),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started(turn_id, "use the previous references")),
+        )
+        .only_action();
+
+    assert!(action_messages(&action).contains(&assistant_message));
+}
+
+#[test]
 fn oversized_agent_input_compacts_before_any_agent_provider_call() {
     let turn_id = "turn-preflight-compaction";
     let request = large_text("current request");
@@ -227,26 +413,6 @@ fn oversized_agent_input_compacts_before_any_agent_provider_call() {
         .find(|text| text.contains("current request"))
         .expect("replacement context must preserve the latest user request");
     assert!(resumed_request.len() <= 20_000 * 4);
-}
-
-#[test]
-fn oversized_agent_input_compacts_before_a_pre_llm_hook() {
-    let turn_id = "turn-preflight-before-hook";
-    let request = large_text("current request");
-    let mut config = automatic_compaction_config();
-    add_always_hook(&mut config, HookPoint::PreLlmCall);
-    let mut runtime = SynchronousRuntime::new(config);
-
-    let compaction = runtime
-        .apply(
-            user_message(turn_id, &request, "queue"),
-            running(turn_id)
-                .dispatch(compaction_call("automatic", 0, 1))
-                .observe(turn_started(turn_id, &request)),
-        )
-        .only_action();
-
-    assert_eq!(compaction["purpose"], "compaction");
 }
 
 #[test]
@@ -357,7 +523,11 @@ fn compaction_uses_a_file_link_then_resumes_the_agent_with_the_native_image() {
     assert_eq!(resumed["model_input"]["messages"]["type"], "replace");
     let image = first_action_block_with_type(&resumed, "image");
     assert_eq!(image["data"].as_str().map(str::len), Some(200_000));
-    assert!(image.get("_meta").is_none());
+    assert!(
+        image["_meta"]
+            .get("mistralai.vibe.harness/file-image-resource-link")
+            .is_some()
+    );
 }
 
 #[test]
@@ -438,7 +608,11 @@ fn changing_agent_image_delivery_replaces_the_runtime_message_cache() {
     assert_eq!(second_action["model_input"]["messages"]["type"], "replace");
     let image = first_action_block_with_type(&second_action, "image");
     assert_eq!(image["data"].as_str().map(str::len), Some(200_000));
-    assert!(image.get("_meta").is_none());
+    assert!(
+        image["_meta"]
+            .get("mistralai.vibe.harness/file-image-resource-link")
+            .is_some()
+    );
     let checkpoint = runtime.checkpoint_value();
     let stored_image = checkpoint["context"]["messages"]
         .as_array()
@@ -456,6 +630,39 @@ fn changing_agent_image_delivery_replaces_the_runtime_message_cache() {
         stored_image["_meta"]
             .get("mistralai.vibe.harness/file-image-resource-link")
             .is_some()
+    );
+}
+
+#[test]
+fn keeps_agent_message_cache_when_only_compaction_image_delivery_changes() {
+    let first_turn_id = "turn-before-compaction-model-switch";
+    let mut config = config();
+    let mut runtime = SynchronousRuntime::new(config.clone());
+    let first_action = runtime.start_turn(first_turn_id, "first request");
+    runtime.finish_turn_with_text(first_turn_id, &first_action, "done");
+
+    config.settings.context.image_delivery.compaction = ImageDeliveryMode::ResourceLink;
+    runtime.reconfigure_settings(
+        config.settings,
+        completed(first_turn_id, vec![json!({"type": "text", "text": "done"})]),
+    );
+    let second_turn_id = "turn-after-compaction-model-switch";
+    let second_action = runtime
+        .apply(
+            user_message(second_turn_id, "second request", "queue"),
+            running(second_turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started(second_turn_id, "second request")),
+        )
+        .only_action();
+
+    runtime.assert_last_model_message_update(
+        &second_action,
+        "append",
+        &[
+            model_assistant_text("done"),
+            model_user_text("second request"),
+        ],
     );
 }
 
@@ -1201,4 +1408,276 @@ fn manual_compaction_retries_invalid_summary_then_returns_idle() {
         reasoning_only_completion(&retry),
         idle().observe(manual_context_compaction_failed(&retry, error)),
     );
+}
+
+///
+/// *Prepare*: A completed turn received keyed context from its pre-LLM hook.
+/// *Do*: Compact manually, then start a turn whose pre-LLM hook returns the same keyed context.
+/// *Assert*: The summary request leaves the keyed context out, and Core delivers it again after the compacted replacement.
+///
+#[test]
+fn keyed_pre_llm_context_is_left_out_of_the_summary_and_delivered_after_compaction() {
+    // Prepare
+    let context = "GitHub is not connected.";
+    let mut config = config();
+    add_always_hook(&mut config, HookPoint::PreLlmCall);
+    let binding_ids = ["test-hook-0-PreLlmCall"];
+    let mut runtime = SynchronousRuntime::new(config);
+    let first_hook = runtime
+        .apply(
+            user_message("turn-before-compaction", "inspect the repository", "queue"),
+            running("turn-before-compaction")
+                .dispatch(hook_call("pre_llm_call", &binding_ids, Value::Null))
+                .observe(turn_started(
+                    "turn-before-compaction",
+                    "inspect the repository",
+                )),
+        )
+        .only_action();
+    let first_agent = runtime
+        .apply(
+            hook_completed(
+                &first_hook,
+                "pre_llm_call",
+                pre_llm_continue_with_context(&[("github", context)]),
+            ),
+            running("turn-before-compaction").dispatch(llm_call(0)),
+        )
+        .only_action();
+    runtime.finish_turn_with_text("turn-before-compaction", &first_agent, "first answer");
+
+    // Do
+    let compaction = runtime
+        .apply(
+            compact(""),
+            compacting("manual").dispatch(compaction_call("manual", 0, 1)),
+        )
+        .only_action();
+    runtime.apply(
+        summary_completion(&compaction, "repository summary"),
+        idle().observe(json!({
+            "type": "context_compacted",
+            "turn_id": null,
+            "action_id": action_id(&compaction),
+            "compaction_id": compaction["compaction_id"],
+            "attempt": compaction["attempt"],
+            "trigger": "manual",
+            "summary": "repository summary",
+            "usage": null,
+        })),
+    );
+    let second_hook = runtime
+        .apply(
+            user_message("turn-after-compaction", "continue", "queue"),
+            running("turn-after-compaction")
+                .dispatch(hook_call("pre_llm_call", &binding_ids, Value::Null))
+                .observe(turn_started("turn-after-compaction", "continue")),
+        )
+        .only_action();
+    let resumed = runtime
+        .apply(
+            hook_completed(
+                &second_hook,
+                "pre_llm_call",
+                pre_llm_continue_with_context(&[("github", context)]),
+            ),
+            running("turn-after-compaction").dispatch(llm_call(0)),
+        )
+        .only_action();
+
+    // Assert
+    assert!(
+        action_messages(&compaction)
+            .iter()
+            .all(|message| message_text(message) != Some(context))
+    );
+    let delivered = action_messages(&resumed)
+        .iter()
+        .filter(|message| message_text(message) == Some(context))
+        .count();
+    assert_eq!(delivered, 1);
+    assert_eq!(
+        action_messages(&resumed).last().and_then(message_text),
+        Some(context)
+    );
+    runtime.finish_turn_with_text("turn-after-compaction", &resumed, "done");
+}
+
+///
+/// *Prepare*: A pre-LLM hook returns keyed context that pushes the agent input over the threshold, and compaction starts.
+/// *Do*: Restart Core from its checkpoint, compact, then let the resumed pre-LLM hook return the same keyed context.
+/// *Assert*: The replacement leaves room for the keyed context across the restore, so Core dispatches the agent completion instead of compacting again.
+///
+#[test]
+fn keyed_context_redelivered_after_automatic_compaction_reaches_the_agent() {
+    // Prepare
+    let turn_id = "turn-keyed-context-compaction";
+    let request = format!("current request {}", "0123456789abcdef".repeat(5_000));
+    let context = format!("GitHub state {}", "fedcba9876543210".repeat(6_250));
+    let mut config = automatic_compaction_config();
+    add_always_hook(&mut config, HookPoint::PreLlmCall);
+    let binding_ids = ["test-hook-0-PreLlmCall"];
+    let mut runtime = SynchronousRuntime::new(config);
+    let first_hook = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(hook_call("pre_llm_call", &binding_ids, Value::Null))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+    let compaction = runtime
+        .apply(
+            hook_completed(
+                &first_hook,
+                "pre_llm_call",
+                pre_llm_continue_with_context(&[("github", context.as_str())]),
+            ),
+            running(turn_id).dispatch(compaction_call("automatic", 0, 1)),
+        )
+        .only_action();
+    assert_eq!(
+        runtime.checkpoint_value()["turn"]["phase"]["context_keys"],
+        json!(["github"])
+    );
+
+    // Do
+    runtime.restart_from_checkpoint();
+    let second_hook = runtime
+        .apply(
+            summary_completion(&compaction, "repository summary"),
+            running(turn_id)
+                .dispatch(hook_call("pre_llm_call", &binding_ids, Value::Null))
+                .observe(context_compacted(
+                    turn_id,
+                    &compaction,
+                    "repository summary",
+                )),
+        )
+        .only_action();
+    let resumed = runtime
+        .apply(
+            hook_completed(
+                &second_hook,
+                "pre_llm_call",
+                pre_llm_continue_with_context(&[("github", context.as_str())]),
+            ),
+            running(turn_id).dispatch(llm_call(0)),
+        )
+        .only_action();
+
+    // Assert
+    assert!(
+        action_messages(&compaction)
+            .iter()
+            .all(|message| message_text(message) != Some(context.as_str()))
+    );
+    let delivered = action_messages(&resumed)
+        .iter()
+        .filter(|message| message_text(message) == Some(context.as_str()))
+        .count();
+    assert_eq!(delivered, 1);
+    assert_eq!(
+        action_messages(&resumed).last().and_then(message_text),
+        Some(context.as_str())
+    );
+    runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+///
+/// *Prepare*: A pre-LLM hook is bound.
+/// *Do*: The hook returns keyed context larger than the automatic compaction threshold.
+/// *Assert*: The turn fails before any compaction call, because no replacement can hold the hook's current context.
+///
+#[test]
+fn keyed_context_that_cannot_fit_fails_before_a_compaction_call() {
+    // Prepare
+    let mut config = automatic_compaction_config();
+    add_always_hook(&mut config, HookPoint::PreLlmCall);
+    let compaction_id = compaction_action_id(&config.task_id, 1);
+    let mut runtime = SynchronousRuntime::new(config);
+
+    // Do / Assert
+    fail_turn_with_unfittable_context(
+        &mut runtime,
+        &compaction_id,
+        "turn-unfittable-keyed-context",
+        &large_text("GitHub state"),
+    );
+}
+
+///
+/// *Prepare*: A turn fails because its pre-LLM hook returned `github` context larger than the threshold.
+/// *Do*: Start the next turn, and let the hook return smaller `github` context.
+/// *Assert*: The hook runs before compaction, the replacement leaves room only for the smaller context, and the agent sees only that context.
+///
+#[test]
+fn oversized_keyed_context_failure_does_not_block_the_next_turn() {
+    // Prepare
+    let small = "GitHub is connected.";
+    let mut config = automatic_compaction_config();
+    add_always_hook(&mut config, HookPoint::PreLlmCall);
+    let compaction_id = compaction_action_id(&config.task_id, 1);
+    let mut runtime = SynchronousRuntime::new(config);
+    fail_turn_with_unfittable_context(
+        &mut runtime,
+        &compaction_id,
+        "turn-oversized-context",
+        &large_text("GitHub state"),
+    );
+
+    // Do
+    let turn_id = "turn-after-oversized-context";
+    let resumed = compact_turn_after_pre_llm_hook(
+        &mut runtime,
+        turn_id,
+        pre_llm_continue_with_context(&[("github", small)]),
+    );
+
+    // Assert
+    let texts = model_texts(&resumed);
+    assert_eq!(texts.iter().filter(|text| **text == small).count(), 1);
+    assert!(texts.iter().all(|text| !text.starts_with("GitHub state")));
+    runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+///
+/// *Prepare*: A turn fails because its pre-LLM hook returned `github` context larger than the threshold.
+/// *Do*: In the next turn, the hook returns only `jira` context, or no context.
+/// *Assert*: The replacement leaves no room for the stale `github` context, so compaction succeeds and the agent completion follows.
+///
+#[test]
+fn stale_context_key_is_not_reserved() {
+    for (label, output) in [
+        (
+            "other key",
+            pre_llm_continue_with_context(&[("jira", "Jira is connected.")]),
+        ),
+        ("no context", json!({"type": "continue"})),
+    ] {
+        // Prepare
+        let mut config = automatic_compaction_config();
+        add_always_hook(&mut config, HookPoint::PreLlmCall);
+        let compaction_id = compaction_action_id(&config.task_id, 1);
+        let mut runtime = SynchronousRuntime::new(config);
+        fail_turn_with_unfittable_context(
+            &mut runtime,
+            &compaction_id,
+            "turn-stale-context",
+            &large_text("GitHub state"),
+        );
+
+        // Do
+        let turn_id = "turn-after-stale-context";
+        let resumed = compact_turn_after_pre_llm_hook(&mut runtime, turn_id, output);
+
+        // Assert
+        assert!(
+            model_texts(&resumed)
+                .iter()
+                .all(|text| !text.starts_with("GitHub state")),
+            "{label}"
+        );
+        runtime.finish_turn_with_text(turn_id, &resumed, "done");
+    }
 }

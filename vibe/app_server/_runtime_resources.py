@@ -27,6 +27,8 @@ from vibe.app_server.protocol import (
     AgentsListResponse,
     AgentSwitchParams,
     AppServerResponseError,
+    ConfigEffectiveReadParams,
+    ConfigEffectiveReadResponse,
     ConfigFieldsReadParams,
     ConfigFieldsReadResponse,
     ConfigMutationResponse,
@@ -50,6 +52,8 @@ from vibe.app_server.protocol import (
     Notification,
     ProtocolError,
     ProtocolErrorCode,
+    ProviderAuthReadParams,
+    ProviderAuthReadResponse,
     RuntimeMutationResponse,
     RuntimeMutationStatus,
     RuntimeReadParams,
@@ -59,6 +63,7 @@ from vibe.app_server.protocol import (
     SessionReadyWaitParams,
     SessionReadyWaitResponse,
 )
+from vibe.app_server.provider_auth import ProviderAuthView
 
 
 def _raise_for_write(response: ConfigWriteResponse) -> None:
@@ -116,6 +121,16 @@ class ConfigResource:
         return validate_wire(
             ConfigSchemaReadResponse,
             await client.request("config/schema", ConfigSchemaReadParams()),
+        )
+
+    async def read_effective(self) -> ConfigEffectiveReadResponse:
+        client = await self._connection.connect()
+        return validate_wire(
+            ConfigEffectiveReadResponse,
+            await client.request(
+                "config/effective/read",
+                ConfigEffectiveReadParams(session_id=self._state.session_id),
+            ),
         )
 
     async def read_fields(self) -> ConfigFieldsReadResponse:
@@ -302,6 +317,31 @@ class IdentityResource:
         )
         self._current = response.identity
         return response.identity
+
+
+class ProviderAuthResource:
+    """Reads the redacted active-provider auth snapshot.
+
+    Holds no cached state: the view is a snapshot taken per read, so later
+    credential changes are reflected by the next read rather than a stale one.
+    """
+
+    def __init__(
+        self, connection: AppServerResourceConnection, state: ClientSessionState
+    ) -> None:
+        self._connection = connection
+        self._state = state
+
+    async def read(self) -> ProviderAuthView:
+        client = await self._connection.connect()
+        response = validate_wire(
+            ProviderAuthReadResponse,
+            await client.request(
+                "providerAuth/read",
+                ProviderAuthReadParams(session_id=self._state.session_id),
+            ),
+        )
+        return response.auth
 
 
 class AgentResource:

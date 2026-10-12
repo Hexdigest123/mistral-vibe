@@ -4,9 +4,11 @@ import os
 import stat
 
 from vibe import VIBE_ROOT
+from vibe.core.experiments._constants import EVAL_CACHE_FILE_NAME
 from vibe.observability.logging import logger
-from vibe.utils.paths import GlobalPath, get_vibe_home
+from vibe.utils.paths import GlobalPath
 from vibe.utils.platform import is_windows
+from vibe.utils.vibe_home import get_vibe_home
 
 VIBE_HOME = GlobalPath(get_vibe_home)
 GLOBAL_ENV_FILE = GlobalPath(lambda: VIBE_HOME.path / ".env")
@@ -20,12 +22,16 @@ PROJECTS_FILE = GlobalPath(lambda: VIBE_HOME.path / "projects.toml")
 CONNECTOR_BOOTSTRAP_CACHE_FILE = GlobalPath(
     lambda: VIBE_HOME.path / "connector_bootstrap_cache.json"
 )
-EXPERIMENT_EVAL_CACHE_FILE = GlobalPath(
-    lambda: VIBE_HOME.path / "experiment_eval_cache.json"
-)
-WHOAMI_CACHE_FILE = GlobalPath(lambda: VIBE_HOME.path / "whoami_cache.json")
+EXPERIMENT_EVAL_CACHE_FILE = GlobalPath(lambda: VIBE_HOME.path / EVAL_CACHE_FILE_NAME)
 MODEL_CATALOG_CACHE_FILE = GlobalPath(
     lambda: VIBE_HOME.path / "model_catalog_cache.json"
+)
+WHOAMI_CACHE_FILE = GlobalPath(lambda: VIBE_HOME.path / "whoami_cache.json")
+UTILITY_MODEL_CACHE_FILE = GlobalPath(
+    lambda: VIBE_HOME.path / "utility_model_cache.json"
+)
+DISCOVERED_MODELS_CACHE_FILE = GlobalPath(
+    lambda: VIBE_HOME.path / "discovered_models_cache.json"
 )
 HISTORY_FILE = GlobalPath(lambda: VIBE_HOME.path / "vibehistory")
 PLANS_DIR = GlobalPath(lambda: VIBE_HOME.path / "plans")

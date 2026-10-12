@@ -10,7 +10,7 @@ from vibe.core.telemetry.send import (
     send_unified_subagent_tool_call_finished,
     send_unified_tool_call_finished,
 )
-from vibe.core.telemetry.types import TelemetryCallType
+from vibe.core.telemetry.types import AttachmentKind, TelemetryCallType
 
 __all__ = ["SessionTelemetry"]
 
@@ -47,6 +47,9 @@ class SessionTelemetry:
         """Pre-mark a resumed session's terminal effects so they never re-emit."""
         self._recorded.add(effect_id)
 
+    def is_recorded(self, effect_id: str) -> bool:
+        return effect_id in self._recorded
+
     def claim(self, effect_id: str) -> bool:
         """Return ``True`` the first time an effect id is seen, ``False`` after.
 
@@ -67,6 +70,7 @@ class SessionTelemetry:
         nb_prompt_chars: int,
         call_type: TelemetryCallType,
         message_id: str | None = None,
+        attachment_counts: dict[AttachmentKind, int] | None = None,
     ) -> None:
         self._client.send_request_sent(
             model=model,
@@ -75,6 +79,7 @@ class SessionTelemetry:
             nb_prompt_chars=nb_prompt_chars,
             call_type=call_type,
             message_id=message_id,
+            attachment_counts=attachment_counts,
         )
 
     def record_tool_call_finished(

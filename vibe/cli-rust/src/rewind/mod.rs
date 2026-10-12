@@ -9,7 +9,9 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::app::{App, Status, ToastSeverity};
+use crate::collapsed_pastes::Collapsed;
 use crate::commands::submission::new_message_id;
+use crate::input_modes::ClassifiedInput;
 use crate::server::{Client, PublicSessionState};
 use crate::transcript::local;
 use request::{confirm, select};
@@ -34,7 +36,7 @@ pub enum Event {
     Selected {
         entry_index: usize,
         entry_id: String,
-        preview: String,
+        preview: Collapsed,
         has_file_changes: bool,
     },
     /// `session/rewind` answered: the session now starts before the message.
@@ -96,7 +98,7 @@ pub fn next(app: &mut App, client: &Arc<Client>) {
 pub fn quit(app: &mut App) {
     app.rewind.open = false;
     app.rewind.entry_id = None;
-    app.rewind.preview.clear();
+    app.rewind.preview = Collapsed::default();
     app.rewind.step = Step::Action;
     app.rewind.restore_files = false;
     app.rewind.selected = 0;
@@ -112,10 +114,12 @@ pub fn handle_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') => navigate(app, false),
         KeyCode::Down | KeyCode::Char('j') => navigate(app, true),
         KeyCode::Enter => choose(app, client, app.rewind.selected),
-        KeyCode::Char('1') => choose(app, client, 0),
-        KeyCode::Char('2') => choose(app, client, 1),
         KeyCode::Char('q') => quit(app),
-        _ => {}
+        _ => {
+            if let Some(option) = crate::list_nav::digit(&key, options(app).len()) {
+                choose(app, client, option);
+            }
+        }
     }
 }
 
@@ -134,11 +138,7 @@ pub fn options(app: &App) -> Vec<&'static str> {
 /// Move the highlight one option up/down, wrapping (Python `action_move_*`).
 fn navigate(app: &mut App, down: bool) {
     let count = options(app).len();
-    if count == 0 {
-        return;
-    }
-    let step = if down { 1 } else { count - 1 };
-    app.rewind.selected = (app.rewind.selected + step) % count;
+    app.rewind.selected = crate::list_nav::wrap(app.rewind.selected, count, down);
 }
 
 /// Act on an option: the action step arms the restore choice and advances, the
@@ -165,7 +165,7 @@ fn reset_to_action(app: &mut App) {
 }
 
 /// Index of the highlighted message in the rewindable list.
-fn current_index(app: &App, messages: &[(usize, String, String)]) -> Option<usize> {
+fn current_index(app: &App, messages: &[(usize, String, Collapsed)]) -> Option<usize> {
     let entry_id = app.rewind.entry_id.as_deref()?;
     messages.iter().position(|(_, id, _)| id == entry_id)
 }
@@ -222,6 +222,19 @@ fn apply_done(
     for error in restore_errors {
         app.show_toast(error, ToastSeverity::Warning, TOAST_SECS);
     }
+    // Read before the transcript is rebuilt: the rewound message's collapsed
+    // pastes and attached images.
+    let rewound = app
+        .rewind
+        .entry_id
+        .as_deref()
+        .and_then(|id| app.view.transcript.entry_raw(id));
+    let display = rewound
+        .and_then(|raw| raw.get("userDisplayContent"))
+        .cloned();
+    let images = rewound
+        .map(crate::inline_images::attachments)
+        .unwrap_or_default();
     quit(app);
     let new_session_id = state.session.id.clone();
     app.set_session_id(new_session_id.clone());
@@ -234,6 +247,7 @@ fn apply_done(
     app.queue.clear();
     app.view.expanded.clear();
     app.view.transcript.load_snapshot(&state);
+    crate::worktree::track_state(app, &state);
     app.expand_rebuilt_tools();
     if !inplace {
         local::add_rewind_fork(
@@ -243,100 +257,23 @@ fn apply_done(
             &new_session_id,
         );
     }
-    // The rewound message goes back into the composer, ready to be edited. The
-    // Textual `value` setter parks the caret at the start, so this does too.
-    app.chat_input.load_full_text(message);
-    app.chat_input.cursor = 0;
+    // The rewound message goes back into the composer, caret at the end, ready to be edited.
+    // A skill invocation reloads in `/` mode as typed; any other message is a prompt.
+    match crate::input_modes::classify(&message, &app.completion.skills) {
+        ClassifiedInput::Skill { .. } => app.chat_input.load_full_text(message.clone()),
+        _ => app.chat_input.load_prompt_text(message.clone()),
+    }
+    crate::long_paste::restore(app, display.as_ref());
+    crate::inline_images::restore_placeholders(app, &message, &images);
+    app.chat_input.cursor = app.chat_input.input.len();
     crate::completion_manager::input_changed(app);
+    // A trailing `@file` or `/skill` mention stays closed until the next edit, like a recall.
+    if crate::completion_manager::active_is_mention(app) {
+        crate::completion_manager::reset_for_recall(app);
+    }
     app.view.scroll = 0;
     app.view.scroll_target = 0;
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn selected(app: &mut App, has_file_changes: bool) {
-        apply_event(
-            app,
-            Event::Selected {
-                entry_index: 0,
-                entry_id: "entry-1".into(),
-                preview: "fix the parser".into(),
-                has_file_changes,
-            },
-        );
-    }
-
-    #[test]
-    fn the_action_step_offers_a_restore_only_when_files_changed() {
-        let mut app = App::default();
-        selected(&mut app, true);
-        assert_eq!(options(&app).len(), 2);
-        selected(&mut app, false);
-        assert_eq!(options(&app), ["Edit message from here"]);
-    }
-
-    #[test]
-    fn navigation_wraps_around_the_current_step() {
-        let mut app = App::default();
-        selected(&mut app, true);
-        navigate(&mut app, true);
-        assert_eq!(app.rewind.selected, 1);
-        navigate(&mut app, true);
-        assert_eq!(app.rewind.selected, 0);
-        navigate(&mut app, false);
-        assert_eq!(app.rewind.selected, 1);
-    }
-
-    #[test]
-    fn a_new_selection_reopens_on_the_action_step() {
-        let mut app = App::default();
-        selected(&mut app, true);
-        app.rewind.step = Step::Persistence;
-        app.rewind.restore_files = true;
-        app.rewind.selected = 1;
-        selected(&mut app, true);
-        assert!(app.rewind.open);
-        assert_eq!(app.rewind.step, Step::Action);
-        assert!(!app.rewind.restore_files);
-        assert_eq!(app.rewind.selected, 0);
-        assert_eq!(app.view.scroll_to_entry, Some(0));
-    }
-
-    #[test]
-    fn a_failed_read_leaves_rewind_mode_when_nothing_is_highlighted() {
-        let mut app = App::default();
-        apply_event(&mut app, Event::Failed("boom".into()));
-        assert!(!app.rewind.open);
-        assert!(!app.overlays.toasts.is_empty());
-    }
-
-    #[test]
-    fn a_done_rewind_restores_the_message_into_the_composer() {
-        let mut app = App::default();
-        selected(&mut app, false);
-        let state = serde_json::json!({
-            "eventId": 3,
-            "session": {"id": "new-session-id"},
-            "history": [],
-        });
-        apply_event(
-            &mut app,
-            Event::Done {
-                message: "fix the parser".into(),
-                restore_errors: vec!["Failed to restore file: a.py".into()],
-                old_session_id: "old-session-id".into(),
-                inplace: false,
-                state: Box::new(serde_json::from_value(state).expect("state")),
-            },
-        );
-        assert!(!app.rewind.open);
-        assert_eq!(app.chat_input.input, "fix the parser");
-        assert_eq!(app.chat_input.cursor, 0);
-        assert_eq!(app.session.session_id.as_deref(), Some("new-session-id"));
-        assert!(!app.overlays.toasts.is_empty());
-        // The fork notice is the only entry left after the history was replaced.
-        assert_eq!(app.view.transcript.lines().count(), 1);
-    }
-}
+mod tests;

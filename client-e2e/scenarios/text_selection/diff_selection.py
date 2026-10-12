@@ -22,10 +22,11 @@ _NEW = "alpha\nBETA\ngamma\ndelta\nEPSILON\nzeta\n"
 # A drag starting in the numbered gutter must still select body text only.
 # Keep it on one row so selection-triggered copy toasts cannot shift the later
 # endpoint while the gesture is in progress.
-_DRAG = "\x1b[<0;12;25M\x1b[<32;20;25M\x1b[<0;20;25m"
+_DRAG = "\x1b[<0;6;18M\x1b[<32;14;18M\x1b[<0;14;18m"
 # A double-click on a diff body word snaps to that word, gutter excluded.
-_DOUBLE = "\x1b[<0;17;25M\x1b[<0;17;25m\x1b[<0;17;25M\x1b[<0;17;25m"
-_EXPAND = "\x1b[<0;1;30M\x1b[<0;1;30m"
+_DOUBLE = "\x1b[<0;11;18M\x1b[<0;11;18m\x1b[<0;11;18M\x1b[<0;11;18m"
+# The lone edit stays ungrouped, so its own header row unfolds the diff.
+_EXPAND_EDIT = "\x1b[<0;1;15M\x1b[<0;1;15m"
 
 timeline: Timeline = [
     f"{_PROMPT}\r",
@@ -34,7 +35,7 @@ timeline: Timeline = [
     edit_file("notes.txt", [(3, _OLD, _NEW)]),
     assistant_msg("Done."),
     turn_completed(),
-    _EXPAND,
+    _EXPAND_EDIT,
     _DRAG,
     _DOUBLE,
 ]

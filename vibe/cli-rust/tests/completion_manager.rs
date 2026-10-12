@@ -1,8 +1,11 @@
 //! Cursor-aware file completion detection and replacement.
 
+use std::time::{Duration, Instant};
+
 use vibe_rs::app::App;
 use vibe_rs::completion_manager::{self, CompletionEntry};
 use vibe_rs::input_modes::InputMode;
+use vibe_rs::utils::file_index::FileIndex;
 
 fn composer(before: &str, after: &str) -> App {
     let mut app = App::default();
@@ -105,6 +108,31 @@ fn accept_without_an_active_token_leaves_input_unchanged() {
 }
 
 #[test]
+fn sync_files_applies_an_index_update_that_landed_after_the_keys() {
+    let root = std::env::temp_dir().join(format!("vibe-rs-sync-files-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "").unwrap();
+    let (files, mut changes) = FileIndex::start(Some(root.clone()));
+    let mut app = composer("@Cargo", "");
+    app.completion.files = files;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !changes.has_changed().unwrap() {
+        assert!(Instant::now() < deadline, "file index never became ready");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    completion_manager::sync_files(&mut app, &mut changes);
+
+    assert!(app
+        .completion
+        .entries
+        .iter()
+        .any(|entry| entry.label == "@Cargo.toml"));
+    assert!(!changes.has_changed().unwrap());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn accept_without_suggestions_leaves_input_unchanged() {
     let mut app = composer("@missing", " suffix");
 
@@ -115,7 +143,8 @@ fn accept_without_suggestions_leaves_input_unchanged() {
 
 #[test]
 fn refresh_resets_highlight_only_when_the_suggestion_list_changes() {
-    let mut app = composer("/", "");
+    let mut app = composer("", "");
+    app.chat_input.mode = InputMode::Slash;
     completion_manager::refresh(&mut app);
     assert!(completion_manager::is_open(&app));
     completion_manager::navigate(&mut app, true);
@@ -130,8 +159,8 @@ fn refresh_resets_highlight_only_when_the_suggestion_list_changes() {
 
     // A different query rebuilds a different list: the highlight restarts at
     // the top suggestion instead of accepting a stale index.
-    app.chat_input.input = "/he".into();
-    app.chat_input.cursor = 3;
+    app.chat_input.input = "he".into();
+    app.chat_input.cursor = 2;
     completion_manager::refresh(&mut app);
     assert!(completion_manager::is_open(&app));
     assert_eq!(app.completion.selected, 0);
@@ -139,19 +168,59 @@ fn refresh_resets_highlight_only_when_the_suggestion_list_changes() {
 }
 
 #[test]
-fn slash_accept_preserves_existing_replacement_and_caret_behavior() {
-    for (mode, before, after, expected) in [
-        (InputMode::Slash, "sta", "tus arg", "status arg"),
-        (InputMode::Prompt, "/sta", "tus arg", "/status arg"),
+fn slash_menu_closes_once_anything_follows_the_command() {
+    for (mode, input, open) in [
+        (InputMode::Prompt, "/help", false),
+        (InputMode::Slash, "help", true),
+        (InputMode::Slash, "help ", false),
+        (InputMode::Slash, "help a", false),
+        (InputMode::Slash, "help\n", false),
     ] {
-        let mut app = composer(before, after);
+        let mut app = composer(input, "");
         app.chat_input.mode = mode;
-        app.chat_input.anchor = Some(0);
-        offer(&mut app, "/status");
+        completion_manager::input_changed(&mut app);
+        assert_eq!(completion_manager::is_open(&app), open, "{input:?}");
+    }
+}
 
-        assert!(completion_manager::accept(&mut app));
+#[test]
+fn slash_menu_stays_closed_when_the_caret_returns_to_the_command() {
+    let mut app = composer("he", "lp arg");
+    app.chat_input.mode = InputMode::Slash;
+    completion_manager::input_changed(&mut app);
+    assert!(!completion_manager::is_open(&app));
+
+    offer(&mut app, "/help");
+    assert!(!completion_manager::accept(&mut app));
+    assert_eq!(app.chat_input.input, "help arg");
+}
+
+#[test]
+fn tab_leaves_a_space_after_a_slash_command_only() {
+    for (mode, before, label, expected) in [
+        (InputMode::Slash, "lo", "/loop", "loop "),
+        (InputMode::Prompt, "@sr", "@src/", "@src/"),
+    ] {
+        let mut app = composer(before, "");
+        app.chat_input.mode = mode;
+        offer(&mut app, label);
+
+        completion_manager::tab(&mut app);
         assert_eq!(app.chat_input.input, expected);
         assert_eq!(app.chat_input.cursor, expected.len());
-        assert_eq!(app.chat_input.anchor, None);
+        assert!(!completion_manager::is_open(&app));
     }
+}
+
+#[test]
+fn slash_accept_replaces_the_whole_command_word() {
+    let mut app = composer("sta", "tu");
+    app.chat_input.mode = InputMode::Slash;
+    app.chat_input.anchor = Some(0);
+    offer(&mut app, "/status");
+
+    assert!(completion_manager::accept(&mut app));
+    assert_eq!(app.chat_input.input, "status");
+    assert_eq!(app.chat_input.cursor, "status".len());
+    assert_eq!(app.chat_input.anchor, None);
 }

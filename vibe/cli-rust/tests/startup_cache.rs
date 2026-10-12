@@ -51,6 +51,28 @@ fn an_older_runtime_without_default_agent_uses_the_builtin_default() {
 }
 
 #[test]
+fn image_support_follows_the_backend_promise_with_a_model_fallback() {
+    let mut runtime = runtime("safe");
+    let config = &mut runtime["runtime"]["config"];
+    config["activeModel"]["supportsImages"] = false.into();
+    config["imagesSupported"] = true.into();
+    assert!(
+        StartupConfig::from_runtime("1.0.0", &runtime)
+            .unwrap()
+            .images_supported
+    );
+
+    let config = &mut runtime["runtime"]["config"];
+    config.as_object_mut().unwrap().remove("imagesSupported");
+    config["activeModel"]["supportsImages"] = true.into();
+    assert!(
+        StartupConfig::from_runtime("1.0.0", &runtime)
+            .unwrap()
+            .images_supported
+    );
+}
+
+#[test]
 fn with_no_cache_the_builtins_are_cycleable() {
     let config = StartupConfig::default();
     assert_eq!(config.default_agent, "accept-edits");
@@ -65,6 +87,15 @@ fn round_trips_through_the_cache_file_format() {
     assert!(raw.contains("\"cachedAt\":"));
     assert!(!raw.contains("activeAgent"));
     assert_eq!(serde_json::from_str::<StartupConfig>(&raw).unwrap(), config);
+}
+
+#[test]
+fn an_older_cache_without_cursor_blink_keeps_blinking_enabled() {
+    let mut cache = serde_json::to_value(config_with(CLIENT_VERSION, 1000)).unwrap();
+    cache.as_object_mut().unwrap().remove("cursorBlink");
+    let config: StartupConfig = serde_json::from_value(cache).unwrap();
+    assert!(config.cursor_blink);
+    assert!(config.is_fresh(CLIENT_VERSION, 1000));
 }
 
 #[test]

@@ -1,9 +1,10 @@
 use serde_json::Value;
 
 use crate::core::error::CoreError;
+use crate::core::features::permissions::PermissionResolution;
 use crate::core::tools::external::{ExternalTool, ExternalToolCall};
 
-use super::descriptor::TypeScriptTool;
+use super::descriptor::{ProgrammaticName, TypeScriptTool};
 use super::settings::Settings;
 
 /// One program operation resolved against the same immutable session snapshot
@@ -27,9 +28,9 @@ impl ResolvedProgramOperation {
 /// The session coordinator builds this value from its resolved tools and hook
 /// index. The feature only sees its own settings and program
 /// descriptors plus narrow callbacks for resolving operations, selecting
-/// post-tool hooks, and validating hook-rewritten arguments. Tool discovery is
-/// dispatched before program execution and is never retained by replay
-/// continuations.
+/// post-tool hooks, validating hook-rewritten arguments, and enforcing tool
+/// permissions. Tool discovery is dispatched before program execution and is
+/// never retained by replay continuations.
 #[derive(Clone, Copy)]
 pub(crate) struct ProgramContext<'a> {
     descriptors: &'a [TypeScriptTool],
@@ -39,9 +40,11 @@ pub(crate) struct ProgramContext<'a> {
     resolve_operation: &'a dyn Fn(&str, Value) -> Option<ResolvedProgramOperation>,
     post_hook_binding_ids: &'a dyn Fn(&ExternalToolCall) -> Vec<String>,
     effective_call: &'a dyn Fn(&ExternalToolCall, Value) -> Result<ExternalToolCall, CoreError>,
+    permission_resolution: &'a dyn Fn(&ExternalToolCall) -> PermissionResolution,
 }
 
 impl<'a> ProgramContext<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         descriptors: &'a [TypeScriptTool],
         settings: &'a Settings,
@@ -50,6 +53,7 @@ impl<'a> ProgramContext<'a> {
         resolve_operation: &'a dyn Fn(&str, Value) -> Option<ResolvedProgramOperation>,
         post_hook_binding_ids: &'a dyn Fn(&ExternalToolCall) -> Vec<String>,
         effective_call: &'a dyn Fn(&ExternalToolCall, Value) -> Result<ExternalToolCall, CoreError>,
+        permission_resolution: &'a dyn Fn(&ExternalToolCall) -> PermissionResolution,
     ) -> Self {
         Self {
             descriptors,
@@ -59,6 +63,7 @@ impl<'a> ProgramContext<'a> {
             resolve_operation,
             post_hook_binding_ids,
             effective_call,
+            permission_resolution,
         }
     }
 
@@ -96,5 +101,27 @@ impl<'a> ProgramContext<'a> {
         arguments: Value,
     ) -> Result<ExternalToolCall, CoreError> {
         (self.effective_call)(original, arguments)
+    }
+
+    pub(crate) fn permission_resolution(self, call: &ExternalToolCall) -> PermissionResolution {
+        (self.permission_resolution)(call)
+    }
+
+    pub(crate) fn resolve_programmatic_name(
+        self,
+        call: &ExternalToolCall,
+    ) -> Result<ProgrammaticName, CoreError> {
+        let runtime_name = call.call.programmatic_runtime_name().ok_or_else(|| {
+            CoreError::invariant("programmatic approval call has no Runtime name")
+        })?;
+        self.descriptors
+            .iter()
+            .find(|descriptor| descriptor.name == runtime_name)
+            .map(|descriptor| descriptor.programmatic_name.clone())
+            .ok_or_else(|| {
+                CoreError::invariant(format!(
+                    "programmatic approval call targets unknown Runtime name {runtime_name:?}"
+                ))
+            })
     }
 }

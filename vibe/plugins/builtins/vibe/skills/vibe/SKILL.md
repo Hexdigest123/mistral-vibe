@@ -85,9 +85,10 @@ press. `Ctrl+Z` suspends on POSIX (resume with `fg`).
 ### Update
 
 Vibe never updates silently. With `enable_update_checks = true` (default), it
-polls PyPI for `mistral-vibe` daily and prompts on the next launch when a
-newer release exists; accepting runs `uv tool upgrade mistral-vibe`, then
-`brew upgrade mistral-vibe` as a fallback. Disable via `enable_update_checks
+checks for a newer `mistral-vibe` daily and prompts on the next launch when
+one exists. uv tool installs ask `uv tool list --outdated`, so uv settings such
+as `exclude-newer` apply; other installs poll PyPI. Accepting runs
+`uv tool upgrade mistral-vibe`, then `brew upgrade mistral-vibe` as a fallback. Disable via `enable_update_checks
 = false`. Run `vibe update` (equivalent to `vibe --check-upgrade`) to check
 immediately, prompt to install a newer version if one exists, and exit. Initial
 install: `uv tool install mistral-vibe`.
@@ -110,10 +111,11 @@ Each session has a `title` stored in `meta.json` (with `title_source`: `auto` or
 concise descriptive title (the `--resume` list shows a message preview until
 then). Automatic generation runs only for the interactive CLI; other clients
 (ACP, app server, programmatic) keep their own session management and fall back
-to the message preview. Title generation runs on the session's active
-model/provider — it substitutes a small fast Mistral model only when the active
-provider is already Mistral and the allowlist permits it, so titles never reach a
-new destination. The first title waits for the opening turn to finish (or a few
+to the message preview. Title generation runs on a small fast Mistral model when the
+deployment is known to serve one — Vibe asks it once, with a one-token request
+at session open, and remembers the answer in `~/.vibe/utility_model_cache.json`
+— and on the session's active model otherwise. `utility_models.title` pins a
+specific model instead. The first title waits for the opening turn to finish (or a few
 model steps) so it isn't generated off a thin tool-call preamble. On that cheap
 fast model it also refreshes periodically and
 after each compaction; when it falls back to the (possibly expensive) active
@@ -151,7 +153,7 @@ falls back to the current default model.
 The configuration file uses TOML format. When it does not exist, Vibe uses its
 built-in defaults and creates a sparse file on the first persisted setting.
 Settings can also be overridden via environment variables with the `VIBE_`
-prefix (e.g., `VIBE_ACTIVE_MODEL=local`).
+prefix (e.g., `VIBE_ACTIVE_MODEL=my-local-model`).
 
 Custom prompt IDs are resolved from project-local `.vibe/prompts/` first, then
 from `~/.vibe/prompts/`, and finally from the built-in bundled prompts.
@@ -165,12 +167,17 @@ active_model = "mistral-medium-3.5"  # Model alias to pin; omit or set "" to fol
 # UI preferences
 theme = "auto"  # Follow terminal background, then OS light/dark preference
 disable_welcome_banner_animation = false
+cursor_blink = true  # Blink the input cursor; false keeps it steady
 autocopy_to_clipboard = true  # Enable automatic copying of selected text to clipboard
 file_watcher_for_autocomplete = true  # Refresh @ suggestions after workspace changes
 ask_confirmation_on_exit = true  # Require a second Ctrl+D to quit (Ctrl+C always confirms)
 show_greeting = true  # Show "Hello {name}" greeting below the banner at startup (Mistral providers, once per 24h)
 log_level = "WARNING"  # Optional. DEBUG | INFO | WARNING | ERROR | CRITICAL — log level for ~/.vibe/logs/vibe.log
 ```
+
+`cursor_blink` controls the main input cursor in both Python and Rust terminals.
+Change it through `/config`, or edit `config.toml` and run `/reload`; no restart
+is needed.
 
 ### Copy and Text Selection
 
@@ -183,11 +190,12 @@ bypass_tool_permissions = false    # Skip tool approval prompts
 system_prompt_id = "cli"          # System prompt: "cli", "lean", or custom .md filename
 compaction_prompt_id = "compact"  # Compaction prompt: built-in "compact" or custom .md filename
 enable_telemetry = true
-enable_update_checks = true       # Daily PyPI check; prompts on next launch when a newer release exists
+enable_update_checks = true       # Daily update check (uv or PyPI); prompts on next launch when a newer release exists
 enable_notifications = true
 enable_system_trust_store = false  # Use OS trust store for outbound HTTPS
 api_timeout = 720.0               # API request timeout in seconds
 api_retry_max_elapsed_time = 300.0  # Retry budget for retryable API failures in seconds
+api_stream_idle_timeout = 0.0     # Silence after the model starts answering that counts as a stall, in seconds; 0 disables
 auto_compact_threshold = 200000   # Fallback for models without their own threshold
 
 # Git commit behavior
@@ -266,20 +274,32 @@ auto_compact_threshold = 200000
 supports_images = true            # vision-capable; allows @-mentioned images
 
 [[models]]
+# A user-defined local model served by llama.cpp; the built-in list ships only
+# the hosted Mistral Medium 3.5.
 name = "devstral"
 provider = "llamacpp"
-alias = "local"
+alias = "my-local-model"
 
-# Optional override, requires --experimental-harness. A non-vision active model
-# already picks up any supports_images model on its OWN provider automatically;
-# set this only to point somewhere else, which is also the only way to cross
-# providers. Ignored whenever the active model has supports_images = true --
-# that model sees the image itself.
+# Optional override. A non-vision active model already picks up any
+# supports_images model on its OWN provider automatically; set this only to
+# point somewhere else, which is also the only way to cross providers. Ignored
+# whenever the active model has supports_images = true -- that model sees the
+# image itself.
 [vision_model]
 name = "mistral-vibe-cli-latest"
 provider = "mistral"
 alias = "vision"
 supports_images = true            # required
+
+# Optional: the model behind each background helper -- session titles and the
+# smart-approve classifier. A value is an alias from [[models]], or "active" for
+# the session's own model (unless a model is aliased "active"). Unset, a helper
+# uses a small fast Mistral model when the deployment serves one (checked when
+# a session opens with the feature on, then cached) and the session's model
+# otherwise, which costs more per call.
+[utility_models]
+title = "local"
+smart_approve = "active"
 ```
 
 ### Tool Configuration
@@ -476,12 +496,11 @@ and the API key env var is set. Toggle the master switch or hide individual
 connectors / tools:
 
 The legacy backend keeps a discovered connector disabled until it has an
-explicit `[[connectors]]` entry. The Unified Harness backend (selected via
-`--experimental-harness` or through the GrowthBook rollout) enables ready
-connectors by default in memory. It does not write that default to TOML, and
-the master switch plus explicit connector, tool, allowlist, and denylist
-settings always take precedence. Use `--legacy-harness` to force the legacy
-backend if you are enrolled in the rollout and prefer the old behavior.
+explicit `[[connectors]]` entry. The Unified Harness backend (the default
+runtime) enables ready connectors by default in memory. It does not write that
+default to TOML, and the master switch plus explicit connector, tool, allowlist,
+and denylist settings always take precedence. Use `--legacy-harness` for the
+temporary legacy escape hatch if you prefer the old behavior.
 
 ```toml
 enable_connectors = true          # Master switch (default: true)
@@ -758,8 +777,8 @@ vibe --max-tokens N                 # Max total session tokens (programmatic mod
 vibe --enabled-tools TOOL           # Enable specific tools (repeatable)
 vibe --disabled-tools TOOL          # Disable specific tools (repeatable)
 vibe --output text|json|streaming   # Output format (programmatic mode)
-vibe --experimental-harness        # Force the Unified Harness backend (requires internal installation)
-vibe --legacy-harness             # Force the legacy Python harness, overriding the GrowthBook rollout
+vibe --experimental-harness        # Select the Unified Harness backend (redundant: it is the default runtime)
+vibe --legacy-harness             # Force the legacy Python harness (temporary escape hatch)
 ```
 
 ## Built-in Agents
@@ -847,15 +866,17 @@ Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
   clears it instead. In the rewind panel: `↑/↓` pick option, `Shift+↑/↓`
   scroll, `←`/`Esc` edit previous message, `→` edit next message, `Enter`
   accept, `q` quit.
-- `/loop <interval> <prompt>` - Schedule a recurring prompt (e.g. `/loop 30s ping`).
-  Intervals: `Ns/Nm/Nh/Nd`, minimum 30s, max 50 loops/session.
-  - `/loop` (or `/loop list` / `/loop ls`) - List current scheduled loops.
-  - `/loop cancel <id|all>` (aliases `rm`, `stop`, `delete`) - Cancel a loop.
-  - Loops fire only when the agent is idle and the input bar is focused. At
-    most one loop fires per poll. Overdue loops fire once on the next poll
-    (no catch-up); `next_fire_at` advances to `now + interval`.
-  - Loops are persisted in the session metadata (`loops` field of `meta.json`)
-    and restored on `--resume`/`--continue`.
+- `/loop [schedule] [prompt]` - With the Unified Harness, ask the model to
+  schedule a recurring prompt, e.g. `/loop every two minutes check the build`
+  or `/loop weekdays at 9am review CI`.
+  - The full message is sent unchanged to the model, which uses the `cron` tool
+    to schedule, list, cancel, or clear prompts. There are no TUI management
+    subcommands; bare `/loop` also goes to the model. Busy submissions queue.
+  - Fixed intervals have a 30-second minimum; calendar schedules use five-field
+    cron in the machine's local timezone. Maximum 50 schedules per session.
+  - Prompts run only while the session is live and idle, without catch-up bursts.
+    Schedules persist in `scheduled-loops.json` beside the Unified session and
+    are restored on resume. They do not run while Vibe is closed.
 - `/proxy-setup` - Configure proxy and SSL certificate settings
 - `/leanstall` - Install the Lean 4 agent (leanstral)
 - `/unleanstall` - Uninstall the Lean 4 agent
@@ -971,10 +992,10 @@ While the queue is non-empty and the agent is busy, pressing **Up**
 enters queue selection mode: the last queued item is highlighted and
 the input is locked (no cursor, no typing). **Up/Down** navigate
 between queued prompts, **Enter** loads the selected prompt into the input
-for editing (press Enter again to update it in-place), **Backspace**
-or **Delete** removes the selected item and moves selection to the
-next, and **Esc** exits selection mode and restores the original
-input text.
+for editing (press Enter again to update it in-place), **Backspace** (or
+**Delete** in the Python CLI, **Ctrl+C** in the Rust CLI) removes the selected
+item and moves selection to the next, and **Esc** exits selection mode and
+restores the original input text.
 
 ## Plugins
 
@@ -1021,8 +1042,8 @@ components (hooks, knowledge, agents). `toolNamespace` is a
 TypeScript-identifier-safe string used to prefix all component names
 (e.g. `myNs:my-skill`). If omitted, it is derived from the plugin name.
 
-Reserved namespaces (rejected): `file_system`, `self`, `process`, `agent`,
-`vibe`.
+Reserved namespaces (rejected): `file_system`, `self`, `process`, `skill`,
+`subagent`, `vibe`.
 
 ### Plugin Contents
 
@@ -1143,6 +1164,8 @@ offered inline, and no popup is shown.
 - `VIBE_HOME` - Override the Vibe home directory (default: `~/.vibe`)
 - `MISTRAL_API_KEY` - API key for Mistral provider
 - `VIBE_ACTIVE_MODEL` - Override active model
+- `VIBE_CLI` - Selects the CLI implementation: `rust` starts the experimental
+  Rust TUI; any other value (or unset) runs the legacy Python (Textual) TUI.
 - `VIBE_*` - Any config field can be overridden with the `VIBE_` prefix
 - `LOG_LEVEL` - Overrides `log_level` config for `$VIBE_HOME/logs/vibe.log`.
   One of `DEBUG`, `INFO`, `WARNING` (default), `ERROR`, `CRITICAL`. Invalid values

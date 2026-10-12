@@ -1,6 +1,6 @@
 //! Composer surface: map screen cells to chat-input offsets and snap selections.
 
-use crate::app::App;
+use crate::app::{App, Surface};
 use crate::chat_input;
 use crate::selection::Granularity;
 use crate::utils::input_edit;
@@ -43,12 +43,20 @@ fn clamped_offset(app: &App, at: (u16, u16)) -> usize {
 /// (Python `ChatTextArea._on_mouse_down`).
 pub(super) fn press(app: &mut App, offset: usize) {
     app.chat_input.scroll = None;
+    app.chat_input.sync_mentions();
+    // A click inside a mention parks the caret after it: mentions are atomic.
+    let offset = app
+        .chat_input
+        .mentions
+        .around(offset)
+        .map_or(offset, |(_, end)| end);
     app.selection.composer_anchor = Some(offset);
     let (anchor, cursor) = match app.selection.granularity {
         Granularity::Char => (offset, offset),
         Granularity::Word => word_bounds(app, offset).unwrap_or((offset, offset)),
         Granularity::Paragraph => input_edit::line_bounds(&app.chat_input.input, offset),
     };
+    let (anchor, cursor) = app.chat_input.mentions.widen(anchor, cursor);
     app.chat_input.anchor = Some(anchor);
     app.chat_input.cursor = cursor;
     crate::completion_manager::refresh(app);
@@ -65,6 +73,7 @@ pub(super) fn drag(app: &mut App, at: (u16, u16)) {
     if app.selection.granularity == Granularity::Char {
         app.chat_input.anchor = Some(anchor);
         app.chat_input.cursor = head;
+        app.chat_input.snap_cursor(anchor);
         return;
     }
     let (lo, hi) = if anchor <= head {
@@ -82,8 +91,18 @@ pub(super) fn drag(app: &mut App, at: (u16, u16)) {
             word_bounds(app, hi).map_or(hi, |(_, end)| end),
         ),
     };
+    let (start, end) = app.chat_input.mentions.widen(start, end);
     app.chat_input.anchor = Some(start);
     app.chat_input.cursor = end;
+}
+
+/// Collapse the selection to the caret and end a composer drag (Python `ChatTextArea.on_blur`).
+pub fn blur_composer(app: &mut App) {
+    app.chat_input.anchor = None;
+    app.selection.composer_anchor = None;
+    if app.selection.drag == Some(Surface::Composer) {
+        app.selection.drag = None;
+    }
 }
 
 /// Copy the completed composer selection, or drop an empty one.

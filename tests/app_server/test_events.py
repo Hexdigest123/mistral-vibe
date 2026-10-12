@@ -717,6 +717,80 @@ def test_streaming_message_is_added_patched_and_frozen() -> None:
         projection.consume(_notification(4, patched[0]))
 
 
+@pytest.mark.parametrize(
+    ("input_fields", "input_patch"),
+    [
+        pytest.param(
+            {},
+            JsonPatchOperation(op="add", path="/inputEntryId", value="steer-1"),
+            id="legacy-omitted-add",
+        ),
+        pytest.param(
+            {"inputEntryId": None},
+            JsonPatchOperation(op="replace", path="/inputEntryId", value="steer-1"),
+            id="nullable-replace",
+        ),
+    ],
+)
+def test_history_patch_links_legacy_and_nullable_input_entry_id(
+    input_fields: dict[str, JsonValue], input_patch: JsonPatchOperation
+) -> None:
+    """*Prepare*: A streaming entry from an older or current server.
+    *Do*: Apply the server's add or replace patch to link its input.
+    *Assert*: Both wire forms update the client projection without losing content.
+    """
+    # Prepare
+    projection = _projection()
+    projection.consume(
+        Notification(
+            method="history/entryAdded",
+            params={
+                "eventId": 1,
+                "sessionId": "session-1",
+                "emittedAt": 1,
+                "entry": {
+                    "type": "message",
+                    "id": "assistant-1",
+                    "sessionId": "session-1",
+                    "turnId": "turn-1",
+                    "createdAt": 1,
+                    "updatedAt": 1,
+                    "generationStatus": "in_progress",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "relatedEntryId": None,
+                    **input_fields,
+                },
+            },
+        )
+    )
+
+    # Do
+    event = projection.consume(
+        Notification(
+            method="history/entryUpdated",
+            params={
+                "eventId": 2,
+                "sessionId": "session-1",
+                "emittedAt": 2,
+                "entryId": "assistant-1",
+                "patch": [input_patch.model_dump(mode="json", by_alias=True)],
+            },
+        )
+    )
+
+    # Assert
+    assert isinstance(event, HistoryEntryUpdated)
+    assert event.previous.input_entry_id is None
+    assert event.entry.input_entry_id == "steer-1"
+    entry = projection.history[0]
+    assert isinstance(entry, PublicMessageEntry)
+    assert entry.input_entry_id == "steer-1"
+    assert entry.text == "hello"
+    assert entry.related_entry_id is None
+    assert projection.last_event_id == 2
+
+
 def test_in_progress_entry_identity_is_frozen() -> None:
     projector = EventProjector("session-1", "turn-1")
     projector.project(AssistantEvent(content="hello", message_id="message-1"))
@@ -750,8 +824,35 @@ def test_tool_call_completes_streamed_text_before_adding_effect() -> None:
     assert message.generation_status == "completed"
     assert effect.generation_status == "in_progress"
 
-    with pytest.raises(ValueError, match="frozen"):
-        projector.project(ReasoningEvent(content="late", message_id="reasoning-1"))
+    # The backend can keep reusing the same message_id for reasoning/text
+    # that streams in after the tool call already completed that entry (seen
+    # with reasoning + speculative decoding on some OpenAI-compatible
+    # backends). That must start a fresh entry, not patch the frozen one.
+    late_updates = projector.project(
+        ReasoningEvent(content="late", message_id="reasoning-1")
+    )
+    assert [update.method for update in late_updates] == ["history/entryAdded"]
+    *_, late_reasoning = projector.history
+    assert isinstance(late_reasoning, PublicReasoningEntry)
+    assert late_reasoning.id != reasoning.id
+    assert late_reasoning.text == "late"
+    assert late_reasoning.generation_status == "in_progress"
+
+
+def test_assistant_text_after_tool_call_reusing_message_id_starts_a_new_entry() -> None:
+    projector = EventProjector("session-1", "turn-1")
+    projector.project(AssistantEvent(content="answer", message_id="message-1"))
+    projector.project(_read_call())
+
+    updates = projector.project(AssistantEvent(content="more", message_id="message-1"))
+
+    assert [update.method for update in updates] == ["history/entryAdded"]
+    message, _effect, late_message = projector.history
+    assert isinstance(message, PublicMessageEntry)
+    assert isinstance(late_message, PublicMessageEntry)
+    assert late_message.id != message.id
+    assert late_message.text == "more"
+    assert late_message.generation_status == "in_progress"
 
 
 def test_event_sequence_rejects_gaps_and_read_resynchronizes() -> None:

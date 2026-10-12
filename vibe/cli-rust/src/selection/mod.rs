@@ -4,12 +4,14 @@ pub mod bottom_bar;
 pub mod cells;
 mod composer;
 mod flow;
+pub mod fold;
 mod gesture;
 pub mod region;
 mod table;
 
 pub use bottom_bar::BottomBarSelection;
-pub use composer::{in_input, offset_at};
+pub use composer::{blur_composer, in_input, offset_at};
+pub use fold::{Fold, Folds};
 pub use gesture::{ClickChain, Granularity};
 pub use region::{Region, RegionId, RowSpan, ScrollTarget};
 pub use table::{TableCellHit, TableCellKey, TableCellSelection, TableCellSpan};
@@ -168,10 +170,7 @@ pub fn release(app: &mut App) -> Release {
         // The text is only known once the frame is painted, so the copy is
         // deferred to the overlay, which clears an empty selection itself.
         Some(Surface::Region(_)) => match app.selection.region.as_mut() {
-            Some(selection)
-                if selection.anchor != selection.head
-                    || app.selection.granularity != Granularity::Char =>
-            {
+            Some(selection) if !is_collapsed(selection, app.selection.granularity) => {
                 selection.pending_copy = true;
                 Release::Selected
             }
@@ -194,13 +193,14 @@ pub fn release(app: &mut App) -> Release {
     }
 }
 
+/// A char gesture whose head is still on its press cell selects nothing.
+pub fn is_collapsed(selection: &Selection, granularity: Granularity) -> bool {
+    selection.anchor == selection.head && granularity == Granularity::Char
+}
+
 /// A scroll drops the composer selection; a transcript one rides the document.
 pub fn scrolled(app: &mut App) {
-    app.chat_input.anchor = None;
-    app.selection.composer_anchor = None;
-    if app.selection.drag == Some(Surface::Composer) {
-        app.selection.drag = None;
-    }
+    blur_composer(app);
 }
 
 pub fn is_auto_scrolling(app: &App) -> bool {

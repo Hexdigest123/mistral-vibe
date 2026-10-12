@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +47,9 @@ from vibe.app_server.protocol import (
     SessionForkParams,
     SessionForkResponse,
     SessionHistoryClearParams,
+    SessionHistoryListParams,
+    SessionHistoryListResponse,
+    SessionLeaseHolder,
     SessionListParams,
     SessionListResponse,
     SessionMarkAsSeenParams,
@@ -571,6 +574,13 @@ class SessionBackendHostPin(Protocol):
 
 
 @runtime_checkable
+class SessionBackendHostLeaseWatch(Protocol):
+    def watch_leases(
+        self,
+    ) -> AsyncGenerator[dict[str, SessionLeaseHolder | None], None]: ...
+
+
+@runtime_checkable
 class SessionBackendHostSeenState(Protocol):
     """Optional selected-backend ownership of durable session seen state."""
 
@@ -582,6 +592,15 @@ class SessionBackendHostConfigRead(Protocol):
     """Optional selected-backend ownership of a stored session's configuration."""
 
     async def read_config(self, params: ConfigReadParams) -> ConfigReadResponse: ...
+
+
+@runtime_checkable
+class SessionBackendHostHistoryList(Protocol):
+    """Optional selected-backend paging of a stored session's history."""
+
+    async def list_history(
+        self, params: SessionHistoryListParams
+    ) -> SessionHistoryListResponse: ...
 
 
 @runtime_checkable

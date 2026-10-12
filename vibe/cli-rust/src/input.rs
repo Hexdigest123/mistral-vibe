@@ -8,13 +8,17 @@ use tokio::sync::mpsc;
 
 use crate::app::{App, Status};
 use crate::commands::{stress, submission};
+use crate::config_write::Scope;
+use crate::focus::Focus;
 use crate::mouse::{scroll_chat, KEY_SCROLL_STEP};
-use crate::server::{method, Client};
+use crate::quit_manager::QuitConfirmKey;
+use crate::server::Client;
 use crate::utils::input_edit;
 use crate::{
-    agents, chat_input, clipboard, completion_manager, config, connector_auth, feedback, keymap,
-    log_level_picker, mcp, mcp_oauth, message_queue, model_picker, paste_image, paste_path,
-    question_input, rewind, theme_picker, thinking_picker, turn_summary, voice,
+    agents, chat_input, clipboard, completion_manager, config, config_write, connector_auth,
+    feedback, keymap, log_level_picker, mcp, mcp_oauth, message_queue, model_picker, paste_files,
+    paste_image, paste_path, question_input, rewind, subagents, theme_picker, thinking_picker,
+    turn_summary, voice,
 };
 
 fn is_ctrl_c(key: &KeyEvent) -> bool {
@@ -45,14 +49,14 @@ pub fn request_suspend(_: &mut App, _: &KeyEvent) -> bool {
     false
 }
 
-/// Copy the selection: Ctrl+Y, Ctrl+Shift+C, or Command+C.
+/// Copy: Ctrl+Y on Unix, Ctrl+Shift+C or Command+C everywhere.
 fn is_copy_key(key: &KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let command = key.modifiers.contains(KeyModifiers::SUPER);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     (command && key.code == KeyCode::Char('c'))
         || (ctrl
-            && ((key.code == KeyCode::Char('y') && !shift)
+            && ((cfg!(unix) && key.code == KeyCode::Char('y') && !shift)
                 || (key.code == KeyCode::Char('c') && shift)))
 }
 
@@ -80,6 +84,7 @@ pub(crate) fn handle_copy_key(app: &mut App, key: &KeyEvent) -> bool {
             // Region and bottom-bar text are cached at paint time so the copy
             // works regardless of the autocopy setting.
             clipboard::copy_to_clipboard(&text);
+            crate::telemetry::user_copied_text(app, &text);
         }
     }
     true
@@ -97,15 +102,22 @@ fn is_todo_key(key: &KeyEvent) -> bool {
 /// Handle application-level bindings before a modal consumes local keys.
 pub fn handle_priority_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) -> Option<bool> {
     if key.code == KeyCode::BackTab {
-        if app.vibe_code_project.open {
+        if app.focus() == Focus::VibeCodeProject {
             return None;
         }
         agents::cycle(app, client);
         return Some(false);
     }
+    // The crash notice says "Press Ctrl+C to exit": nothing is left to copy, cancel or confirm.
+    if is_ctrl_c(&key) && app.server_closed {
+        return Some(true);
+    }
     if (is_ctrl_c(&key) || is_copy_key(&key))
         && crate::vibe_code_project::input::copy_selection(app, false)
     {
+        return Some(false);
+    }
+    if is_ctrl_c(&key) && crate::proxy_setup::copy_selection(app, false) {
         return Some(false);
     }
     if is_ctrl_c(&key) {
@@ -114,6 +126,11 @@ pub fn handle_priority_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) -
             return Some(false);
         }
         if stress::stop(app) {
+            return Some(false);
+        }
+        // Queue selection takes Ctrl+C to remove the highlighted prompt (ADR 0013).
+        if app.queue.selected.is_some() && !app.queue.editing && composer_reachable(app) {
+            message_queue::handle_selection_key(app, client, key);
             return Some(false);
         }
         app.chat_input.normalize_positions();
@@ -145,31 +162,25 @@ fn is_cut_key(key: &KeyEvent) -> bool {
 }
 
 fn copy_selected_input(app: &App) -> bool {
-    let Some(text) = chat_input::selected_text(
-        &app.chat_input.input,
-        app.chat_input.cursor,
-        app.chat_input.anchor,
-    ) else {
+    let input = &app.chat_input;
+    let Some((lo, hi)) = chat_input::selection_range(&input.input, input.cursor, input.anchor)
+    else {
         return false;
     };
+    // A collapsed paste copies as the text it stands for; pasted back, it collapses again.
+    let text = input.mentions.expanded_range(&input.input, lo, hi);
     clipboard::copy_to_clipboard(&text);
+    crate::telemetry::user_copied_text(app, &text);
     true
 }
 
 fn composer_owns_key(app: &App) -> bool {
-    !app.approval.open
-        && !app.question_app.open
-        && !app.config_screen.open
-        && !app.resume_picker.open
-        && !app.mcp.open
-        && !app.mcp_oauth.open
-        && !app.connector_auth.open
-        && !app.rewind.open
-        && !app.theme_picker.open
-        && !app.model_picker.open
-        && !app.log_level_picker.open
-        && !app.thinking_picker.open
-        && (app.queue.selected.is_none() || app.queue.editing)
+    app.focus() == Focus::Composer && (app.queue.selected.is_none() || app.queue.editing)
+}
+
+/// Whether the composer and its queue mode receive keys before any modal or view.
+pub(crate) fn composer_reachable(app: &App) -> bool {
+    app.focus() == Focus::Composer && app.subagents.viewed_subagent_id.is_none()
 }
 
 /// Handle one key press; true means the application should exit.
@@ -179,40 +190,53 @@ pub fn handle_key(
     config_tx: &mpsc::Sender<config::Loaded>,
     key: KeyEvent,
 ) -> bool {
+    let before = if composer_owns_key(app) && !app.recording_active() {
+        crate::composer_history::before_key(app, &key)
+    } else {
+        app.chat_input.edit_history.checkpoint();
+        None
+    };
+    let exit = handle_key_inner(app, client, config_tx, key);
+    crate::composer_history::finish(&mut app.chat_input, before);
+    exit
+}
+
+fn handle_key_inner(
+    app: &mut App,
+    client: &Arc<Client>,
+    config_tx: &mpsc::Sender<config::Loaded>,
+    key: KeyEvent,
+) -> bool {
     if let Some(exit) = handle_priority_key(app, client, key) {
         return exit;
     }
     app.chat_input.normalize_positions();
-    // The question app owns keys while the server waits for the user's answer,
-    // except the app-level priority bindings that scroll the transcript.
-    if app.question_app.open {
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    // The subagent list owns navigation and selection while focused (Python
+    // `SubagentList`); other keys fall through, and the unfocused composer
+    // never edits (Python's TextArea ignores keys without focus).
+    if app.subagents.list.focused {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let plain = key.modifiers.is_empty();
+        let list_key = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Enter
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        ) || (plain && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('k')));
         match key.code {
-            KeyCode::Up if shift => scroll_chat(app, true, KEY_SCROLL_STEP),
-            KeyCode::Down if shift => scroll_chat(app, false, KEY_SCROLL_STEP),
-            _ => question_input::handle_key(app, client, key),
+            _ if list_key => {
+                subagents::handle_list_key(app, key);
+                return false;
+            }
+            // App-level bindings still run while the list is focused.
+            KeyCode::Esc => {}
+            KeyCode::Char('o') if ctrl => {}
+            _ => return false,
         }
-        return false;
-    }
-    // The theme picker owns keys while open.
-    if app.theme_picker.open {
-        handle_theme_key(app, client, key);
-        return false;
-    }
-    // The model picker owns keys while open.
-    if app.model_picker.open {
-        handle_model_key(app, client, key);
-        return false;
-    }
-    // The log-level picker owns keys while open.
-    if app.log_level_picker.open {
-        handle_log_level_key(app, client, key);
-        return false;
-    }
-    // The thinking picker owns keys while open.
-    if app.thinking_picker.open {
-        handle_thinking_key(app, client, key);
-        return false;
     }
     // Reaching here the chat input owns the key (Textual `ChatTextArea._on_key`).
     app.chat_input.last_keystroke = Some(std::time::Instant::now());
@@ -253,24 +277,31 @@ pub fn handle_key(
         }
     }
     // Queue selection locks the input: navigation, removal, edit and escape are
-    // intercepted before any editing key (ADR 0013).
-    if app.queue.selected.is_some() && !app.queue.editing {
+    // intercepted before any editing key (ADR 0013), only where its hints show.
+    if app.queue.selected.is_some() && !app.queue.editing && composer_reachable(app) {
         message_queue::handle_selection_key(app, client, key);
         return false;
     }
     // Editing a queued prompt: only Escape is special, the rest edits the text.
-    if app.queue.editing && key.code == KeyCode::Esc {
+    if app.queue.editing && key.code == KeyCode::Esc && composer_reachable(app) {
         message_queue::end_edit(app);
+        return false;
+    }
+    if crate::external_editor::request(app, &key) {
         return false;
     }
     // Cut the chat input selection or current line; copy is an app-level priority binding.
     if is_cut_key(&key) {
         app.chat_input.scroll = None;
-        if let Some(text) = chat_input::cut(
-            &mut app.chat_input.input,
-            &mut app.chat_input.cursor,
-            &mut app.chat_input.anchor,
-        ) {
+        crate::long_paste::dismiss(app);
+        // Without a selection a cut takes the caret line, from its start.
+        let line_start = app.chat_input.line_cut_start();
+        let text = app
+            .chat_input
+            .edit_atomically(line_start, |input, cursor, anchor| {
+                chat_input::cut(input, cursor, anchor);
+            });
+        if !text.is_empty() {
             clipboard::copy_to_clipboard(&text);
             reset_history_state(app);
             completion_manager::input_changed(app);
@@ -281,31 +312,10 @@ pub fn handle_key(
         paste_image::request(app, true);
         return false;
     }
-    let mode = match key.code {
-        KeyCode::Char('!') => Some(crate::input_modes::InputMode::Bash),
-        KeyCode::Char('/') => Some(crate::input_modes::InputMode::Slash),
-        _ => None,
-    };
-    let modified = key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
-    if !modified
-        && app.chat_input.mode == crate::input_modes::InputMode::Prompt
-        && app.chat_input.input.is_empty()
-        && mode.is_some()
-    {
+    if app.chat_input.apply_mode_key(&key) {
+        app.chat_input.scroll = None;
+        crate::long_paste::dismiss(app);
         reset_history_state(app);
-        app.chat_input.mode = mode.unwrap_or_default();
-        completion_manager::input_changed(app);
-        return false;
-    }
-    if matches!(key.code, KeyCode::Backspace)
-        && app.chat_input.mode != crate::input_modes::InputMode::Prompt
-        && app.chat_input.input.is_empty()
-        && app.chat_input.cursor == 0
-    {
-        reset_history_state(app);
-        app.chat_input.mode = crate::input_modes::InputMode::Prompt;
         completion_manager::input_changed(app);
         return false;
     }
@@ -314,20 +324,40 @@ pub fn handle_key(
     // completion; a caret/selection move only marks the caret as moved.
     if let Some(action) = keymap::action_for(&key) {
         app.chat_input.scroll = None;
+        if matches!(action, chat_input::Action::Undo | chat_input::Action::Redo) {
+            crate::composer_history::restore(app, &action);
+            return false;
+        }
         let edit = action.is_edit();
         if edit {
             reset_history_state(app);
         }
-        chat_input::apply(
-            &action,
-            &mut app.chat_input.input,
-            &mut app.chat_input.cursor,
-            &mut app.chat_input.anchor,
-        );
+        let from = app.chat_input.cursor;
         if edit {
-            rewrite_image_paths(app);
+            crate::long_paste::dismiss(app);
+            // A line deletion starts at the start of the first line it takes.
+            let line_start = matches!(action, chat_input::Action::DeleteLine).then(|| {
+                let input = &app.chat_input;
+                let first = input
+                    .anchor
+                    .map_or(input.cursor, |anchor| anchor.min(input.cursor));
+                input_edit::line_bounds(&input.input, first).0
+            });
+            app.chat_input
+                .edit_atomically(line_start, |input, cursor, anchor| {
+                    chat_input::apply(&action, input, cursor, anchor);
+                });
+            // Raw-keystroke drops only get image mentions; mixed lists need a bracketed paste.
+            crate::composer_paths::rewrite_image_paths(&mut app.chat_input);
             completion_manager::input_changed(app);
         } else {
+            chat_input::apply(
+                &action,
+                &mut app.chat_input.input,
+                &mut app.chat_input.cursor,
+                &mut app.chat_input.anchor,
+            );
+            app.chat_input.snap_cursor(from);
             mark_cursor_moved(app);
             // Completion queries end at the caret, so a move re-filters the popup.
             completion_manager::refresh(app);
@@ -339,20 +369,28 @@ pub fn handle_key(
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
+        // Python `_try_interrupt` checks the subagent view first.
+        KeyCode::Esc if app.subagents.viewed_subagent_id.is_some() => {
+            app.overlays.last_escape = None;
+            subagents::show_main_chat(app, true);
+        }
         KeyCode::Esc if completion_manager::dismiss(app) => app.overlays.last_escape = None,
         KeyCode::Esc if app.session.shell_operation_id.is_some() => {
             crate::commands::shell::interrupt(app, client);
             app.overlays.last_escape = Some(std::time::Instant::now());
         }
+        KeyCode::Esc if crate::teleport::busy(app) => {
+            crate::teleport::interrupt(app, client);
+            app.overlays.last_escape = Some(std::time::Instant::now());
+        }
         // Only a docked panel owns Esc; a dropped column must not swallow the interrupt.
-        KeyCode::Esc if app.todo_sidebar.visible => app.todo_sidebar.open = false,
+        KeyCode::Esc if app.todo_sidebar.close() => {}
         // Escape while generating interrupts the turn (Python `_interrupt_turn`).
         KeyCode::Esc if matches!(app.session.status, Status::Generating { .. }) => {
             submission::interrupt_turn(app, client);
             app.overlays.last_escape = Some(std::time::Instant::now());
         }
-        // A summary request is in flight: cancel it, without arming the
-        // double-escape (Python `_try_interrupt_no_job_steps`).
+        // An active narrator stops without arming the double-escape (Python `_try_interrupt_no_job_steps`).
         KeyCode::Esc if turn_summary::cancel(app) => {}
         KeyCode::Esc => handle_escape(app, client),
         // Ctrl+O toggles every tool group and result body (Python `toggle_tool`).
@@ -371,8 +409,10 @@ pub fn handle_key(
             app.chat_input.scroll = None;
             let (target, moved_row) = crate::ui::chat_input::vertical_cursor(app, false);
             if !handle_history_up(app, !moved_row) {
+                let from = app.chat_input.cursor;
                 app.chat_input.cursor = target;
                 app.chat_input.anchor = None;
+                app.chat_input.snap_cursor(from);
                 mark_cursor_moved(app);
                 completion_manager::refresh(app);
             }
@@ -380,19 +420,28 @@ pub fn handle_key(
         KeyCode::Down => {
             app.chat_input.scroll = None;
             let (target, moved_row) = crate::ui::chat_input::vertical_cursor(app, true);
-            if !handle_history_down(app, !moved_row) {
+            let history = handle_history_down(app, !moved_row);
+            if !history {
+                // Python `NavigateBelow`: focus the subagent list at the Main
+                // row when the caret is on the last wrapped line.
+                if !moved_row && subagents::focus_first(app) {
+                    return false;
+                }
+                if !moved_row {
+                    app.set_app_focus(true);
+                }
+                let from = app.chat_input.cursor;
                 app.chat_input.cursor = target;
                 app.chat_input.anchor = None;
+                app.chat_input.snap_cursor(from);
                 mark_cursor_moved(app);
                 completion_manager::refresh(app);
             }
         }
-        KeyCode::Tab => {
-            completion_manager::accept(app);
-        }
-        // A file (`@`) completion accepts on Enter without submitting.
+        KeyCode::Tab => completion_manager::tab(app),
+        // A file (`@`) or skill (`/`) mention completion accepts on Enter without submitting.
         KeyCode::Enter
-            if completion_manager::active_is_file(app) && completion_manager::accept(app) => {}
+            if completion_manager::active_is_mention(app) && completion_manager::accept(app) => {}
         // A slash completion accepts the highlighted entry (completing e.g.
         // `/them` to `/theme`) and runs it in the same Enter, like Python's
         // SlashCommandController returning SUBMIT. With no popup open, accept is
@@ -441,13 +490,15 @@ fn handle_escape(app: &mut App, client: &Arc<Client>) {
 fn move_cursor_page(app: &mut App, down: bool) {
     app.chat_input.scroll = None;
     app.chat_input.anchor = None;
+    let from = app.chat_input.cursor;
     app.chat_input.cursor = crate::ui::chat_input::page_cursor(app, down);
+    app.chat_input.snap_cursor(from);
     mark_cursor_moved(app);
     completion_manager::refresh(app);
 }
 
 /// The `/theme` picker owns keys: arrows/jk preview, Enter selects, Esc reverts.
-fn handle_theme_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
+pub fn handle_theme_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             theme_picker::cancel(app);
@@ -476,13 +527,9 @@ fn select_theme(app: &mut App, client: &Arc<Client>) {
     let theme_tx = app.theme_picker.tx.clone();
     let pending = app.commit_started();
     tokio::spawn(async move {
-        let params = serde_json::json!({
-            "sessionId": session_id,
-            "ops": [{"op": "set", "path": "/theme", "value": theme, "targetLayer": null}],
-            "reason": "app-server config update",
-            "reloadRuntime": false,
-        });
-        let result = client.request(method::CONFIG_WRITE, params).await;
+        let ops = vec![config_write::set_op("/theme", theme)];
+        let result =
+            config_write::write(&client, &session_id, ops, "app-server config update").await;
         let applied = result.ok().and_then(|result| {
             result
                 .pointer("/runtime/config/theme")
@@ -518,15 +565,15 @@ pub fn handle_log_level_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) 
 
 pub fn handle_mcp_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     if mcp::search::handle_key(app, key) {
-        mcp::search_usage::record(app, client);
         return;
     }
     match key.code {
+        // Esc backs out one level: the tool list to the source list, then closes.
+        KeyCode::Esc if app.mcp.viewing_name.is_some() => mcp::back(app),
         KeyCode::Esc => mcp::close(app),
-        KeyCode::Backspace => mcp::back(app),
         KeyCode::Up | KeyCode::Char('k') => mcp::navigate(app, false),
         KeyCode::Down | KeyCode::Char('j') => mcp::navigate(app, true),
-        KeyCode::Enter => mcp::select(app, client),
+        KeyCode::Enter => mcp::select(app),
         KeyCode::Char('d') => mcp::set_disabled(app, client, true),
         KeyCode::Char('e') => mcp::set_disabled(app, client, false),
         KeyCode::Char('r') => mcp::refresh(app, client),
@@ -534,168 +581,58 @@ pub fn handle_mcp_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     }
 }
 
-/// The connector auth app owns keys while open (Python `ConnectorAuthApp.BINDINGS`
-/// plus its plain `OptionList`, which has no `j`/`k` navigation).
+/// The connector auth app owns keys while open (Python `ConnectorAuthApp.BINDINGS`).
 pub fn handle_connector_auth_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Backspace => connector_auth::close(app, client, false),
+        KeyCode::Esc => connector_auth::close(app, client, false),
         KeyCode::Char('r') | KeyCode::Char('R') => connector_auth::refresh(app, client),
-        KeyCode::Up => connector_auth::navigate(app, false),
-        KeyCode::Down => connector_auth::navigate(app, true),
+        KeyCode::Up | KeyCode::Char('k') => connector_auth::navigate(app, false),
+        KeyCode::Down | KeyCode::Char('j') => connector_auth::navigate(app, true),
         KeyCode::Enter => connector_auth::select(app),
         _ => {}
     }
 }
 
-/// The MCP OAuth app owns keys while open (Python `MCPOAuthApp.BINDINGS` plus
-/// its plain `OptionList`, which has no `j`/`k` navigation).
+/// The MCP OAuth app owns keys while open (Python `MCPOAuthApp.BINDINGS`).
 pub fn handle_mcp_oauth_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc | KeyCode::Backspace => mcp_oauth::close(app, client, false),
+        KeyCode::Esc => mcp_oauth::close(app, client),
         KeyCode::Char('r') | KeyCode::Char('R') => mcp_oauth::refresh(app, client),
-        KeyCode::Up => mcp_oauth::navigate(app, false),
-        KeyCode::Down => mcp_oauth::navigate(app, true),
+        KeyCode::Up | KeyCode::Char('k') => mcp_oauth::navigate(app, false),
+        KeyCode::Down | KeyCode::Char('j') => mcp_oauth::navigate(app, true),
         KeyCode::Enter => mcp_oauth::select(app),
         _ => {}
     }
 }
 
-/// The `/model` picker owns keys: arrows/jk navigate, Enter selects, Esc cancels.
+/// The `/model` picker owns keys: arrows/jk navigate, Enter saves to config,
+/// `s` keeps the pick for this session only, Esc cancels.
 /// Unlike the theme picker, navigation does not live-preview (Python `ModelPickerApp`).
-fn handle_model_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
+pub fn handle_model_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => model_picker::cancel(app),
         KeyCode::Up | KeyCode::Char('k') => model_picker::navigate(app, false),
         KeyCode::Down | KeyCode::Char('j') => model_picker::navigate(app, true),
-        KeyCode::Enter => select_model(app, client),
+        KeyCode::Enter => model_picker::select(app, client, Scope::Saved),
+        KeyCode::Char('s') => model_picker::select(app, client, Scope::Session),
         _ => {}
     }
 }
 
-/// Commit the highlighted model: close the picker and persist the alias (`""`
-/// for Default/unpinned) via `config/write`, mirroring Python's `_persist_model`.
-/// The written runtime comes back on the response, then a `config/reload` follows
-/// (Python `_reload_config`); both runtimes are applied on the main thread.
-fn select_model(app: &mut App, client: &Arc<Client>) {
-    let alias = model_picker::selected_alias(app);
-    app.model_picker.open = false;
-    let Some(session_id) = app.session.session_id.clone() else {
-        return;
-    };
-    let client = client.clone();
-    let model_tx = app.model_picker.tx.clone();
-    let pending = app.commit_started();
-    tokio::spawn(async move {
-        let params = serde_json::json!({
-            "sessionId": session_id.clone(),
-            "ops": [{"op": "set", "path": "/active_model", "value": alias, "targetLayer": null}],
-            "reason": "app-server config update",
-            "reloadRuntime": false,
-        });
-        let written = client.request(method::CONFIG_WRITE, params).await;
-        let reload = serde_json::json!({
-            "sessionId": session_id,
-            "reloadRuntime": true,
-        });
-        let reloaded = match written.is_ok() {
-            true => client.request(method::CONFIG_RELOAD, reload).await.ok(),
-            false => None,
-        };
-        // Only the final runtime reaches the UI: the written one is superseded
-        // before it could be seen, and one event keeps the commit's last paint
-        // and the idle marker in step.
-        let event = match (reloaded, written) {
-            (Some(runtime), _) => model_picker::Event::Reloaded(runtime),
-            (None, Ok(runtime)) => model_picker::Event::Written(runtime),
-            (None, Err(_)) => model_picker::Event::Failed,
-        };
-        deliver(model_tx, event, &pending).await;
-    });
-}
-
-/// The `/thinking` picker owns keys: arrows/jk navigate, Enter selects, Esc cancels.
-fn handle_thinking_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
+/// The `/thinking` picker owns keys: arrows/jk navigate, Enter commits to
+/// `enter_scope`, `s` keeps the level for this session only, Esc cancels.
+pub fn handle_thinking_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => thinking_picker::cancel(app),
         KeyCode::Up | KeyCode::Char('k') => thinking_picker::navigate(app, false),
         KeyCode::Down | KeyCode::Char('j') => thinking_picker::navigate(app, true),
-        KeyCode::Enter => select_thinking(app, client),
+        KeyCode::Enter => {
+            let scope = thinking_picker::enter_scope(app);
+            thinking_picker::select(app, client, scope);
+        }
+        KeyCode::Char('s') => thinking_picker::select(app, client, Scope::Session),
         _ => {}
     }
-}
-
-/// Commit the highlighted thinking level: close the picker and persist via
-/// `config/write` to `/models/<alias>/thinking`, then `config/reload`.
-fn select_thinking(app: &mut App, client: &Arc<Client>) {
-    let level = thinking_picker::selected_level(app).to_owned();
-    app.thinking_picker.open = false;
-    let Some(session_id) = app.session.session_id.clone() else {
-        return;
-    };
-    let alias = app.model_picker.current_model.clone();
-    if alias.is_empty() {
-        return;
-    }
-    let alias = escape_json_pointer(&alias);
-    let client = client.clone();
-    let thinking_tx = app.thinking_picker.tx.clone();
-    let pending = app.commit_started();
-    tokio::spawn(async move {
-        let path = format!("/models/{alias}/thinking");
-        let failure_prefix = format!("Failed to apply: thinking {level} — ");
-        let params = serde_json::json!({
-            "sessionId": session_id.clone(),
-            "ops": [{"op": "set", "path": path, "value": level, "targetLayer": null}],
-            "reason": "app-server thinking update",
-            "reloadRuntime": false,
-        });
-        let written = client.request(method::CONFIG_WRITE, params).await;
-        // Python raises on a rejected or failed mutation even though the RPC
-        // succeeds (`ConfigMutationResponse`), and `_run_settings_update`
-        // mounts the error; only a clean write is worth reloading.
-        let event = match written {
-            Err(error) => thinking_failed(&failure_prefix, &error.to_string()),
-            Ok(value) => match config_mutation_error(&value) {
-                Some(error) => thinking_failed(&failure_prefix, &error),
-                None => {
-                    let reload = serde_json::json!({
-                        "sessionId": session_id,
-                        "reloadRuntime": true,
-                    });
-                    match client.request(method::CONFIG_RELOAD, reload).await {
-                        Ok(runtime) => thinking_picker::Event::Reloaded(runtime),
-                        // Python's `_run_settings_update` wraps write + reload
-                        // in one try/except: a reload failure mounts the same
-                        // "Failed to apply" error as a write rejection.
-                        Err(error) => thinking_failed(&failure_prefix, &error.to_string()),
-                    }
-                }
-            },
-        };
-        deliver(thinking_tx, event, &pending).await;
-    });
-}
-
-/// Python `_run_settings_update`: a failed update mounts an `ErrorMessage`.
-fn thinking_failed(prefix: &str, error: &str) -> thinking_picker::Event {
-    thinking_picker::Event::Failed(format!("{prefix}{error}"))
-}
-
-/// Python raises `AppServerResponseError` on a rejected or failed config mutation.
-fn config_mutation_error(value: &serde_json::Value) -> Option<String> {
-    if value
-        .get("rejected")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Some("Invalid configuration edit".to_owned());
-    }
-    let failures: Vec<&str> = value
-        .get("failures")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
-        .unwrap_or_default();
-    (!failures.is_empty()).then(|| failures.join("; "))
 }
 
 /// Hand a commit's answer to the main thread, which releases the commit once it
@@ -746,8 +683,13 @@ fn handle_history_down(app: &mut App, on_last_row: bool) -> bool {
 }
 
 fn recall_previous(app: &mut App) {
-    let draft = app.chat_input.full_text();
+    let navigating = app.chat_input.history.is_navigating();
+    let draft = app.chat_input.submitted_text();
     if let Some(entry) = app.chat_input.history.get_previous(&draft) {
+        if !navigating {
+            let snapshot = crate::edit_history::Snapshot::capture(&app.chat_input);
+            app.chat_input.recall_draft = Some(snapshot);
+        }
         load_history_entry(app, entry);
     }
 }
@@ -755,7 +697,18 @@ fn recall_previous(app: &mut App) {
 fn recall_next(app: &mut App) {
     if let Some(entry) = app.chat_input.history.get_next() {
         let navigating = app.chat_input.history.is_navigating();
-        load_history_entry(app, entry);
+        // Leaving the recalled entries gives the draft back as it was; moving
+        // within them keeps it for later.
+        let draft = (!navigating)
+            .then(|| app.chat_input.recall_draft.take())
+            .flatten();
+        match draft {
+            Some(draft) => {
+                draft.restore(&mut app.chat_input);
+                park_after_load(app);
+            }
+            None => load_history_entry(app, entry),
+        }
         if !navigating {
             app.chat_input.cursor_pos_after_load = None;
             app.chat_input.cursor_moved_since_load = false;
@@ -766,8 +719,13 @@ fn recall_next(app: &mut App) {
 /// Load a recalled entry: place the caret at the end of its first line and record
 /// the loaded-entry state (Textual's `_load_history_entry`).
 fn load_history_entry(app: &mut App, entry: String) {
-    let entry = paste_path::rewrite_bare_image_paths_in_text(&entry);
-    app.chat_input.load_full_text(entry);
+    crate::long_paste::load_collapsed(app, entry);
+    crate::composer_paths::rewrite_image_paths(&mut app.chat_input);
+    park_after_load(app);
+}
+
+/// Park the caret at the end of the first line of text just loaded.
+fn park_after_load(app: &mut App) {
     let col = app
         .chat_input
         .input
@@ -793,20 +751,56 @@ fn mark_cursor_moved(app: &mut App) {
 /// Clear history navigation and the loaded-entry state after a text edit.
 pub(crate) fn reset_history_state(app: &mut App) {
     app.chat_input.history.reset_navigation();
+    app.chat_input.recall_draft = None;
     app.chat_input.cursor_pos_after_load = None;
     app.chat_input.cursor_moved_since_load = false;
 }
 
-/// Insert a bracketed paste at the cursor as a single edit, normalizing CRs. A
+/// Insert a bracketed paste at the cursor as one edit, normalizing CRs; a later
+/// existence probe may turn a pasted path list into mentions as a second edit. A
 /// paste replaces the active selection, like Textual.
 pub fn handle_paste(app: &mut App, text: String) {
+    if composer_hidden(app) {
+        return;
+    }
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    app.chat_input.normalize_positions();
+    let before = crate::edit_history::Snapshot::capture(&app.chat_input);
+    let probe = handle_paste_inner(app, &text);
+    app.chat_input
+        .record_edit(before, true, std::time::Instant::now());
+    if let Some((start, raw, candidates)) = probe {
+        paste_files::request_probe(app, start, raw, candidates);
+    }
+    if text.trim().is_empty() {
+        paste_image::request(app, false);
+    }
+}
+
+// Deliberate divergence from Python: the hidden composer takes no paste
+// while the list is focused or a child view is open.
+pub(crate) fn composer_hidden(app: &App) -> bool {
+    app.subagents.list.focused || app.subagents.viewed_subagent_id.is_some()
+}
+
+/// Insert `text`; returns the inserted path list's start, text and paths when
+/// only an existence probe can tell whether it becomes mentions.
+fn handle_paste_inner(app: &mut App, text: &str) -> Option<(usize, String, Vec<String>)> {
     app.chat_input.normalize_positions();
     app.chat_input.scroll = None;
     reset_history_state(app);
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    let probe_clipboard = text.trim().is_empty();
-    let rewritten = paste_path::maybe_prepend_at_for_image_path(&text);
-    let image_path = rewritten != text;
+    // Pasting a collapsed paste again shows it in full instead of adding a copy.
+    if crate::long_paste::expand(app, text) {
+        completion_manager::input_changed(app);
+        return None;
+    }
+    let names = app.chat_input.mode.names_images();
+    if let Some(paths) = paste_path::pasted_image_paths(text).filter(|_| names) {
+        paste_files::insert_images(app, &paths);
+        completion_manager::input_changed(app);
+        return None;
+    }
+    app.chat_input.widen_selection();
     if let Some((lo, hi)) = chat_input::selection_range(
         &app.chat_input.input,
         app.chat_input.cursor,
@@ -814,47 +808,63 @@ pub fn handle_paste(app: &mut App, text: String) {
     ) {
         app.chat_input.input.replace_range(lo..hi, "");
         app.chat_input.cursor = lo;
+        app.chat_input.sync_mentions_at(lo);
     }
     app.chat_input.anchor = None;
-    let text = match image_path {
-        true => paste_path::with_image_mention_boundaries(
-            &app.chat_input.input,
-            app.chat_input.cursor,
-            &rewritten,
-        ),
-        false => rewritten,
+    let text = app.chat_input.open_pasted_mode(text);
+    // A path list stays inline: the existence probe turns it into compact mentions.
+    let candidates = match app.chat_input.mode.names_images() {
+        true => paste_path::path_candidates(text),
+        false => Vec::new(),
     };
-    input_edit::insert(&mut app.chat_input.input, &mut app.chat_input.cursor, &text);
-    rewrite_image_paths(app);
+    if candidates.is_empty() && crate::long_paste::is_long(text) {
+        crate::long_paste::insert_collapsed(app, text);
+        completion_manager::input_changed(app);
+        return None;
+    }
+    let start = app.chat_input.cursor;
+    input_edit::insert(&mut app.chat_input.input, &mut app.chat_input.cursor, text);
+    app.chat_input.sync_mentions_at(start);
+    let input = &app.chat_input.input;
+    let (prefix, suffix) = (
+        input[..start].to_owned(),
+        input[app.chat_input.cursor..].to_owned(),
+    );
+    crate::composer_paths::rewrite_image_paths(&mut app.chat_input);
     completion_manager::input_changed(app);
-    if probe_clipboard {
-        paste_image::request(app, false);
-    }
-}
-
-fn rewrite_image_paths(app: &mut App) {
-    let rewritten = paste_path::rewrite_bare_image_paths_in_text(&app.chat_input.input);
-    if rewritten == app.chat_input.input {
-        return;
-    }
-    app.chat_input.input = rewritten;
-    app.chat_input.cursor = app.chat_input.input.len();
-    app.chat_input.anchor = None;
+    let input = &app.chat_input.input;
+    let kept = input.len() >= prefix.len() + suffix.len()
+        && input.starts_with(&prefix)
+        && input.ends_with(&suffix);
+    (kept && !candidates.is_empty()).then(|| {
+        let raw = input[start..input.len() - suffix.len()].to_owned();
+        (start, raw, candidates)
+    })
 }
 
 /// Ctrl+C ladder (Python `action_interrupt_or_quit`); returns true to exit.
 fn handle_ctrl_c(app: &mut App, client: &Arc<Client>) -> bool {
+    // Python checks the subagent view before touching the input or the queue.
+    if let Some(viewed) = app.subagents.viewed_subagent_id.clone() {
+        if app.quit.is_confirmed(QuitConfirmKey::CtrlC) {
+            return true;
+        }
+        // Python appends a read-only error message instead of quitting.
+        subagents::append_read_only_message(app, &viewed);
+        request_quit_confirmation(app, QuitConfirmKey::CtrlC);
+        return false;
+    }
     if !app.chat_input.full_text().is_empty() {
         app.chat_input.clear();
         reset_history_state(app);
         completion_manager::input_changed(app);
-        app.overlays.quit_pending = None;
+        app.quit.cancel_confirmation();
         return false;
     }
-    if app.quit_confirm_active() {
+    if app.quit.is_confirmed(QuitConfirmKey::CtrlC) {
         return true;
     }
-    if (app.vibe_code_project.open || app.vibe_code_project.pending) && !app.server_closed {
+    if app.vibe_code_project.open || app.vibe_code_project.pending {
         crate::vibe_code_project::input::handle_key(
             app,
             client,
@@ -862,8 +872,17 @@ fn handle_ctrl_c(app: &mut App, client: &Arc<Client>) -> bool {
         );
         return false;
     }
-    // A summary request is in flight: cancel it (Python's ladder runs the
-    // narrator step before touching the queue).
+    // Python `_try_interrupt_bottom_app_escape`: reject the approval or cancel the question.
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    if app.approval.open {
+        crate::approval::handle_key(app, client, esc);
+        return false;
+    }
+    if app.question_app.open {
+        question_input::handle_key(app, client, esc);
+        return false;
+    }
+    // An active narrator stops first; Python's ladder runs it before the queue step.
     if turn_summary::cancel(app) {
         return false;
     }
@@ -871,36 +890,48 @@ fn handle_ctrl_c(app: &mut App, client: &Arc<Client>) -> bool {
     if message_queue::pop_last(app, client) {
         return false;
     }
+    // Running jobs the loading hint offers to interrupt (Python `_try_interrupt_running_job`).
     if app.session.shell_operation_id.is_some() {
         crate::commands::shell::interrupt(app, client);
         return false;
     }
-    app.overlays.quit_pending = Some(std::time::Instant::now());
+    if crate::teleport::busy(app) {
+        crate::teleport::interrupt(app, client);
+        return false;
+    }
+    if matches!(app.session.status, Status::Generating { .. }) {
+        submission::interrupt_turn(app, client);
+        return false;
+    }
+    request_quit_confirmation(app, QuitConfirmKey::CtrlC);
     false
 }
 
-/// Ctrl+D (Python `action_delete_right_or_quit`); returns true to exit. With text
-/// it deletes the char under the cursor; on empty input it arms/confirms quit.
+/// Ctrl+D (Python `action_delete_right_or_quit`); returns true to exit. Deletes right
+/// in the main-view input, else quits (on a second press if confirmation is on).
 fn handle_ctrl_d(app: &mut App) -> bool {
-    if !app.chat_input.full_text().is_empty() {
+    if app.subagents.viewed_subagent_id.is_none() && !app.chat_input.full_text().is_empty() {
+        app.chat_input.normalize_positions();
+        let before = crate::edit_history::Snapshot::capture(&app.chat_input);
         reset_history_state(app);
-        chat_input::apply(
-            &chat_input::Action::DeleteRight,
-            &mut app.chat_input.input,
-            &mut app.chat_input.cursor,
-            &mut app.chat_input.anchor,
-        );
+        crate::long_paste::dismiss(app);
+        app.chat_input
+            .edit_atomically(None, |input, cursor, anchor| {
+                chat_input::apply(&chat_input::Action::DeleteRight, input, cursor, anchor);
+            });
+        app.chat_input
+            .record_edit(before, false, std::time::Instant::now());
         completion_manager::input_changed(app);
         return false;
     }
-    if app.quit_confirm_active() {
+    if !app.quit.ask_confirmation_on_exit || app.quit.is_confirmed(QuitConfirmKey::CtrlD) {
         return true;
     }
-    app.overlays.quit_pending = Some(std::time::Instant::now());
+    request_quit_confirmation(app, QuitConfirmKey::CtrlD);
     false
 }
 
-/// Escape a JSON pointer token (Python `_escape_json_pointer_token`).
-fn escape_json_pointer(value: &str) -> String {
-    value.replace('~', "~0").replace('/', "~1")
+fn request_quit_confirmation(app: &mut App, key: QuitConfirmKey) {
+    let queued = app.queue.len();
+    app.quit.request_confirmation(key, queued);
 }

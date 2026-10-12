@@ -19,6 +19,7 @@ from mistralai_vibe_local_harness.protocol import (
     RustContentBlock,
     RustEvent,
     RustExternalToolCall,
+    RustFailTurnEvent,
     RustFilesystemAction,
     RustFilesystemFailedEvent,
     RustFilesystemSucceededEvent,
@@ -78,6 +79,14 @@ from mistralai_vibe_local_harness.vibe._runtime_config import (
     ProviderRetry,
     ToolApprovalMode,
 )
+from mistralai_vibe_local_harness.vibe._sandbox import (
+    SANDBOX_UNAVAILABLE_CODE,
+    SandboxUnavailableError,
+)
+from mistralai_vibe_local_harness.vibe._saved_outputs import (
+    SavedOutputs,
+    build_saved_outputs,
+)
 from mistralai_vibe_local_harness.vibe._self_tools import execute_self_tool
 from mistralai_vibe_local_harness.vibe._shell_tools import execute_shell_tool
 from mistralai_vibe_local_harness.vibe._skill_tools import execute_skill_tool
@@ -90,6 +99,7 @@ from mistralai_vibe_local_harness.vibe._smart_approve import (
     RiskClassificationResult,
     build_classification_request,
     classify_tool_call,
+    project_checkouts,
 )
 
 logger = logging.getLogger(__name__)
@@ -172,6 +182,11 @@ class HookContext:
     config: LocalRuntimeAdapterConfig
     messages: tuple[RustMessage, ...]
     session_id: str = ""
+    # The session's storage root, published to foreign hooks as ``transcript_path``:
+    # the harness keeps a durable journal under it, which is what transcript-reading
+    # and audit hooks key off on the legacy runtime.
+    session_root: Path | None = None
+    parent_session_id: str | None = None
     request_approval: HookApprovalCallback | None = None
     emit_hook_notice: HookNoticeEmitter | None = None
     record_approval_note: ApprovalNoteRecorder | None = None
@@ -231,6 +246,13 @@ _DENY_AND_CONTINUE = "deny_and_continue"
 _ESCALATED_APPROVED = "escalated_approved"
 _ESCALATED_DENIED = "escalated_denied"
 _ESCALATED_HEADLESS_DENIED = "escalated_headless_denied"
+# Process calls that only observe or revoke processes this session started
+# under the ``process.start`` gate; the Host's resolver clears them by policy.
+_PROCESS_UNGATED_BUILTINS = frozenset({
+    "process.output",
+    "process.list",
+    "process.stop",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +358,7 @@ def build_local_action_executor(  # noqa: PLR0913 - explicit executor dependenci
     filesystem_root: Path | None = None,
     hook_handlers: HookHandlers | None = None,
     session_id: str = "",
+    parent_session_id: str | None = None,
     notice_sink: PublicHistoryEntrySink | None = None,
     foreign_binding_ids: frozenset[str] = frozenset(),
     classifier_factory: ClassifierFactory | None = None,
@@ -349,6 +372,7 @@ def build_local_action_executor(  # noqa: PLR0913 - explicit executor dependenci
         hook_handlers or HookHandlers(),
         session_id,
         filesystem_root=filesystem_root,
+        parent_session_id=parent_session_id,
         foreign_binding_ids=foreign_binding_ids,
         classifier_factory=classifier_factory,
         classify_model=classify_model,
@@ -360,7 +384,7 @@ def build_local_action_executor(  # noqa: PLR0913 - explicit executor dependenci
 
 
 class _LocalActionState:
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit executor dependencies
         self,
         config: LocalRuntimeAdapterConfig,
         request_approval: ApprovalRequester | None,
@@ -369,6 +393,7 @@ class _LocalActionState:
         session_id: str = "",
         *,
         filesystem_root: Path | None = None,
+        parent_session_id: str | None = None,
         foreign_binding_ids: frozenset[str] = frozenset(),
         classifier_factory: ClassifierFactory | None = None,
         classify_model: str = DEFAULT_SMART_APPROVE_MODEL,
@@ -384,14 +409,18 @@ class _LocalActionState:
         )
         self._hook_handlers = hook_handlers
         self._session_id = session_id
+        self._parent_session_id = parent_session_id
         self._filesystem_root = (
             filesystem_root.expanduser().resolve()
             if filesystem_root is not None
             else None
         )
-        # The path a file call was cleared for by the permission resolver (main's
-        # out-of-workspace grant handoff); set during gating, read by the file tool.
-        self._resolved_authorized_path: Path | None = None
+        self._saved_outputs = self._build_saved_outputs(config)
+        # The path each file call was cleared for by the permission resolver
+        # (main's out-of-workspace grant handoff), keyed by action id: actions
+        # gate and run as concurrent tasks, so one shared slot would let one
+        # gate erase what another had already been approved for.
+        self._resolved_authorized_paths: dict[str, Path] = {}
         self._foreign_binding_ids = foreign_binding_ids
         self._notice_sink: PublicHistoryEntrySink | None = None
         self._messages: list[RustMessage] = []
@@ -430,9 +459,46 @@ class _LocalActionState:
             Callable[[str, ProviderRetry | None], Awaitable[None]] | None
         ) = None
         self._delta_sink: CompletionDeltaSink | None = None
+        self._project_roots_for: tuple[Path, ...] | None = None
+        self._project_roots: list[str] = []
+        self._refresh_project_roots()
 
     def configure(self, config: LocalRuntimeAdapterConfig) -> None:
+        if config.sandbox is not self._config.sandbox:
+            self._saved_outputs = self._build_saved_outputs(config)
         self._config = config
+        self._refresh_project_roots()
+
+    def _refresh_project_roots(self) -> None:
+        """Decide which writable roots are checkouts, once per set of roots.
+
+        Smart approve shows a checkout to the classifier by name instead of by
+        location. Deciding it here rather than on every call means the agent
+        cannot turn a writable directory into a checkout by creating ``.git`` in
+        it. The roots change when a session moves to a new workspace, so the
+        decision is taken again then, and only then.
+        """
+        roots = self._writable_roots()
+        if roots == self._project_roots_for:
+            return
+        self._project_roots_for = roots
+        self._project_roots = project_checkouts([str(root) for root in roots])
+
+    def _build_saved_outputs(self, config: LocalRuntimeAdapterConfig) -> SavedOutputs:
+        return build_saved_outputs(
+            config.sandbox,
+            records=lambda: self._tool_results_root,
+            session_id=self._session_id,
+        )
+
+    @property
+    def _workspace_root(self) -> Path:
+        return self._filesystem_root or self._config.workspace.cwd
+
+    @property
+    def _tool_results_root(self) -> Path:
+        """Where the Session records the outputs the Harness Core saves."""
+        return (self._workspace_root / "tool-results").resolve()
 
     def bind_approval_requester(self, request_approval: ApprovalRequester) -> None:
         self._request_approval = request_approval
@@ -450,6 +516,18 @@ class _LocalActionState:
                 exc_info=True,
             )
             return ALWAYS_ASK
+
+    async def gate_process_call(
+        self, action: RustRuntimeBuiltinToolCallAction
+    ) -> RustEvent | None:
+        """Gate one process call exactly as ``execute`` gates other builtins.
+
+        The Runtime dispatches process actions on its own durable path, so they
+        never reach ``execute``; this is that same gate for this path.
+        """
+        return await self._gate_tool_call(
+            action, self._config.tool_modes.get(action.call.name, "allow")
+        )
 
     def bind_notice_sink(self, sink: PublicHistoryEntrySink) -> None:
         self._notice_sink = sink
@@ -503,7 +581,25 @@ class _LocalActionState:
             approval = approval.get(call.tool_name)
         return approval or self._config.provided_tool_mode
 
-    async def execute(self, action: RustAction) -> RustEvent:  # noqa: PLR0911 - one return per action kind
+    async def execute(self, action: RustAction) -> RustEvent:
+        try:
+            return await self._execute(action)
+        except SandboxUnavailableError as error:
+            # Reported to the model, a lost sandbox would only be retried.
+            if isinstance(action, RustLLMCallAction):
+                raise
+            return RustFailTurnEvent(
+                action_id=action.action_id,
+                expected_turn_id=action.turn_id,
+                error=RustProtocolError(
+                    code=SANDBOX_UNAVAILABLE_CODE,
+                    message=str(error),
+                    retryable=False,
+                    details=None,
+                ),
+            )
+
+    async def _execute(self, action: RustAction) -> RustEvent:  # noqa: PLR0911 - one return per action kind
         if isinstance(action, RustLLMCallAction):
             self._apply_model_input(action)
             return await execute_completion(
@@ -538,10 +634,7 @@ class _LocalActionState:
                 "file_system.search_replace",
             }:
                 additional_read_roots = (
-                    (
-                        self._filesystem_root / "attachments",
-                        self._filesystem_root / "tool-results",
-                    )
+                    (self._filesystem_root / "attachments",)
                     if self._filesystem_root is not None
                     else ()
                 )
@@ -550,7 +643,10 @@ class _LocalActionState:
                         action,
                         self._config,
                         additional_read_roots=additional_read_roots,
-                        authorized_path=self._resolved_authorized_path,
+                        workspace_read_roots=self._saved_outputs.read_roots,
+                        authorized_path=self._resolved_authorized_paths.pop(
+                            action.action_id, None
+                        ),
                     ),
                     action.action_id,
                 )
@@ -581,24 +677,29 @@ class _LocalActionState:
             relative_path = Path(action.operation.workspace_path)
             if relative_path.is_absolute():
                 raise ValueError("filesystem write path must be relative")
-            workspace = self._filesystem_root or self._config.cwd.expanduser().resolve()
+            workspace = self._workspace_root
             destination = (workspace / relative_path).resolve()
             if not destination.is_relative_to(workspace):
                 raise ValueError("filesystem write path resolves outside the workspace")
             # Filesystem actions can be restored from durable state. Keep a
             # malformed action away from checkpoints and other session metadata.
-            tool_results_root = (workspace / "tool-results").resolve()
-            if not destination.is_relative_to(tool_results_root):
+            if not destination.is_relative_to(self._tool_results_root):
                 raise ValueError(
                     "filesystem write path must resolve under tool-results"
                 )
+            # The record stays with the Session, and an export copies it.
             await asyncio.to_thread(
                 _replace_text_file, destination, action.operation.content
             )
+            model_path = await self._saved_outputs.publish(
+                destination, action.operation.content
+            )
             return RustFilesystemSucceededEvent(
                 action_id=action.action_id,
-                result=RustFilesystemWriteResult(model_path=str(destination)),
+                result=RustFilesystemWriteResult(model_path=model_path),
             )
+        except SandboxUnavailableError:
+            raise
         except Exception as error:
             return RustFilesystemFailedEvent(
                 action_id=action.action_id,
@@ -730,6 +831,8 @@ class _LocalActionState:
                     context,
                 )
                 tool_result = result.output.tool_result
+        except SandboxUnavailableError:
+            raise
         except Exception as error:
             return _hook_pipeline_failed(action, error)
         else:
@@ -841,6 +944,8 @@ class _LocalActionState:
             config=self._config,
             messages=tuple(self._messages),
             session_id=self._session_id,
+            session_root=self._filesystem_root,
+            parent_session_id=self._parent_session_id,
             emit_hook_notice=self._emit_notice,
         )
 
@@ -854,6 +959,8 @@ class _LocalActionState:
             config=self._config,
             messages=tuple(self._messages),
             session_id=self._session_id,
+            session_root=self._filesystem_root,
+            parent_session_id=self._parent_session_id,
             request_approval=request_approval,
             emit_hook_notice=self._emit_notice,
             record_approval_note=self._record_approval_note,
@@ -875,8 +982,14 @@ class _LocalActionState:
         disagree. This string is the trusted evidence that makes a workspace delete
         auto-approvable, so it has to name the directory the write will actually land in.
         """
-        roots = self._config.workspace_roots or (self._config.cwd,)
-        return tuple(root.expanduser().resolve() for root in roots)
+        workspace = self._config.workspace
+        match workspace.path_space:
+            case "host":
+                return tuple(root.expanduser().resolve() for root in workspace.roots)
+            case "sandbox":
+                # Already canonical, and resolving them against this host's file
+                # system would follow the host's links instead.
+                return workspace.roots
 
     def _with_approval_note(self, event: RustEvent, action_id: str) -> RustEvent:
         """Ride a recorded approval note out on the tool's result ``_meta``.
@@ -945,17 +1058,21 @@ class _LocalActionState:
         resolver (the Vibe rules: .env prompt, denylists, allowlist grants), which
         can lower it to allow/deny before the human is ever asked.
         """
-        self._resolved_authorized_path = None
+        self._resolved_authorized_paths.pop(action.action_id, None)
         if mode == "ask" and self._config.bypass_approval:
             mode = "allow"
         outcome: PermissionOutcome | None = None
         if mode == "ask":
             outcome = await self._resolve_permission(action)
-            self._resolved_authorized_path = outcome.authorized_path
+            if outcome.authorized_path is not None:
+                self._resolved_authorized_paths[action.action_id] = (
+                    outcome.authorized_path
+                )
             mode = outcome.decision
         match mode:
             case "deny":
                 self._record_approval_meta(action.action_id, "skip", "never", "never")
+                self._resolved_authorized_paths.pop(action.action_id, None)
                 return _failed_tool_action(
                     action,
                     code="tool_denied",
@@ -964,6 +1081,7 @@ class _LocalActionState:
                 )
             case "ask":
                 if self._request_approval is None:
+                    self._resolved_authorized_paths.pop(action.action_id, None)
                     return _failed_tool_action(
                         action,
                         code="approval_required",
@@ -975,6 +1093,7 @@ class _LocalActionState:
                 ).approved
                 if not approved:
                     self._record_approval_meta(action.action_id, "skip", "ask", "user")
+                    self._resolved_authorized_paths.pop(action.action_id, None)
                     return _failed_tool_action(
                         action,
                         code="tool_denied",
@@ -1020,9 +1139,11 @@ class _LocalActionState:
         # gated call. Account for that when defining the metric.
         required: tuple[JsonObject, ...] = ()
         outcome = await self._resolve_permission(action)
-        self._resolved_authorized_path = outcome.authorized_path
+        if outcome.authorized_path is not None:
+            self._resolved_authorized_paths[action.action_id] = outcome.authorized_path
         if outcome.decision == "deny":
             self._record_approval_meta(action.action_id, "skip", "never", "never")
+            self._resolved_authorized_paths.pop(action.action_id, None)
             return _failed_tool_action(
                 action,
                 code="tool_denied",
@@ -1030,9 +1151,16 @@ class _LocalActionState:
             )
         if outcome.decision == "allow":
             self._record_approval_meta(action.action_id, "execute", "always", "smart")
-            self._smart_proceed(
-                action.action_id, "Auto-approved: allowed by your permission rules"
-            )
+            # A process read or stop is cleared by policy, not by anything
+            # the user granted, so it carries no approval note -- one per
+            # poll while tailing a process would be pure spam -- and it must
+            # not reset the deny streak the escalation below counts on: a
+            # call that guards nothing should not interrupt the streak of
+            # calls that do.
+            if gated_tool_name(action) not in _PROCESS_UNGATED_BUILTINS:
+                self._smart_proceed(
+                    action.action_id, "Auto-approved: allowed by your permission rules"
+                )
             return None
         required = outcome.required_permissions
 
@@ -1041,6 +1169,7 @@ class _LocalActionState:
             action.call,
             tuple(self._messages),
             writable_roots=[str(root) for root in self._writable_roots()],
+            project_roots=self._project_roots,
         )
         # Exact: it scopes what a human's session grant covers.
         key = (request.tool_name, request.args_hash())
@@ -1065,7 +1194,8 @@ class _LocalActionState:
             request,
             config=self._config,
             classifier_factory=self._classifier_factory,
-            classify_model=self._classify_model,
+            # Live config, so a mid-session selection change applies.
+            classify_model=self._config.classifier_model or self._classify_model,
         )
         # A path that decides what runs later is never auto-approved, whatever the
         # classifier says: writing one turns a single approved call into arbitrary
@@ -1105,6 +1235,7 @@ class _LocalActionState:
             return await self._smart_escalate(action, key, reason, result, required)
         self._record_approval_meta(action.action_id, "skip", "never", "smart")
         self._emit_result(action, request.tool_name, result, _DENY_AND_CONTINUE)
+        self._resolved_authorized_paths.pop(action.action_id, None)
         return _failed_tool_action(
             action,
             code="tool_denied",
@@ -1223,11 +1354,13 @@ class _LocalActionState:
         if self._request_approval is None:
             self._record_approval_meta(action.action_id, "skip", "ask", "user")
             self._emit_result(action, tool_name, result, _ESCALATED_HEADLESS_DENIED)
+            self._resolved_authorized_paths.pop(action.action_id, None)
             return _failed_tool_action(action, code="tool_denied", message=reason)
         grant = await self._request_approval(action, reason, required)
         if not grant.approved:
             self._record_approval_meta(action.action_id, "skip", "ask", "user")
             self._emit_result(action, tool_name, result, _ESCALATED_DENIED, grant)
+            self._resolved_authorized_paths.pop(action.action_id, None)
             return _failed_tool_action(action, code="tool_denied", message=reason)
         if grant.remembered:
             if isinstance(action, RustRuntimeBuiltinToolCallAction):
