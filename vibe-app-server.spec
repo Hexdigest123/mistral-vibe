@@ -44,6 +44,10 @@ datas += [("vibe/core/tools/builtins/*.py", "vibe/core/tools/builtins")]
 datas += collect_data_files(
     "vibe.core.skills.builtins", includes=["*.py"], include_py_files=True
 )
+# Built-in plugins (plugin.json, skills/*/SKILL.md) are discovered from the
+# package directory at runtime; without them startup reports a missing
+# vibe/plugins/builtins directory.
+datas += collect_data_files("vibe.plugins.builtins")
 datas += _harness_datas
 
 a = Analysis(

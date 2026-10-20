@@ -35,6 +35,8 @@ datas = [
     ('vibe/setup/*', 'vibe/setup'),
     # This is necessary because tools are dynamically called in vibe, meaning there is no static reference to those files
     ('vibe/core/tools/builtins/*.py', 'vibe/core/tools/builtins'),
+    # Built-in plugins are discovered from the package directory at runtime
+    ('vibe/plugins/builtins/vibe', 'vibe/plugins/builtins/vibe'),
 ] + harness_deps[0]
 
 a = Analysis(

@@ -79,7 +79,9 @@ install:        ## Install the last standalone build as ~/.local/bin/vibes
 	mkdir -p "$(LOCAL_BUNDLE_DIR)" "$(LOCAL_BIN_DIR)"
 	rm -rf "$(LOCAL_BUNDLE_DIR)/$(notdir $(DIST_DIR))" "$(LOCAL_BUNDLE_DIR)/vibe-dir"
 	cp -R $(DIST_DIR) "$(LOCAL_BUNDLE_DIR)/$(notdir $(DIST_DIR))"
-	cp $(BIN) "$(LOCAL_BUNDLE_DIR)/vibe-rs"
+	# Copy then rename: overwriting a running vibe-rs fails with "Text file busy".
+	cp $(BIN) "$(LOCAL_BUNDLE_DIR)/vibe-rs.new"
+	mv -f "$(LOCAL_BUNDLE_DIR)/vibe-rs.new" "$(LOCAL_BUNDLE_DIR)/vibe-rs"
 	printf '#!/bin/sh\nunset VIBE_APP_SERVER_CMD VIBE_APP_SERVER_CWD\nVIBE_APP_SERVER_BIN="%s" exec "%s" %s "$$@"\n' \
 		"$(LOCAL_BUNDLE_DIR)/$(notdir $(DIST_DIR))/vibe-app-server" "$(LOCAL_BUNDLE_DIR)/vibe-rs" "$(VIBES_WRAPPER_ARGS)" > "$(LOCAL_BIN_DIR)/vibes"
 	chmod +x "$(LOCAL_BIN_DIR)/vibes"
