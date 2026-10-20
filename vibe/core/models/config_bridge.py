@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from vibe.core.config.layers.model_catalog import ModelCatalogLayer
+from vibe.core.config.layers.provider_models import ProviderModelsLayer
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.config.vibe_schema import VibeConfigSchema
 from vibe.core.models.catalog import ModelCatalogResult
@@ -68,12 +68,12 @@ async def user_declared_model_aliases(
 
 def _catalog_layer(
     orchestrator: ConfigOrchestrator[VibeConfigSchema],
-) -> ModelCatalogLayer | None:
+) -> ProviderModelsLayer | None:
     try:
-        layer = orchestrator.get_layer(ModelCatalogLayer.NAME)
+        layer = orchestrator.get_layer(ProviderModelsLayer.NAME)
     except KeyError:
         return None
-    return layer if isinstance(layer, ModelCatalogLayer) else None
+    return layer if isinstance(layer, ProviderModelsLayer) else None
 
 
 def discover_only_provider_names(config: VibeConfigSchema) -> set[str]:

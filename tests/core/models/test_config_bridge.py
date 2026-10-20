@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from vibe.core.config.default_orchestrator import build_default_orchestrator
-from vibe.core.config.layers.model_catalog import ModelCatalogLayer
+from vibe.core.config.layers.provider_models import ProviderModelsLayer
 from vibe.core.models import refresh_models, user_declared_model_aliases
 
 OPENROUTER_PROVIDER = {"name": "openrouter", "api_base": "https://openrouter.ai/api/v1"}
@@ -162,8 +162,8 @@ async def test_catalog_layer_merge_user_model_wins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     orchestrator = await _orchestrator_with_user_model(monkeypatch)
-    layer = orchestrator.get_layer(ModelCatalogLayer.NAME)
-    assert isinstance(layer, ModelCatalogLayer)
+    layer = orchestrator.get_layer(ProviderModelsLayer.NAME)
+    assert isinstance(layer, ProviderModelsLayer)
     # Same alias as the user's [[model]] entry: the durable layer must win.
     layer.set_models({"gpt-4o": {"provider": "openrouter", "name": "discovered-id"}})
     await orchestrator.reload()
