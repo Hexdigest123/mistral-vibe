@@ -280,6 +280,7 @@ Rust binary (`vibe-rs`) bundled with the package.
 
 - **Copy**: Use `Ctrl+Y` or `Ctrl+Shift+C` to copy the current selection to clipboard. With autocopy enabled (default via `autocopy_to_clipboard = true`), mouse selection automatically copies on release and shows a brief confirmation.
 - **Multi-click selection**: Double-click selects a word, triple-click selects the paragraph. Dragging extends the selection at the same granularity. Clicking a collapsible transcript entry (tool group, tool call, reasoning) toggles it on every click; drag to select its text.
+- **Pasting images on Linux**: `Ctrl+V` or `/paste-image` attaches the clipboard image (PNG, JPEG, WebP or GIF) or the image files a file manager copied, read through `wl-paste` (Wayland) or `xclip` (X11), else straight from the X11 or Wayland clipboard when neither tool is installed.
 - **Linux clipboard**: In a local Linux session, Vibe copies through `wl-copy`, `xclip`, or `xsel`. If pasting fails, install `xclip` (or `wl-clipboard`), or hold Shift while selecting to use your terminal's native selection. Over SSH, Vibe relies on OSC 52 alone, so your terminal must support it.
 
 You can start Vibe with a prompt using the following command:
@@ -683,24 +684,68 @@ fuzzy search bar, then Up again to wrap to the last item.
 
 #### Model Auto-Discovery
 
-When your `config.toml` declares a `[[model]]` block, Vibe auto-discovers the
-provider's models: it fetches the OpenAI-compatible `/models` endpoint of the
-provider that model references (for example
-`https://openrouter.ai/api/v1/models` for an OpenRouter provider) and merges the
-listed model ids into the model picker. The lists are persisted to
-`~/.vibe/discovered_models_cache.json` and loaded from disk at startup, so no
-network request blocks the session; a fresh fetch runs in the background once
-per session, and the app-server `models/refresh` method re-runs it on demand.
-Explicit `[[model]]` entries and Mistral's curated model catalog
-(`experimental_enable_model_catalog`) always win over discovered ids, and
-discovery never runs without a declared `[[model]]` block. A provider flagged
-`discover_only = true` is also a discovery target: its models are fetched even
-when no `[[model]]` block names it, so standalone providers need no hand-written
-model entries.
+Flag a provider `discover = true` and Vibe lists every model its `/models`
+endpoint offers in `/model` (and in the `/config` `active_model` choices):
 
-With large discovered catalogs, search the `/model` picker: press `/` and type to
-filter by model name, alias or provider, best matches first; `↑↓` and `Enter`
-keep working while typing, and `Esc` leaves the search, then clears it.
+```toml
+[[providers]]
+name = "openrouter"
+api_base = "https://openrouter.ai/api/v1"
+api_key_env_var = "OPENROUTER_API_KEY"
+discover = true
+```
+
+The key is `[[providers]]`, plural, like `[[models]]`; a `[[providers]]` entry
+replaces the built-in provider of the same name, so give it its full settings.
+Discovery reads the metadata Mistral, OpenRouter and Anthropic endpoints send
+(display name, image input, context window) and leaves out models the endpoint
+marks as unable to chat with tools (embeddings, OCR, moderation). OpenAI-style
+endpoints (`Bearer` key), Anthropic-style ones (`api_style = "anthropic"`) and
+the CLI OIDC sign-in are supported; a configured `Authorization` header is sent
+as is.
+
+The first session after boot fetches the lists, concurrently, and caches them
+in `/tmp/vibe-<uid>/discovered-models.json` (the system temp dir, in a private
+directory) for as long as the machine stays up: every later start reads that
+file and sends no request. A reboot, a cleaned temp dir, a changed `api_base`
+or a changed key refetches; `/model refresh` asks every `discover` provider
+again on demand and reports each one's count (a provider that fails keeps its
+cached models). Explicit `[[models]]` entries win field by field over what
+discovery fills in, and a discovered id that another provider already uses as
+an alias is listed as `<provider>/<id>`.
+
+#### Searching Long Lists
+
+`/model`, `/config` (settings, and any choice list too long for one screen,
+such as `active_model`), `/resume`, `/mcp` and `/plugins` search with fzf's
+algorithm: press `/`, type, and the best matches come first while `↑↓` and
+`Enter` keep working. Every space-separated term must match (`openrouter gpt`),
+and fzf's operators work: `'exact`, `^prefix`, `suffix$`, `!exclude`. Names
+match fuzzily; descriptions and session previews match terms as typed. `Esc`
+leaves the search, then clears it, then closes the list.
+
+#### Default and Vision Fallback Models
+
+`active_model` pins the default model, and `vision_model` names the model that
+describes images (pasted, or read with `read_file`) for an active model that
+cannot see them, on any provider:
+
+```toml
+active_model = "mistral-large-4"
+
+[[models]]
+name = "mistral-large-4-0"
+provider = "mistral"
+alias = "mistral-large-4"
+display_name = "Mistral Large 4"
+supports_images = true
+
+[vision_model]
+name = "mistral-large-4-0"
+provider = "mistral"
+alias = "mistral-large-4"
+supports_images = true
+```
 
 `/loop every two minutes check the build` asks the model to schedule a recurring
 prompt. Calendar requests such as `/loop weekdays
@@ -1331,7 +1376,7 @@ Vibe supports continuing from previous sessions:
 - **`--continue`** or **`-c`**: Continue the last session used in this terminal in the current folder, or the folder's most recent session when this terminal has none there. It also works with `-p`. Only sessions of the exact current folder count, not those of its subfolders. Set `VIBE_TERMINAL_KEY` to name the terminal yourself (an empty value makes `-c` ignore the terminal)
 - **`--resume`**: Open an interactive session picker
 - **`--resume SESSION_ID`**: Resume a specific session by ID (supports partial matching)
-- **`/resume`** or **`/continue`**: Open the session picker from inside Vibe; press `D` twice to delete a local saved session. The active session cannot be deleted from this picker.
+- **`/resume`** or **`/continue`**: Open the session picker from inside Vibe; press `/` to search titles and previews, and `D` twice to delete a local saved session. The active session cannot be deleted from this picker.
 
 ```bash
 # Continue from last session

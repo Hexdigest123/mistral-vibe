@@ -7,7 +7,10 @@ use ratatui::Frame;
 
 use super::super::theme;
 use crate::app::App;
-use crate::config_edit::{is_multiline, ConfigEdit, MAX_VISIBLE_CHOICES};
+use crate::config_edit::{is_multiline, search, ConfigEdit, MAX_VISIBLE_CHOICES};
+
+/// The search row and the blank under it, above a long choice list.
+pub(super) const SEARCH_ROWS: u16 = 2;
 
 pub(super) struct Layout {
     pub modal: Rect,
@@ -48,7 +51,17 @@ impl Layout {
         let inner_width = width - 6;
         let side_width = if edit.field.layers.is_empty() { 0 } else { 37 };
         let multiline = choices.is_empty() && is_multiline(&edit.field);
-        let minimum_editor = if choices.is_empty() { 3 } else { 1 };
+        // Sized from every choice, so typing a search never resizes the modal.
+        let search_rows = if search::searchable(&edit.field) {
+            SEARCH_ROWS
+        } else {
+            0
+        };
+        let minimum_editor = if choices.is_empty() {
+            3
+        } else {
+            1 + search_rows
+        };
         let side_by_side_width = inner_width.saturating_sub(side_width);
         let side_by_side_description = if edit.field.description.is_empty() {
             0
@@ -78,11 +91,12 @@ impl Layout {
                 3
             }
         } else {
-            choices
+            (choices
                 .iter()
                 .map(|label| usize::from(height(label, main_width - 2)))
                 .sum::<usize>()
-                .min(MAX_VISIBLE_CHOICES) as u16
+                .min(MAX_VISIBLE_CHOICES) as u16)
+                .saturating_add(search_rows)
         };
         let side_height = if side_width == 0 {
             0

@@ -4,6 +4,30 @@ Conventions for AI agents and humans contributing to **Mistral Vibe** — a CLI 
 
 Layout: Unified Harness Core and Runtime are external dependencies that execute and persist sessions; `vibe/app_server` hosts sessions and exposes product features and RPCs to every client, including Vibe Desktop; `vibe/core` retains shared config, tool, permission and other utilities; `vibe/cli-rust` is the terminal UI (Rust, Ratatui), a thin client over `vibe-app-server`; `vibe/cli` holds the `vibe` launcher that execs it and the audio helpers `vibe/acp` uses; `vibe/acp` bridges to the Agent Client Protocol; `vibe/setup` holds auth and onboarding config shared by the app server and `vibe-acp`. Tests live in `tests/` with autouse fixtures in `conftest.py` and test doubles in `tests/stubs/`.
 
+## Fork features (never drop)
+
+This checkout is the `Hexdigest123/mistral-vibe` fork. The features below exist only here, and they are requirements: no task, refactor, cleanup, simplification, upstream merge or conflict resolution may remove, disable, hide or degrade one, and "upstream does not have it" is never a reason. Their contracts, file maps and rebuild steps are in the `vibe-fork-features` skill (`.agents/skills/vibe-fork-features/SKILL.md`): read it before an upstream merge, before changing a file it lists, and whenever `tests/test_fork_features.py` fails.
+
+| Fork feature | Guard tests |
+| --- | --- |
+| fzf search (nucleo: every term matches, `'exact`, `^prefix`, `suffix$`, `!not`) in `/model`, `/config` and its long choice lists, `/resume`, `/mcp`, `/plugins` | `vibe/cli-rust/tests/units/{fork_features,fzf_rank,config_filter,model_picker_search}.rs`; client-e2e `model/model_search`, `model/model_fzf_terms`, `slash_command/resume_search`, `slash_command/config_edit_choice_search` |
+| `[[providers]] discover = true`: every model the provider's `/models` lists, fetched once per boot and cached in `/tmp/vibe-<uid>/discovered-models.json`; `/model refresh` refetches | `tests/core/models/`, `tests/app_server/test_provider_model_discovery.py`, `vibe/cli-rust/tests/units/model_refresh.rs`; client-e2e `model/model_refresh*` |
+| Linux clipboard image paste (`Ctrl+V`, `/paste-image`): PNG/JPEG/WebP/GIF, file-manager copies, native X11/Wayland fallback without wl-clipboard or xclip | `vibe/cli-rust/tests/units/paste_image.rs` |
+| Vision fallback for blind models, including images read with `read_file` (`builtin:image_describe`) and a `vision_model` on another provider | `tests/app_server/test_image_read_hooks.py`, `tests/app_server/test_vision.py` |
+| `make build` → standalone `~/.local/bin/vibes` | `tests/test_fork_features.py` |
+
+1. Before you finish any change, and after every upstream merge, run `uv run pytest tests/test_fork_features.py` and the guard tests of every feature the change touches, plus `make test_golden` when the TUI changed. A failing guard means a fork feature broke: fix the code, never the guard.
+2. Never delete, skip, xfail or weaken a guard test or a fork golden, and never shorten `GUARD_TESTS` in `tests/test_fork_features.py`. Only the user's explicit decision to change a feature changes its guards.
+3. In an upstream merge, keep both upstream's change and the fork feature. When upstream rewrote or deleted the code a feature lived in (v3.0 replaced the Python TUI with `vibe/cli-rust` and silently dropped the fork's picker search and clipboard paste), re-implement the feature on the new code in that same merge, from its contract in the skill. Never land a merge with a fork feature missing.
+4. Fork-only code must follow upstream's dependency swaps (v3.0.4 moved runtime HTTP from `httpx` to `httpx2`): after a merge, grep the fork-only modules for removed imports and smoke-test the `make build` bundle.
+5. Keep fork code in fork-only modules with thin hooks into upstream files, each hook marked `Fork feature (AGENTS.md "Fork features")`. A new fork feature gets its row here, its section in the skill and its `GUARD_TESTS` entries in the same change.
+6. If a request would remove or change what one of these features does, say so and get the user's explicit go-ahead first.
+
+### Local fork builds
+
+- `make build` is the one build command: it builds the Rust TUI (`vibe-rs`) and the PyInstaller `vibe-app-server` bundle from the current source — every patch in this checkout included — and installs them behind a `~/.local/bin/vibes` wrapper. Do not add experimental-flag build variants; there is no `make build-experimental`.
+- The Unified Harness is the only backend on every surface (CLI, ACP, app-server); upstream 3.0 removed the legacy loop and the `--experimental-harness`/`--legacy-harness` flags. A missing or incompatible harness fails startup with an actionable error.
+
 ## Architecture Decisions
 
 Before architecture-affecting changes, read [0002 Ownership Boundaries](docs/adr/0002-core-engine-and-delivery-surfaces.md) and the matching ADR below. For new agent capabilities, also read [0018](docs/adr/0018-modular-app-server-capabilities.md), including its Runtime/Core scope rule. Flag conflicts with ADR direction before implementing. When writing ADRs, follow the `write-vibe-adr` skill.
@@ -52,11 +76,6 @@ Always go through `uv` — never invoke bare `python` or `pip`.
 - Useful uv basics: `uv sync --all-extras`, `uv add <pkg>`, `uv remove <pkg>`.
 
 Never stop processes by name or pattern (`pkill`, `killall`, `pgrep | xargs kill`): names and patterns such as `vibe`, `vibe-rs`, `vibe-app-server`, `vibe-acp` or `client-e2e` match every Vibe session, IDE integration and test run on the machine, including the user's own. Stop only processes you started, by the PID or process group you recorded when you started them; if you do not have it, ask the user instead of guessing.
-
-### Local fork builds
-
-- `make build` is the one build command: it builds the Rust TUI (`vibe-rs`) and the PyInstaller `vibe-app-server` bundle from the current source — every patch in this checkout included — and installs them behind a `~/.local/bin/vibes` wrapper. Do not add experimental-flag build variants; there is no `make build-experimental`.
-- The Unified Harness is the only backend on every surface (CLI, ACP, app-server); upstream 3.0 removed the legacy loop and the `--experimental-harness`/`--legacy-harness` flags. A missing or incompatible harness fails startup with an actionable error.
 
 ## Project layout & module conventions
 

@@ -1,49 +1,126 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 import respx
 
 from vibe.core.models.catalog import (
-    MODELS_CACHE_VERSION,
+    DiscoveredModel,
     fetch_provider_models,
-    load_catalog_cache,
     models_endpoint,
-    read_cached_catalog,
-    store_catalog_result,
+    parse_models,
 )
-from vibe.core.models.config_bridge import CatalogRefreshReport
-from vibe.core.models.discovery import discovered_models_payload
+
+OPENROUTER = "https://openrouter.ai/api/v1/models"
 
 
-def _models_payload(*ids: str) -> dict[str, object]:
+def _ids(*ids: str) -> dict[str, Any]:
     return {"data": [{"id": model_id} for model_id in ids]}
 
 
-@pytest.mark.asyncio
-async def test_fetch_parses_and_sorts_model_ids(respx_mock: respx.MockRouter) -> None:
-    route = respx_mock.get("https://openrouter.ai/api/v1/models").mock(
-        return_value=httpx.Response(
-            200, json=_models_payload("z-model", "a-model", "a-model")
+def test_parse_sorts_and_deduplicates_bare_ids() -> None:
+    models = parse_models(_ids("z-model", "a-model", "a-model"))
+    assert [model.id for model in models] == ["a-model", "z-model"]
+    assert models[0] == DiscoveredModel(id="a-model")
+
+
+@pytest.mark.parametrize(
+    "payload", [None, [], {"data": "nope"}, {"data": [1, None, {"id": ""}, {"id": 3}]}]
+)
+def test_parse_ignores_malformed_bodies(payload: Any) -> None:
+    assert parse_models(payload) == []
+
+
+def test_parse_reads_mistral_capabilities() -> None:
+    payload = {
+        "data": [
+            {
+                "id": "mistral-large-latest",
+                "name": "mistral-large-latest",
+                "max_context_length": 131072,
+                "capabilities": {
+                    "completion_chat": True,
+                    "function_calling": True,
+                    "vision": True,
+                },
+            },
+            {
+                "id": "mistral-embed",
+                "capabilities": {"completion_chat": False, "function_calling": False},
+            },
+            {
+                "id": "chat-no-tools",
+                "capabilities": {"completion_chat": True, "function_calling": False},
+            },
+        ]
+    }
+    assert parse_models(payload) == [
+        DiscoveredModel(
+            id="mistral-large-latest", supports_images=True, max_context_length=131072
         )
-    )
-    result = await fetch_provider_models("openrouter", "https://openrouter.ai/api/v1")
-    assert route.called
-    assert result.ok
-    assert result.model_ids == ["a-model", "z-model"]
-    assert result.endpoint == "https://openrouter.ai/api/v1/models"
-    assert result.fetched_at > 0
+    ]
+
+
+def test_parse_reads_openrouter_metadata() -> None:
+    payload = {
+        "data": [
+            {
+                "id": "anthropic/claude-sonnet-4.5",
+                "name": "Anthropic: Claude Sonnet 4.5",
+                "context_length": 1000000,
+                "architecture": {"input_modalities": ["text", "image"]},
+                "supported_parameters": ["tools", "temperature"],
+            },
+            {
+                "id": "some/text-only",
+                "architecture": {"input_modalities": ["text"]},
+                "top_provider": {"context_length": 32768},
+                "supported_parameters": ["tools"],
+            },
+            {"id": "some/no-tools", "supported_parameters": ["temperature"]},
+        ]
+    }
+    assert parse_models(payload) == [
+        DiscoveredModel(
+            id="anthropic/claude-sonnet-4.5",
+            display_name="Anthropic: Claude Sonnet 4.5",
+            supports_images=True,
+            max_context_length=1000000,
+        ),
+        DiscoveredModel(
+            id="some/text-only", supports_images=False, max_context_length=32768
+        ),
+    ]
+
+
+def test_parse_reads_anthropic_display_name() -> None:
+    payload = {"data": [{"id": "claude-x", "display_name": "Claude X"}]}
+    assert parse_models(payload)[0].display_name == "Claude X"
+
+
+def test_models_endpoint() -> None:
+    assert models_endpoint("https://openrouter.ai/api/v1/") == OPENROUTER
+    for base in ("https://api.anthropic.com", "https://api.anthropic.com/v1/"):
+        assert (
+            models_endpoint(base, "anthropic")
+            == "https://api.anthropic.com/v1/models?limit=1000"
+        )
 
 
 @pytest.mark.asyncio
-async def test_fetch_sends_bearer_token(respx_mock: respx.MockRouter) -> None:
-    route = respx_mock.get("https://openrouter.ai/api/v1/models").mock(
-        return_value=httpx.Response(200, json=_models_payload("m"))
+async def test_fetch_parses_and_sends_headers(respx_mock: respx.MockRouter) -> None:
+    route = respx_mock.get(OPENROUTER).mock(
+        return_value=httpx.Response(200, json=_ids("b", "a"))
     )
-    await fetch_provider_models("openrouter", "https://openrouter.ai/api/v1", "key")
+    result = await fetch_provider_models(
+        "openrouter", OPENROUTER, {"Authorization": "Bearer key"}
+    )
+    assert result.ok
+    assert result.model_ids == ["a", "b"]
+    assert result.endpoint == OPENROUTER
+    assert result.fetched_at > 0
     assert route.calls.last.request.headers["Authorization"] == "Bearer key"
 
 
@@ -52,113 +129,24 @@ async def test_fetch_sends_bearer_token(respx_mock: respx.MockRouter) -> None:
 async def test_fetch_reports_http_error(
     respx_mock: respx.MockRouter, status_code: int
 ) -> None:
-    respx_mock.get("https://openrouter.ai/api/v1/models").mock(
-        return_value=httpx.Response(status_code)
-    )
-    result = await fetch_provider_models("openrouter", "https://openrouter.ai/api/v1")
+    respx_mock.get(OPENROUTER).mock(return_value=httpx.Response(status_code))
+    result = await fetch_provider_models("openrouter", OPENROUTER, {})
     assert not result.ok
     assert result.error == f"HTTP {status_code}"
 
 
 @pytest.mark.asyncio
-async def test_fetch_reports_empty_catalog(respx_mock: respx.MockRouter) -> None:
-    respx_mock.get("https://openrouter.ai/api/v1/models").mock(
-        return_value=httpx.Response(200, json={"data": []})
-    )
-    result = await fetch_provider_models("openrouter", "https://openrouter.ai/api/v1")
+async def test_fetch_reports_unreachable_endpoint(respx_mock: respx.MockRouter) -> None:
+    respx_mock.get(OPENROUTER).mock(side_effect=httpx.ConnectError("refused"))
+    result = await fetch_provider_models("openrouter", OPENROUTER, {})
     assert not result.ok
-    assert "no model ids" in (result.error or "")
+    assert result.models == []
 
 
-def test_models_endpoint_joins_base() -> None:
-    assert (
-        models_endpoint("https://openrouter.ai/api/v1/")
-        == "https://openrouter.ai/api/v1/models"
-    )
-
-
-class TestCache:
-    def test_missing_cache_is_empty(self, config_dir: Path) -> None:
-        assert load_catalog_cache().providers == {}
-
-    def test_round_trip(self, config_dir: Path) -> None:
-        result = fetch_result_ok("openrouter", ["a", "b"])
-        store_catalog_result(result)
-        cache = load_catalog_cache()
-        assert cache.version == MODELS_CACHE_VERSION
-        assert cache.providers["openrouter"].model_ids == ["a", "b"]
-        assert cache.providers["openrouter"].endpoint == result.endpoint
-
-    def test_read_cached_requires_matching_endpoint(self, config_dir: Path) -> None:
-        store_catalog_result(fetch_result_ok("openrouter", ["a"]))
-        assert read_cached_catalog("openrouter", "https://x/v1/models").ok
-        assert not read_cached_catalog("openrouter", "https://other/v1/models").ok
-        assert not read_cached_catalog("other", "https://x/v1/models").ok
-
-    def test_invalid_cache_is_ignored(self, config_dir: Path) -> None:
-        (config_dir / "discovered_models_cache.json").write_text(
-            "{not json", encoding="utf-8"
-        )
-        assert load_catalog_cache().providers == {}
-
-    def test_stale_version_is_ignored(self, config_dir: Path) -> None:
-        payload = {"version": 999, "providers": {"openrouter": {}}}
-        (config_dir / "discovered_models_cache.json").write_text(
-            json.dumps(payload), encoding="utf-8"
-        )
-        assert load_catalog_cache().providers == {}
-
-
-def fetch_result_ok(provider: str, model_ids: list[str]):
-    from vibe.core.models.catalog import ModelCatalogResult
-
-    return ModelCatalogResult(
-        provider_name=provider,
-        endpoint="https://x/v1/models",
-        model_ids=model_ids,
-        fetched_at=123.0,
-    )
-
-
-def test_discovered_models_payload_keeps_wide_catalogs() -> None:
-    result = fetch_result_ok("openrouter", [f"m{i}" for i in range(300)])
-    payload = discovered_models_payload(result)
-    assert len(payload) == 300
-    assert payload["m0"] == {
-        "name": "m0",
-        "provider": "openrouter",
-        "alias": "m0",
-        "display_name": None,
-    }
-    assert payload["m299"]["alias"] == "m299"
-
-
-def test_discovered_models_payload_skips_failed_results() -> None:
-    from vibe.core.models.catalog import ModelCatalogResult
-
-    failed = ModelCatalogResult(
-        provider_name="openrouter", endpoint="https://x/v1/models", error="HTTP 500"
-    )
-    assert discovered_models_payload(failed) == {}
-
-
-def test_report_summary_lists_providers() -> None:
-    from vibe.core.models.catalog import ModelCatalogResult
-
-    report = CatalogRefreshReport(
-        results=[
-            ModelCatalogResult(
-                provider_name="openrouter",
-                endpoint="https://x/v1/models",
-                model_ids=["a", "b"],
-                from_cache=True,
-            ),
-            ModelCatalogResult(
-                provider_name="other", endpoint="https://y/v1/models", error="HTTP 401"
-            ),
-        ]
-    )
-    assert report.ok
-    assert report.total_models == 2
-    assert "openrouter: 2 models (cache)" in report.summary()
-    assert "other: unavailable (HTTP 401)" in report.summary()
+@pytest.mark.asyncio
+async def test_fetch_reports_a_list_without_chat_models(
+    respx_mock: respx.MockRouter,
+) -> None:
+    respx_mock.get(OPENROUTER).mock(return_value=httpx.Response(200, json={"data": []}))
+    result = await fetch_provider_models("openrouter", OPENROUTER, {})
+    assert result.error == "the endpoint listed no chat models"

@@ -80,6 +80,8 @@ pub mod method {
     pub const CONFIG_MODEL_WRITE: &str = "config/model/write";
     /// Re-read config and runtime after a change.
     pub const CONFIG_RELOAD: &str = "config/reload";
+    /// Fork feature (AGENTS.md): re-list the `discover = true` providers' models.
+    pub const MODELS_REFRESH: &str = "models/refresh";
     /// Read the proxy variables `/proxy-setup` edits.
     pub const CONFIG_PROXY_READ: &str = "config/proxy/read";
     /// Persist the changed proxy variables.

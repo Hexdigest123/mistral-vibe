@@ -148,7 +148,19 @@ pub fn read_clipboard_image() -> Option<Vec<u8>> {
     let data = linux::read();
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let data = None;
-    data.filter(|data| data.starts_with(PNG_MAGIC))
+    data.filter(|data| image_extension(data).is_some())
+}
+
+/// The extension an image is stored under, from its magic bytes; `None` for types the session cannot take.
+pub fn image_extension(data: &[u8]) -> Option<&'static str> {
+    let webp = data.get(..4) == Some(b"RIFF") && data.get(8..12) == Some(b"WEBP");
+    match data {
+        _ if data.starts_with(PNG_MAGIC) => Some("png"),
+        [0xff, 0xd8, 0xff, ..] => Some("jpg"),
+        _ if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") => Some("gif"),
+        _ if webp => Some("webp"),
+        _ => None,
+    }
 }
 
 pub(crate) fn run_with_timeout(command: &mut Command, stdout: Stdio) -> bool {

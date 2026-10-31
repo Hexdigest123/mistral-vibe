@@ -10,11 +10,13 @@ use crate::utils::datetime;
 const PASTED_IMAGES_DIR: &str = "vibe-pasted-images";
 const MAX_SAME_SECOND_COLLISIONS: usize = 1000;
 
-/// Write `$TMPDIR/vibe-pasted-images/clipboard-<local timestamp>.png`.
+/// Write `$TMPDIR/vibe-pasted-images/clipboard-<local timestamp>.<png|jpg|gif|webp>`.
 pub fn write_clipboard_image(data: &[u8]) -> io::Result<PathBuf> {
     let dir = std::env::temp_dir().join(PASTED_IMAGES_DIR);
     fs::create_dir_all(&dir)?;
-    let path = clipboard_image_path(&dir, &clipboard_timestamp(), |path| path.exists());
+    let extension = super::image_extension(data).unwrap_or("png");
+    let free = |path: &Path| path.with_extension(extension).exists();
+    let path = clipboard_image_path(&dir, &clipboard_timestamp(), free).with_extension(extension);
     fs::write(&path, data)?;
     Ok(path)
 }

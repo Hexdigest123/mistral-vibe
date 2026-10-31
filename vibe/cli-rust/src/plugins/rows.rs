@@ -1,10 +1,11 @@
-//! `/plugins` option rows: the filtered plugin list plus what failed to load, or one plugin's detail.
+//! `/plugins` option rows: the fzf-ranked plugin list plus what failed to load, or one plugin's detail.
 
 use super::text;
 use super::State;
 use crate::hints::{self, action, key, Hint};
 use crate::search_field;
 use crate::server::PluginCatalogEntry;
+use crate::utils::fzf;
 
 /// One option of the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,17 +34,14 @@ pub fn rows(state: &State) -> Vec<Row> {
             .map(Row::Dim)
             .collect();
     }
-    let query = state.query();
-    let mut rows: Vec<Row> = state
-        .catalog
-        .plugins
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| text::matches(entry, &query))
-        .map(|(index, _)| Row::Entry(index))
+    let query = state.filter.query.as_str();
+    let plugins = &state.catalog.plugins;
+    let mut rows: Vec<Row> = fzf::rank(plugins, query, |p| p.name.clone(), |p| &p.description)
+        .into_iter()
+        .map(Row::Entry)
         .collect();
     if rows.is_empty() {
-        rows.push(Row::Note(if query.is_empty() {
+        rows.push(Row::Note(if query.trim().is_empty() {
             "No plugins in this session"
         } else {
             "No plugins match this filter"

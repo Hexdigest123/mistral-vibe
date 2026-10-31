@@ -105,7 +105,7 @@ fn draw_options(app: &mut App, f: &mut Frame, bx: u16, top: u16, w: u16, help_y:
     let fields: Vec<ConfigField> = config::filtered(app).into_iter().cloned().collect();
     let lines = config_options::build_lines(
         &fields,
-        app.config_screen.search.query.trim().is_empty() || fields.len() > 5,
+        app.config_screen.search.query.trim().is_empty() || fields.len() > config::MERGED_MATCHES,
     );
     let total = lines.len() as u16;
     let options: Vec<_> = lines

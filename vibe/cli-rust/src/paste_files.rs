@@ -177,11 +177,16 @@ pub fn image_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Files copied in Finder, or in a Linux file manager (fork feature, AGENTS.md).
 pub fn read_clipboard_files() -> Vec<PathBuf> {
-    if !cfg!(target_os = "macos") {
-        return Vec::new();
+    if cfg!(target_os = "macos") {
+        return read_macos_files().unwrap_or_default();
     }
-    read_macos_files().unwrap_or_default()
+    #[cfg(target_os = "linux")]
+    let files = paste_image::linux::read_files();
+    #[cfg(not(target_os = "linux"))]
+    let files = Vec::new();
+    files
 }
 
 pub fn parse_clipboard_files(output: &str) -> Vec<PathBuf> {

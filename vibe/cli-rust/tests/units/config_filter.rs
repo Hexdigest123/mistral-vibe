@@ -1,4 +1,4 @@
-//! Config search uses fuzzy relevance without losing section or selection ordering.
+//! Config search ranks with fzf (fork feature) without losing section or selection ordering.
 
 use serde_json::json;
 use vibe_rs::app::App;
@@ -97,10 +97,17 @@ fn larger_result_sets_rank_within_each_section() {
 }
 
 #[test]
-fn zero_score_and_missing_matches_are_excluded() {
+fn far_apart_letters_rank_last_and_misses_are_excluded() {
     let name = format!("a{}b", "_".repeat(200));
-    let app = app_with(&[(&name, "", true), ("theme", "", false)], "ab");
-    assert!(names(&app).is_empty());
+    let app = app_with(
+        &[
+            (&name, "", true),
+            ("about", "", false),
+            ("theme", "", false),
+        ],
+        "ab",
+    );
+    assert_eq!(names(&app), ["about", name.as_str()]);
 }
 
 #[test]

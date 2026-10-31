@@ -283,3 +283,86 @@ fn parses_one_clipboard_file_per_line() {
     );
     assert!(parse_clipboard_files("\n").is_empty());
 }
+
+#[test]
+fn image_types_are_told_apart_by_their_magic_bytes() {
+    use vibe_rs::paste_image::image_extension;
+
+    assert_eq!(image_extension(&[PNG_MAGIC, b"x"].concat()), Some("png"));
+    assert_eq!(image_extension(b"\xff\xd8\xff\xe0jfif"), Some("jpg"));
+    assert_eq!(image_extension(b"GIF89a..."), Some("gif"));
+    assert_eq!(
+        image_extension(b"RIFF\x10\x00\x00\x00WEBPVP8 "),
+        Some("webp")
+    );
+    assert_eq!(image_extension(b"BM\x00\x00"), None);
+    assert_eq!(image_extension(b"RIFF\x10\x00\x00\x00WAVE"), None);
+    assert_eq!(image_extension(b""), None);
+}
+
+#[test]
+fn a_jpeg_is_stored_under_its_own_extension() {
+    let path = write_clipboard_image(b"\xff\xd8\xff\xe0jpeg").expect("write image");
+    assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("jpg"));
+    fs::remove_file(path).expect("remove image fixture");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn linux_takes_the_best_image_type_on_offer() {
+    use vibe_rs::paste_image::linux::best_image_type;
+
+    let offered = |types: &[&str]| types.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let firefox = offered(&[
+        "text/html",
+        "image/bmp",
+        "image/jpeg",
+        "image/png",
+        "TARGETS",
+    ]);
+    assert_eq!(best_image_type(&firefox), Some("image/png"));
+    assert_eq!(
+        best_image_type(&offered(&["IMAGE/JPEG"])),
+        Some("image/jpeg")
+    );
+    assert_eq!(
+        best_image_type(&offered(&["image/webp", "image/gif"])),
+        Some("image/webp")
+    );
+    assert_eq!(
+        best_image_type(&offered(&["image/bmp", "text/plain"])),
+        None
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn linux_file_manager_copies_become_local_paths() {
+    use vibe_rs::paste_image::linux::parse_uri_list;
+
+    let list = "# copied by a file manager\r\nfile:///home/me/My%20Shot.png\r\nfile://localhost/tmp/a.jpg\r\nhttps://example.com/b.png\r\nfile://other-host/c.png\r\n\r\n";
+    assert_eq!(
+        parse_uri_list(list),
+        [
+            PathBuf::from("/home/me/My Shot.png"),
+            PathBuf::from("/tmp/a.jpg")
+        ]
+    );
+    assert!(parse_uri_list("not a uri\n").is_empty());
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn linux_native_pixels_are_re_encoded_as_png() {
+    use vibe_rs::paste_image::{image_extension, linux::encode_png};
+
+    let pixels = [255u8, 0, 0, 255, 0, 255, 0, 255];
+    let png = encode_png(2, 1, &pixels).expect("encode");
+    assert_eq!(image_extension(&png), Some("png"));
+    assert_eq!(
+        &png[16..24],
+        &[0, 0, 0, 2, 0, 0, 0, 1],
+        "IHDR width and height"
+    );
+    assert!(encode_png(2, 2, &pixels).is_none(), "too few pixels");
+}

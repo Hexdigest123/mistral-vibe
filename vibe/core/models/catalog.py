@@ -1,45 +1,56 @@
+"""One provider's model list, fetched from its ``/models`` endpoint.
+
+Every OpenAI-compatible endpoint lists ids. Mistral, OpenRouter and Anthropic
+add metadata, read here when present: a display name, image input, the
+context window, and whether the model can chat with tools at all. The agent
+loop needs tool calls, so a model the endpoint marks as unable to make them
+(embeddings, OCR, moderation, tool-less chat models) is left out; without
+metadata every listed id is kept.
+"""
+
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import time
 from typing import Any
 
 import httpx2
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from vibe.observability.logging import logger
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
 
+# Bounds the whole request, not each connection phase: a slow body cannot hold
+# a session start for longer.
 MODELS_LIST_TIMEOUT = 10.0
-MODELS_CACHE_VERSION = 1
+# Anthropic pages its list at 20 by default.
+_ANTHROPIC_PAGE = "limit=1000"
 
 
-class ProviderCatalogEntry(BaseModel):
-    """One provider's cached catalog: the model ids and when they were fetched."""
+class DiscoveredModel(BaseModel):
+    """One listed model, with what its endpoint said about it."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", frozen=True)
 
-    endpoint: str
-    model_ids: list[str] = Field(default_factory=list)
-    fetched_at: float = 0.0
-
-
-class ModelCatalogCache(BaseModel):
-    """On-disk cache of auto-discovered model catalogs, keyed by provider name."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    version: int = MODELS_CACHE_VERSION
-    providers: dict[str, ProviderCatalogEntry] = Field(default_factory=dict)
+    id: str
+    display_name: str | None = None
+    supports_images: bool | None = None
+    max_context_length: int | None = None
 
 
 @dataclass(slots=True)
 class ModelCatalogResult:
-    """Outcome of one discovery attempt for a single provider."""
+    """One provider's discovery outcome.
+
+    A failed refresh can still carry the models this boot cached for the
+    provider: ``error`` says the fetch failed, ``models`` what is offered.
+    """
 
     provider_name: str
     endpoint: str
-    model_ids: list[str] = field(default_factory=list)
+    models: list[DiscoveredModel] = field(default_factory=list)
     fetched_at: float = 0.0
     from_cache: bool = False
     error: str | None = None
@@ -48,140 +59,124 @@ class ModelCatalogResult:
     def ok(self) -> bool:
         return self.error is None
 
+    @property
+    def model_ids(self) -> list[str]:
+        return [model.id for model in self.models]
 
-def models_endpoint(api_base: str) -> str:
-    """Return the OpenAI-compatible ``/models`` list URL for a provider base."""
-    return f"{api_base.rstrip('/')}/models"
+
+def models_endpoint(api_base: str, api_style: str = "openai") -> str:
+    """The provider's model list URL; Anthropic's sits under ``/v1`` either way."""
+    base = api_base.rstrip("/")
+    if api_style == "anthropic":
+        return f"{base.removesuffix('/v1')}/v1/models?{_ANTHROPIC_PAGE}"
+    return f"{base}/models"
 
 
-def _parse_model_ids(payload: Any) -> list[str]:
-    """Extract sorted unique model ids from an OpenAI-style ``/models`` body."""
-    if not isinstance(payload, dict):
-        return []
-    entries = payload.get("data")
+def parse_models(payload: Any) -> list[DiscoveredModel]:
+    """The chat models of a ``/models`` body, one per id, sorted by id."""
+    entries = payload.get("data") if isinstance(payload, Mapping) else None
     if not isinstance(entries, list):
         return []
-    ids = [entry.get("id") for entry in entries if isinstance(entry, dict)]
-    return sorted({
-        model_id for model_id in ids if isinstance(model_id, str) and model_id
-    })
+    models = {
+        model.id: model
+        for entry in entries
+        if isinstance(entry, Mapping) and (model := _parse_entry(entry)) is not None
+    }
+    return [models[model_id] for model_id in sorted(models)]
 
 
-def _catalog_cache_path() -> Any:
-    from vibe.core.paths import DISCOVERED_MODELS_CACHE_FILE
-
-    return DISCOVERED_MODELS_CACHE_FILE.path
-
-
-def load_catalog_cache() -> ModelCatalogCache:
-    """Read the catalog cache from disk; a missing or stale file yields empty."""
-    path = _catalog_cache_path()
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ModelCatalogCache()
-    except OSError as exc:
-        logger.debug("Model catalog cache unreadable path=%s error=%s", path, exc)
-        return ModelCatalogCache()
-    try:
-        cache = ModelCatalogCache.model_validate_json(raw)
-    except ValueError as exc:
-        logger.debug("Model catalog cache invalid, ignoring error=%s", exc)
-        return ModelCatalogCache()
-    if cache.version != MODELS_CACHE_VERSION:
-        return ModelCatalogCache()
-    return cache
-
-
-def save_catalog_cache(cache: ModelCatalogCache) -> None:
-    """Persist the catalog cache; failures never break the caller."""
-    path = _catalog_cache_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(cache.model_dump_json(indent=2), encoding="utf-8")
-    except OSError as exc:
-        logger.warning(
-            "Could not write model catalog cache path=%s error=%s", path, exc
-        )
-
-
-def read_cached_catalog(provider_name: str, endpoint: str) -> ModelCatalogResult:
-    """Return the cached catalog entry for a provider when it matches the endpoint."""
-    cache = load_catalog_cache()
-    entry = cache.providers.get(provider_name)
-    if entry is None or entry.endpoint != endpoint or not entry.model_ids:
-        return ModelCatalogResult(
-            provider_name=provider_name, endpoint=endpoint, error="not cached"
-        )
-    return ModelCatalogResult(
-        provider_name=provider_name,
-        endpoint=endpoint,
-        model_ids=list(entry.model_ids),
-        fetched_at=entry.fetched_at,
-        from_cache=True,
+def _parse_entry(entry: Mapping[str, Any]) -> DiscoveredModel | None:
+    model_id = entry.get("id")
+    if not isinstance(model_id, str) or not model_id.strip():
+        return None
+    capabilities = _mapping(entry.get("capabilities"))
+    # Mistral marks embedding, OCR and moderation models this way.
+    if any(
+        capabilities.get(name) is False
+        for name in ("completion_chat", "function_calling")
+    ):
+        return None
+    # OpenRouter lists the request parameters a model accepts.
+    parameters = entry.get("supported_parameters")
+    if isinstance(parameters, list) and parameters and "tools" not in parameters:
+        return None
+    name = entry.get("display_name") or entry.get("name")
+    return DiscoveredModel(
+        id=model_id,
+        display_name=name
+        if isinstance(name, str) and name.strip() and name != model_id
+        else None,
+        supports_images=_supports_images(entry, capabilities),
+        max_context_length=_context_length(entry),
     )
 
 
-async def fetch_provider_models(
-    provider_name: str,
-    api_base: str,
-    api_key: str | None = None,
-    extra_headers: dict[str, str] | None = None,
-) -> ModelCatalogResult:
-    """Fetch ``/models`` from an OpenAI-compatible endpoint.
+def _supports_images(
+    entry: Mapping[str, Any], capabilities: Mapping[str, Any]
+) -> bool | None:
+    if isinstance(vision := capabilities.get("vision"), bool):
+        return vision
+    modalities = _mapping(entry.get("architecture")).get("input_modalities")
+    if isinstance(modalities, list):
+        return "image" in modalities
+    return None
 
-    Any failure is returned as ``error`` on the result rather than raised, so
-    discovery never breaks startup or the ``/model refresh`` command.
+
+def _context_length(entry: Mapping[str, Any]) -> int | None:
+    candidates = (
+        entry.get("max_context_length"),
+        entry.get("context_length"),
+        entry.get("context_window"),
+        _mapping(entry.get("top_provider")).get("context_length"),
+    )
+    return next(
+        (
+            value
+            for value in candidates
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        ),
+        None,
+    )
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+async def fetch_provider_models(
+    provider_name: str, endpoint: str, headers: Mapping[str, str]
+) -> ModelCatalogResult:
+    """GET ``endpoint`` and parse it.
+
+    Never raises: a failure is the result's ``error``, so discovery never
+    breaks a session start or ``/model refresh``.
     """
-    endpoint = models_endpoint(api_base)
-    headers = dict(extra_headers or {})
-    if api_key:
-        headers.setdefault("Authorization", f"Bearer {api_key}")
     try:
-        async with VibeAsyncHTTPClient(verify=build_ssl_context()) as client:
-            response = await client.get(
-                endpoint, headers=headers, timeout=MODELS_LIST_TIMEOUT
-            )
-            response.raise_for_status()
-            model_ids = _parse_model_ids(response.json())
+        async with asyncio.timeout(MODELS_LIST_TIMEOUT):
+            async with VibeAsyncHTTPClient(verify=build_ssl_context()) as client:
+                response = await client.get(
+                    endpoint, headers=dict(headers), timeout=MODELS_LIST_TIMEOUT
+                )
+                response.raise_for_status()
+                models = parse_models(response.json())
     except httpx2.HTTPStatusError as exc:
         return ModelCatalogResult(
-            provider_name=provider_name,
-            endpoint=endpoint,
-            error=f"HTTP {exc.response.status_code}",
+            provider_name, endpoint, error=f"HTTP {exc.response.status_code}"
         )
-    except (httpx2.RequestError, ValueError) as exc:
+    except (httpx2.RequestError, TimeoutError, ValueError) as exc:
         logger.debug(
-            "Model discovery failed provider=%s endpoint=%s error=%s",
+            "Model discovery failed provider=%s endpoint=%s error=%r",
             provider_name,
             endpoint,
             exc,
         )
         return ModelCatalogResult(
-            provider_name=provider_name, endpoint=endpoint, error=str(exc)
+            provider_name, endpoint, error=str(exc) or type(exc).__name__
         )
-    if not model_ids:
+    if not models:
         return ModelCatalogResult(
-            provider_name=provider_name,
-            endpoint=endpoint,
-            error="the endpoint returned no model ids",
+            provider_name, endpoint, error="the endpoint listed no chat models"
         )
     return ModelCatalogResult(
-        provider_name=provider_name,
-        endpoint=endpoint,
-        model_ids=model_ids,
-        fetched_at=time.time(),
+        provider_name, endpoint, models=models, fetched_at=time.time()
     )
-
-
-def store_catalog_result(result: ModelCatalogResult) -> None:
-    """Fold one discovery result into the on-disk cache."""
-    if not result.ok:
-        return
-    cache = load_catalog_cache()
-    cache.providers[result.provider_name] = ProviderCatalogEntry(
-        endpoint=result.endpoint,
-        model_ids=list(result.model_ids),
-        fetched_at=result.fetched_at or time.time(),
-    )
-    save_catalog_cache(cache)

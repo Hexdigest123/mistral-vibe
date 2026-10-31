@@ -34,9 +34,6 @@ WHOAMI_CACHE_FILE = GlobalPath(lambda: VIBE_HOME.path / "whoami_cache.json")
 UTILITY_MODEL_CACHE_FILE = GlobalPath(
     lambda: VIBE_HOME.path / "utility_model_cache.json"
 )
-DISCOVERED_MODELS_CACHE_FILE = GlobalPath(
-    lambda: VIBE_HOME.path / "discovered_models_cache.json"
-)
 HISTORY_FILE = GlobalPath(lambda: VIBE_HOME.path / "vibehistory")
 
 DEFAULT_TOOL_DIR = GlobalPath(lambda: VIBE_ROOT / "core" / "tools" / "builtins")

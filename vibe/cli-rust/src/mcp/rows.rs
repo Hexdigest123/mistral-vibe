@@ -217,18 +217,10 @@ fn filtered_sources<'a>(
     query: &str,
 ) -> Vec<&'a MCPSourceSummary> {
     let ordered = sources(state, kind);
-    let query = query.trim();
-    if query.is_empty() {
-        return ordered;
-    }
-    let mut scored: Vec<_> = ordered
+    crate::utils::fzf::rank(&ordered, query, |s| s.label().to_owned(), |_| "")
         .into_iter()
-        .filter_map(|source| {
-            crate::utils::fuzzy::score(query, source.label()).map(|score| (score, source))
-        })
-        .collect();
-    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-    scored.into_iter().map(|(_, source)| source).collect()
+        .map(|index| ordered[index])
+        .collect()
 }
 
 fn add_source_group(

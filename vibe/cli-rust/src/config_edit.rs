@@ -1,6 +1,7 @@
 //! Typed editor behavior for `/config` fields.
 
 mod input;
+pub mod search;
 
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use tokio::sync::mpsc;
 use crate::app::App;
 use crate::config::{self, ConfigField};
 use crate::option_list::{OptionList, SingleAction};
+use crate::search_field::Search;
 
 pub const MAX_VISIBLE_CHOICES: usize = 14;
 
@@ -26,6 +28,8 @@ pub struct ConfigEdit {
     pub error: Option<String>,
     /// Highlighted choice and the choice-list viewport.
     pub list: OptionList<SingleAction>,
+    /// Filters a long choice list (`search`).
+    pub search: Search,
 }
 
 pub fn open(app: &mut App, field: ConfigField) {
@@ -44,6 +48,7 @@ pub fn open(app: &mut App, field: ConfigField) {
         field,
         error: None,
         list: OptionList::new(selected.unwrap_or_default()),
+        search: Search::default(),
     });
 }
 
@@ -63,6 +68,11 @@ pub fn handle_key(
     tx: &mpsc::Sender<config::Loaded>,
     key: KeyEvent,
 ) {
+    if let Some(edit) = app.config_screen.edit.as_mut() {
+        if search::key(edit, &key) {
+            return;
+        }
+    }
     if key.code == KeyCode::Esc {
         app.config_screen.edit = None;
         return;
@@ -78,7 +88,13 @@ pub fn handle_key(
             .as_ref()
             .is_some_and(|edit| !is_multiline(&edit.field) || !choices(&edit.field).is_empty())
     {
-        commit(app, client, tx);
+        // A search that matches nothing has no choice to save.
+        let matched = app.config_screen.edit.as_ref().is_none_or(|edit| {
+            choices(&edit.field).is_empty() || !search::visible(edit).is_empty()
+        });
+        if matched {
+            commit(app, client, tx);
+        }
         return;
     }
     let Some(edit) = app.config_screen.edit.as_mut() else {
@@ -97,9 +113,10 @@ pub fn handle_key(
             if !choices.is_empty() =>
         {
             let down = matches!(key.code, KeyCode::Down | KeyCode::Char('j'));
-            edit.list.step(down, choices.len(), true, |_| true);
+            let shown = search::visible(edit);
+            edit.list.step(down, shown.len(), true, |_| true);
             let index = edit.list.selected();
-            select_choice(edit, &choices, index);
+            select_choice(edit, &choices, &shown, index);
         }
         _ => {}
     }
@@ -116,7 +133,8 @@ pub fn wheel(app: &mut App, delta: isize) {
         return;
     };
     let choices = choices(&edit.field);
-    if choices.is_empty() {
+    let shown = search::visible(edit);
+    if shown.is_empty() {
         return;
     }
     if edit.list.free_scroll() {
@@ -127,8 +145,8 @@ pub fn wheel(app: &mut App, delta: isize) {
         .list
         .selected()
         .saturating_add_signed(delta)
-        .min(choices.len() - 1);
-    select_choice(edit, &choices, index);
+        .min(shown.len() - 1);
+    select_choice(edit, &choices, &shown, index);
 }
 
 /// A click on a choice picks it; returns whether to commit.
@@ -136,10 +154,13 @@ pub fn mouse(app: &mut App, event: MouseEvent) -> bool {
     let Some(edit) = app.config_screen.edit.as_mut() else {
         return false;
     };
+    if search::click(edit, event) {
+        return false;
+    }
     let Some(index) = edit.list.mouse(event) else {
         return false;
     };
-    select_choice(edit, &choices(&edit.field), index);
+    select_choice(edit, &choices(&edit.field), &search::visible(edit), index);
     true
 }
 
@@ -147,6 +168,9 @@ pub fn paste(app: &mut App, text: String) {
     let Some(edit) = app.config_screen.edit.as_mut() else {
         return;
     };
+    if search::paste(edit, &text) {
+        return;
+    }
     if choices(&edit.field).is_empty() {
         crate::utils::input_edit::insert(&mut edit.draft, &mut edit.cursor, &text);
         edit.error = None;
@@ -161,8 +185,9 @@ pub fn choices(field: &ConfigField) -> Vec<String> {
     }
 }
 
-fn select_choice(edit: &mut ConfigEdit, choices: &[String], index: usize) {
-    if let Some(choice) = choices.get(index) {
+/// Draft the choice shown on row `index` of the (searched) list.
+fn select_choice(edit: &mut ConfigEdit, choices: &[String], shown: &[usize], index: usize) {
+    if let Some(choice) = shown.get(index).and_then(|&i| choices.get(i)) {
         edit.draft.clone_from(choice);
         edit.cursor = edit.draft.len();
         edit.list.select(index);

@@ -288,8 +288,8 @@ extra_headers = { "X-Custom-Header" = "value" }  # optional per-provider HTTP he
 emits_finish_reason = false  # set false for OpenAI-compatible endpoints that end
                              # streams without a finish reason; avoids spurious
                              # "incomplete stream" errors and retries (default true)
-discover_only = true  # standalone provider: fetch its full model catalog even
-                      # when no [[model]] block names it (default false)
+discover = true  # list every model the provider's /models endpoint offers in
+                 # /model; fetched once per boot and cached (default false)
 ```
 
 ### Models
@@ -345,14 +345,21 @@ title = "local"
 smart_approve = "active"
 ```
 
-Model auto-discovery: when `config.toml` declares a `[[model]]` block, the
-providers those models reference (plus every provider flagged
-`discover_only = true`) are queried at their OpenAI-compatible models
-endpoint, and every listed id becomes selectable in `/model`. Results are
-cached in `~/.vibe/discovered_models_cache.json`: startup loads the cache
-without network traffic and refreshes it in the background, and the
-app-server `models/refresh` method re-runs it on demand. Explicit `[[model]]`
-entries and the Mistral model catalog always win over discovered ids.
+Model auto-discovery: every provider flagged `discover = true` (the key is
+`[[providers]]`, plural; an entry replaces the built-in provider of its name)
+is asked for its model list (`<api_base>/models`), and every listed model
+becomes selectable in `/model` and in `/config`'s `active_model`. Mistral,
+OpenRouter and Anthropic metadata (display name, image input, context window)
+is kept, and models the endpoint marks as unable to chat with tools are left
+out. The first session after boot fetches the lists concurrently and caches
+them in `/tmp/vibe-<uid>/discovered-models.json` (a private directory under
+the system temp dir) until the machine reboots: later starts read the file and
+send no request. A changed `api_base` or key refetches that provider;
+`/model refresh` (app-server `models/refresh`) asks every `discover` provider
+again, and a provider that fails keeps its cached models. Explicit
+`[[models]]` entries win field by field; a discovered id another provider
+already uses as an alias is listed as `<provider>/<id>`. This is a fork
+feature (see the repository's `AGENTS.md`).
 
 ### Tool Configuration
 
@@ -1012,8 +1019,8 @@ session's model.
 ## Built-in Slash Commands
 
 - `/help` - Show help message
-- `/config` - Full-screen settings browser. Fields show their value and origin layer (default / TOML / env / override). Type to filter, arrows to move, Enter to edit; booleans toggle, closed-set fields (theme, models) pick from a list, scalars edit inline, complex fields open a JSON editor. The edit modal shows an inspector of the layers setting the field; edits persist to the user config (`~/.vibe/config.toml`) by default, `Tab` cycles the save target through the project config (`.vibe/config.toml`, when the project layer is active) and the ephemeral session override (until restart), and `Ctrl+R` clears the field one writable layer at a time toward the default. The `tools` field opens a grouped tool list with a per-tool config editor (permission, allow/deny lists, `Ctrl+E` for raw JSON). Enabling/disabling whole MCP servers or connectors stays in `/mcp`.
-- `/model` - Select active model. Each row shows the model's provider; press `/` and type to fuzzy-search by name, alias or provider (best matches first, `Esc` leaves then clears the search). The footer shows the active model and its thinking level (`Name[level]`) before the token counter; clicking it opens `/model` and keeps the prompt being typed (only while idle, like the typed command). On narrow terminals the model is shortened first, then the working directory, and the model is hidden before the working directory gets very short.
+- `/config` - Full-screen settings browser. Fields show their value and origin layer (default / TOML / env / override). Press `/` to search (fzf on setting names, then descriptions holding every term), arrows to move, Enter to edit; a choice list longer than one screen (e.g. `active_model`) has its own `/` search; booleans toggle, closed-set fields (theme, models) pick from a list, scalars edit inline, complex fields open a JSON editor. The edit modal shows an inspector of the layers setting the field; edits persist to the user config (`~/.vibe/config.toml`) by default, `Tab` cycles the save target through the project config (`.vibe/config.toml`, when the project layer is active) and the ephemeral session override (until restart), and `Ctrl+R` clears the field one writable layer at a time toward the default. The `tools` field opens a grouped tool list with a per-tool config editor (permission, allow/deny lists, `Ctrl+E` for raw JSON). Enabling/disabling whole MCP servers or connectors stays in `/mcp`.
+- `/model` - Select active model. Each row shows the model's provider; press `/` and type to search with fzf's algorithm by name, alias or provider (best matches first; every space-separated term must match; `'exact`, `^prefix`, `suffix$` and `!exclude` work; `Esc` leaves then clears the search). `/model refresh` re-lists the models of every `discover = true` provider past the boot cache and reports each provider's count. The footer shows the active model and its thinking level (`Name[level]`) before the token counter; clicking it opens `/model` and keeps the prompt being typed (only while idle, like the typed command). On narrow terminals the model is shortened first, then the working directory, and the model is hidden before the working directory gets very short.
 - `/thinking` - Select thinking level
 - `/theme` - Select UI theme; `auto` follows terminal/OS appearance (persisted in config)
 - `/reload` - Reload configuration, agent instructions, and skills from disk (skills added or edited on disk are also picked up on their own while `file_watcher_for_autocomplete` is on, except in sandboxed sessions)
@@ -1058,8 +1065,10 @@ session's model.
 - `/mcp logout <alias>` - Log out from an MCP server and delete stored OAuth
   secrets
 - `/resume` (or `/continue`) - Browse and resume past sessions for the current
-  folder. The picker header shows the folder being listed. Press `d` twice to
-  delete a saved session; the active session cannot be deleted here.
+  folder. The picker header shows the folder being listed. Press `/` to search
+  (fzf on titles, then terms as typed in previews; letters type into the field
+  while it is focused). Press `d` twice to delete a saved session; the active
+  session cannot be deleted here.
 - `/rewind` - Rewind to a previous message. Also triggered by pressing `Esc`
   twice on an empty input; if the input has content, the first double-`Esc`
   clears it instead. In the rewind panel: `↑/↓` pick option, `Shift+↑/↓`
@@ -1175,8 +1184,11 @@ Image attachments:
   2. `/paste-image` slash command.
 
   macOS reads the pasteboard via `osascript` with a TIFF→PNG fallback via
-  `sips`. Linux reads `image/png` from `wl-paste` (Wayland) or `xclip`
-  (X11); install `wl-clipboard` or `xclip` to enable it.
+  `sips`. Linux asks `wl-paste` (Wayland) or `xclip` (X11) which types are on
+  offer and takes the best image type the session accepts (PNG, JPEG, WebP,
+  GIF, stored under its own extension); image files copied in a file manager
+  (`text/uri-list`) attach like Finder copies. Without either tool it reads the
+  X11 or Wayland (data-control) clipboard natively.
   On Windows the binding and the slash command are not registered at all,
   so the feature is invisible to users on that platform.
 - Rendered in the chat bubble as one dim `attached image:` footer line

@@ -9,8 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `/model` is searchable again: press `/` and type to fuzzy-filter models by name, alias or provider, and each row shows the provider it comes from
-- Clipboard image paste (`Ctrl+V` and `/paste-image`) now works on Linux via `wl-paste` (Wayland) or `xclip` (X11), matching the existing macOS support
+- `/model` is searchable again: press `/` and type to filter models by name, alias or provider, and each row shows the provider it comes from
+- fzf-style search (nucleo) in `/model`, `/config`, `/mcp` and `/plugins`: every space-separated term must match, and `'exact`, `^prefix`, `suffix$` and `!exclude` work; `/config` descriptions match terms as typed instead of fuzzily
+- `/resume` and long `/config` choice lists (such as `active_model`) are searchable with `/`
+- `[[providers]]` entries take `discover = true` to list every model their `/models` endpoint offers; the lists are fetched once per boot and cached in `/tmp/vibe-<uid>/discovered-models.json`, so later starts send no request, and keep the endpoint's display name, image input and context window
+- `/model refresh` re-lists the `discover = true` providers' models past the boot cache
+- Clipboard image paste (`Ctrl+V` and `/paste-image`) works on Linux via `wl-paste` (Wayland) or `xclip` (X11), takes JPEG, WebP and GIF as well as PNG, attaches image files copied in a file manager, and reads the X11 or Wayland clipboard natively when neither tool is installed
+
+### Changed
+
+- Model discovery runs only for providers flagged `discover = true` (it replaces `discover_only`, and a `[[model]]` block no longer triggers it); a session start no longer refetches in the background
 
 ## [3.0.4] - 2026-10-30
 

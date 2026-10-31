@@ -129,12 +129,6 @@ from vibe.core.llm.utility_completion import (
     ensure_utility_models_probed,
     select_utility_model,
 )
-from vibe.core.models import (
-    discover_only_provider_names,
-    load_cached_models,
-    refresh_models,
-    user_declared_model_aliases,
-)
 from vibe.core.paths import VIBE_HOME
 from vibe.core.prompts import UtilityPrompt
 from vibe.core.session.session_permissions import start_restrict_session_log_permissions
@@ -2105,12 +2099,6 @@ class HarnessProcess:
         # After the org config: it can set the process-wide trust store too.
         if check_process_settings and self._process_settings is not None:
             self._process_settings.check(config_orchestrator.config)
-        # Provider model auto-discovery: when a durable layer declares [[model]]
-        # blocks, the providers they reference are queried for their /models
-        # list. The on-disk cache is loaded synchronously (cheap) so the first
-        # render already shows discovered models; a fresh fetch runs in the
-        # background and lands as a config change when it finds anything new.
-        await _start_provider_model_discovery(config_orchestrator)
         # Every session crosses this config build, and the unified harness
         # never constructs the legacy agent loop, so the sweep starts here.
         start_restrict_session_log_permissions(
@@ -2867,51 +2855,6 @@ async def _accept_org_config(context: UnifiedSessionContext) -> None:
     orchestrator = context.config_orchestrator
     if enforced_keys(orchestrator) and context.preflight is not None:
         await context.preflight(orchestrator.config, UnifiedSessionSettings())
-
-
-# Background provider-model refresh tasks hold their own references so a fire-and-forget
-# task is never garbage-collected mid-flight.
-_PROVIDER_MODEL_TASKS: set[asyncio.Task[None]] = set()
-
-
-async def _start_provider_model_discovery(
-    config_orchestrator: ConfigOrchestrator[VibeConfigSchema],
-) -> None:
-    """Load the cached model catalog, then refresh it in the background.
-
-    Only runs when a durable layer (user or project TOML) declares [[model]]
-    blocks, or when a provider is flagged ``discover_only``: the default model
-    set needs no discovery, and a session without explicit models must not send
-    requests to any endpoint. The background fetch rewrites the cache and the
-    catalog layer; the next config reload (or the /model refresh command)
-    picks the result up.
-    """
-    try:
-        declared = await user_declared_model_aliases(config_orchestrator)
-    except Exception:
-        declared = set()
-    discover_only = discover_only_provider_names(config_orchestrator.config)
-    if not declared and not discover_only:
-        return
-    cached = load_cached_models(config_orchestrator, declared_aliases=declared)
-    # The catalog layer feeds discovery results into the merged config; a
-    # reload is what makes the cached models visible to the session. Without
-    # it they only appear after the background fetch (or a manual /models
-    # refresh), so a session with a valid on-disk cache would start without
-    # its discovered models.
-    if cached.ok:
-        await config_orchestrator.reload()
-
-    async def _refresh() -> None:
-        try:
-            await refresh_models(config_orchestrator, declared_aliases=declared)
-            await config_orchestrator.reload()
-        except Exception as exc:
-            logger.debug("Model catalog background refresh failed", exc_info=exc)
-
-    task = asyncio.create_task(_refresh(), name="vibe-provider-models-refresh")
-    _PROVIDER_MODEL_TASKS.add(task)
-    task.add_done_callback(_PROVIDER_MODEL_TASKS.discard)
 
 
 def _session_config_overrides(options: SessionOptions) -> dict[str, object]:

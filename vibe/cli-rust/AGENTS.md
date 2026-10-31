@@ -11,6 +11,10 @@ client ── spawn vibe-app-server, frame NDJSON, correlate ids, forward notifs
 proto  ── serde types for the SUBSET of methods/notifications we use
 ```
 
+## Fork features
+
+This crate carries fork-only features (root `AGENTS.md` "Fork features", skill `vibe-fork-features`): fzf search in every long list (`src/utils/fzf.rs`), `/model refresh`, and Linux clipboard image paste (`src/paste_image/linux.rs`). Never drop or degrade them, here or in a merge; their guards are `tests/units/{fork_features,fzf_rank,config_filter,model_picker_search,model_refresh,paste_image}.rs` and the client-e2e scenarios the root table lists.
+
 ## Rules
 
 - Do not modify code to make tests pass, modify code to fix code, and it should fix test, fix user and code first.

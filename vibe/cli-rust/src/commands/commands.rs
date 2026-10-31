@@ -45,7 +45,7 @@ impl Command {
 const COMMANDS: &[Command] = &[
     cmd(&["/help"], "Show help message", true),
     cmd(&["/config"], "Edit config settings", false),
-    cmd(&["/model"], "Select active model", false),
+    cmd(&["/model"], "Select active model", false).args("[refresh]"),
     cmd(&["/thinking"], "Select thinking level", false),
     cmd(&["/reload"], "Reload configuration, agent instructions, and skills from disk", false),
     cmd(&["/clear", "/new"], "Start a new conversation. Optionally pass a prompt to seed it.", false).args("[prompt]"),

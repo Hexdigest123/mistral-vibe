@@ -1,47 +1,47 @@
+"""Model discovery for providers flagged ``discover = true`` (fork feature).
+
+Keep it: AGENTS.md "Fork features" lists what this package must keep doing.
+"""
+
 from __future__ import annotations
 
+from vibe.core.models.cache import (
+    CACHE_VERSION,
+    DiscoveryCache,
+    boot_id,
+    cache_path,
+    load_cache,
+    save_cache,
+)
 from vibe.core.models.catalog import (
-    MODELS_CACHE_VERSION,
-    ModelCatalogCache,
+    DiscoveredModel,
     ModelCatalogResult,
-    ProviderCatalogEntry,
     fetch_provider_models,
-    load_catalog_cache,
     models_endpoint,
-    read_cached_catalog,
-    save_catalog_cache,
-    store_catalog_result,
+    parse_models,
 )
 from vibe.core.models.config_bridge import (
-    CatalogRefreshReport,
-    discover_only_provider_names,
-    load_cached_models,
-    refresh_models,
-    user_declared_model_aliases,
+    DiscoveryReport,
+    apply_discovered_models,
+    discover_provider_names,
 )
-from vibe.core.models.discovery import (
-    cached_provider_models,
-    discover_provider_models,
-    discovered_models_payload,
-)
+from vibe.core.models.discovery import discover, models_payload
 
 __all__ = [
-    "MODELS_CACHE_VERSION",
-    "CatalogRefreshReport",
-    "ModelCatalogCache",
+    "CACHE_VERSION",
+    "DiscoveredModel",
+    "DiscoveryCache",
+    "DiscoveryReport",
     "ModelCatalogResult",
-    "ProviderCatalogEntry",
-    "cached_provider_models",
-    "discover_only_provider_names",
-    "discover_provider_models",
-    "discovered_models_payload",
+    "apply_discovered_models",
+    "boot_id",
+    "cache_path",
+    "discover",
+    "discover_provider_names",
     "fetch_provider_models",
-    "load_cached_models",
-    "load_catalog_cache",
+    "load_cache",
     "models_endpoint",
-    "read_cached_catalog",
-    "refresh_models",
-    "save_catalog_cache",
-    "store_catalog_result",
-    "user_declared_model_aliases",
+    "models_payload",
+    "parse_models",
+    "save_cache",
 ]

@@ -2,6 +2,7 @@
 
 mod layout;
 mod persistence;
+mod search;
 
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Modifier, Style};
@@ -78,7 +79,8 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         input(f, editor, edit);
         None
     } else {
-        draw_choices(f, editor, edit, &choices)
+        let (list, shown) = search::draw(f, editor, edit, &choices, app.view.cursor_on);
+        draw_choices(f, list, edit, &shown)
     };
     persistence::inspector(f, layout.side, &edit.field);
     f.render_widget(
@@ -92,11 +94,13 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         ),
     );
     persistence::targets(f, layout.targets, &app.config_screen.targets, edit.target);
+    let search = config_edit::search::searchable(&edit.field).then_some(&edit.search);
     help(
         f,
         layout.help,
         !choices.is_empty(),
         config_edit::is_multiline(&edit.field),
+        search,
     );
     if let Some(error) = &edit.error {
         f.render_widget(
@@ -120,7 +124,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             crate::mouse::MouseTarget::ConfigEditor,
             track,
             total,
-            usize::from(editor.height),
+            usize::from(track.height),
             offset,
         );
     }
@@ -247,7 +251,13 @@ fn draw_choices(
     ))
 }
 
-fn help(f: &mut Frame, area: Rect, choices: bool, multiline: bool) {
+fn help(
+    f: &mut Frame,
+    area: Rect,
+    choices: bool,
+    multiline: bool,
+    search: Option<&crate::search_field::Search>,
+) {
     let narrow = area.width < 60;
     let save = match (choices, multiline) {
         (true, _) => hints::SELECT,
@@ -263,6 +273,12 @@ fn help(f: &mut Frame, area: Rect, choices: bool, multiline: bool) {
     if choices && !narrow {
         list.push(hints::NAVIGATE);
     }
+    if search.is_some() {
+        list.push(hints::SEARCH);
+    }
     list.extend([save, hints::CANCEL, (key::TAB, layer)]);
+    if let Some(search) = search {
+        list = crate::search_field::hints(search.focused, !search.query.is_empty(), &list);
+    }
     super::hint_line::draw_clipped(f, area.x, area.y, area.width, &list);
 }

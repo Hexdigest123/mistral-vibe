@@ -110,8 +110,12 @@ mod focus;
 mod fold_clicks;
 #[path = "units/foreign_session.rs"]
 mod foreign_session;
+#[path = "units/fork_features.rs"]
+mod fork_features;
 #[path = "units/frames_oversized.rs"]
 mod frames_oversized;
+#[path = "units/fzf_rank.rs"]
+mod fzf_rank;
 #[path = "units/headless_cli_flags.rs"]
 mod headless_cli_flags;
 #[path = "units/headless_logic.rs"]
@@ -204,6 +208,8 @@ mod model_enforcement;
 mod model_picker;
 #[path = "units/model_picker_search.rs"]
 mod model_picker_search;
+#[path = "units/model_refresh.rs"]
+mod model_refresh;
 #[path = "units/mouse_pixels.rs"]
 mod mouse_pixels;
 #[path = "units/mouse_routing.rs"]

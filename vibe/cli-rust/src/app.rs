@@ -608,6 +608,8 @@ pub struct ThinkingPicker {
 pub struct ResumePicker {
     pub open: bool,
     pub sessions: Vec<crate::resume_picker::Session>,
+    /// Filters `sessions` (fork feature, AGENTS.md); rows follow `resume_picker::search::shown`.
+    pub search: crate::search_field::Search,
     pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
     /// Folder the listed sessions belong to, from the server-filtered list. It
     /// is the attached session's cwd too.

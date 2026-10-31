@@ -179,7 +179,14 @@ def session_config_inputs(harness_files: HarnessFilesManager) -> Hashable:
     signatures, the project config's trust, and the environment. Keep it in
     step with them.
     """
-    files = [EXPERIMENT_EVAL_CACHE_FILE.path, MODEL_CATALOG_CACHE_FILE.path]
+    from vibe.core.models.cache import cache_path as discovered_models_cache
+
+    files = [
+        EXPERIMENT_EVAL_CACHE_FILE.path,
+        MODEL_CATALOG_CACHE_FILE.path,
+        # Fork feature: a /model refresh rewrites it (AGENTS.md "Fork features").
+        discovered_models_cache(),
+    ]
     if "user" in harness_files.sources and harness_files.user_config is None:
         files.append(harness_files.user_config_file)
     project_trust: bool | None = None

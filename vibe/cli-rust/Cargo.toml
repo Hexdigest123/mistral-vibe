@@ -58,6 +58,8 @@ webpki-root-certs = "1"
 sentry = { version = "0.49.2", default-features = false, features = ["backtrace", "contexts", "reqwest", "rustls", "tracing"] }
 uuid = { version = "1", features = ["v4"] }
 percent-encoding = "2"
+# fzf's matching and scoring (nucleo, from Helix) for every searchable list.
+nucleo-matcher = "0.3"
 
 [dev-dependencies]
 ctor = "0.2"
@@ -77,6 +79,13 @@ libc = "0.2"
 # (Credential Manager). macOS keeps the `security` shell-out in
 # `src/credentials/keyring.rs`, like Python.
 keyring = "4.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Fork feature (AGENTS.md): clipboard image paste on Linux without wl-clipboard
+# or xclip installed, over X11 and the Wayland data-control protocol.
+arboard = { version = "3.7", default-features = false, features = ["image-data", "wayland-data-control"] }
+# Re-encodes the native clipboard's pixels; the version arboard's `image` already uses.
+png = "0.18"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows pins credentials to Python `keyring`'s WinVault naming via the

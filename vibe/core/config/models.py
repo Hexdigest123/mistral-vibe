@@ -157,10 +157,10 @@ class ProviderConfig(BaseModel):
     # stream (and retried). Set to False for OpenAI-compatible endpoints that
     # do not emit a finish reason, to avoid spurious incomplete-stream errors.
     emits_finish_reason: bool = True
-    # Standalone providers whose models come solely from auto-discovery: the
-    # /models endpoint is queried even when no [[model]] block names this
-    # provider, and every discovered id is offered in the model picker.
-    discover_only: bool = False
+    # Fork feature (AGENTS.md "Fork features"): list every model this
+    # provider's /models endpoint offers in the model picker. Fetched once per
+    # boot and cached under the system temp dir (vibe.core.models).
+    discover: bool = False
     project_id: str = ""
     region: str = ""
     extra_headers: dict[str, str] = Field(default_factory=dict)

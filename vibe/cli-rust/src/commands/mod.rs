@@ -8,6 +8,7 @@ pub mod compact;
 mod dispatch;
 pub mod event;
 pub mod leanstall;
+pub mod model_refresh;
 pub mod provider_auth;
 pub mod retry;
 pub mod retry_continuation;

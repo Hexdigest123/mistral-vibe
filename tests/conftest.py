@@ -213,6 +213,18 @@ def get_base_config() -> dict[str, Any]:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_discovered_models_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    # Fork feature: model discovery caches under the system temp dir for the
+    # whole boot; no test may read or write the developer's real cache.
+    monkeypatch.setattr(
+        "vibe.core.models.cache._CACHE_DIR",
+        tmp_path_factory.mktemp("discovered_models"),
+    )
+
+
+@pytest.fixture(autouse=True)
 def tmp_working_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> Path:

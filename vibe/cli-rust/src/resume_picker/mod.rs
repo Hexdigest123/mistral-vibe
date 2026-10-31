@@ -2,6 +2,7 @@
 
 mod notice;
 mod request;
+pub mod search;
 
 use std::sync::Arc;
 
@@ -67,6 +68,7 @@ fn begin(app: &mut App) {
     app.resume_picker.preview_request += 1;
     app.resume_picker.open = true;
     app.resume_picker.sessions.clear();
+    crate::search_field::clear(&mut app.resume_picker.search);
     app.resume_picker.list.reset();
     app.resume_picker.previewing = false;
     app.resume_picker.resuming = false;
@@ -147,6 +149,11 @@ pub fn handle_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     if app.resume_picker.deleting.is_some() {
         return;
     }
+    // Esc first drops a pending delete confirmation, then reaches the search.
+    let confirming = key.code == KeyCode::Esc && app.resume_picker.delete_confirm.is_some();
+    if !confirming && search::key(app, client, &key) {
+        return;
+    }
     let chorded = key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
@@ -200,13 +207,11 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, event: Event) {
                 return;
             }
             if let Some(current) = app.session.session_id.as_deref() {
-                app.resume_picker.list.highlight(
-                    app.resume_picker
-                        .sessions
-                        .iter()
-                        .position(|session| session.id == current)
-                        .unwrap_or(0),
-                );
+                let sessions = &app.resume_picker.sessions;
+                let row = search::shown(app)
+                    .iter()
+                    .position(|&index| sessions[index].id == current);
+                app.resume_picker.list.highlight(row.unwrap_or(0));
             }
             preview(app, client);
         }
@@ -278,11 +283,12 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, event: Event) {
             app.resume_picker
                 .sessions
                 .retain(|session| session.id != id);
+            let rows = search::shown(app).len();
             app.resume_picker.list.highlight(
                 app.resume_picker
                     .list
                     .selected()
-                    .min(app.resume_picker.sessions.len().saturating_sub(1)),
+                    .min(rows.saturating_sub(1)),
             );
             let deleted = format!("Deleted session `{}`.", short_id(&id));
             if app.resume_picker.sessions.is_empty() {
@@ -321,7 +327,7 @@ fn drop_initial_prompt(app: &mut App) {
 }
 
 fn navigate(app: &mut App, client: &Arc<Client>, down: bool) {
-    let len = app.resume_picker.sessions.len();
+    let len = search::shown(app).len();
     if len == 0 {
         return;
     }
@@ -332,7 +338,7 @@ fn navigate(app: &mut App, client: &Arc<Client>, down: bool) {
 
 /// Scroll the saved-session viewport without changing the preview selection.
 pub fn wheel(app: &mut App, down: bool) {
-    if app.resume_picker.sessions.is_empty() {
+    if search::shown(app).is_empty() {
         return;
     }
     app.resume_picker.list.wheel(down, 2);
@@ -340,11 +346,7 @@ pub fn wheel(app: &mut App, down: bool) {
 
 fn preview(app: &mut App, client: &Arc<Client>) {
     notice::scroll_to_bottom(app);
-    let Some(session) = app
-        .resume_picker
-        .sessions
-        .get(app.resume_picker.list.selected())
-    else {
+    let Some(session) = search::selected(app) else {
         return;
     };
     let is_current = app.session.session_id.as_deref() == Some(session.id.as_str());
@@ -359,11 +361,7 @@ fn preview(app: &mut App, client: &Arc<Client>) {
 }
 
 fn resume(app: &mut App, client: &Arc<Client>) {
-    let Some(session) = app
-        .resume_picker
-        .sessions
-        .get(app.resume_picker.list.selected())
-    else {
+    let Some(session) = search::selected(app) else {
         return;
     };
     if app.resume_picker.resuming {
@@ -390,11 +388,7 @@ fn resume(app: &mut App, client: &Arc<Client>) {
 }
 
 fn delete(app: &mut App, client: &Arc<Client>) {
-    let Some(session) = app
-        .resume_picker
-        .sessions
-        .get(app.resume_picker.list.selected())
-    else {
+    let Some(session) = search::selected(app) else {
         return;
     };
     if app.session.session_id.as_deref() == Some(&session.id) {

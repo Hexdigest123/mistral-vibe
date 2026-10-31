@@ -46,13 +46,6 @@ pub struct State {
     pub reloading: bool,
 }
 
-impl State {
-    /// The filter query as matched: stripped and case-folded.
-    pub fn query(&self) -> String {
-        caseless::default_case_fold_str(self.filter.query.trim())
-    }
-}
-
 /// A plugin round-trip's answer; `Ok(None)` comes from a backend without plugins.
 pub enum Event {
     Read(Result<Option<PluginCatalogState>, String>),

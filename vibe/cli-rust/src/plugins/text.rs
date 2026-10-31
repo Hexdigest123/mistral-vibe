@@ -87,13 +87,6 @@ pub fn entry_facts(entry: &PluginCatalogEntry) -> String {
     .join(" · ")
 }
 
-/// Whether the filter query (already case-folded) matches the name or description.
-pub fn matches(entry: &PluginCatalogEntry, query: &str) -> bool {
-    query.is_empty()
-        || caseless::default_case_fold_str(&format!("{} {}", entry.name, entry.description))
-            .contains(query)
-}
-
 /// The detail view's lines.
 pub fn detail_lines(entry: &PluginCatalogEntry) -> Vec<String> {
     let mut lines = vec![

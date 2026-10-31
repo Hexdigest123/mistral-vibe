@@ -1,7 +1,6 @@
-//! `/model` picker state: a Default row plus one row per model, searchable by name, alias and
-//! provider. A pick chains straight into `/thinking`, which writes both at once.
+//! `/model` picker state: a Default row plus one row per model, fzf-searchable by name, alias and
+//! provider (fork feature, AGENTS.md). A pick chains straight into `/thinking`, which writes both.
 
-use std::cmp::Reverse;
 use std::sync::Arc;
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -14,7 +13,7 @@ use crate::option_list::OptionList;
 use crate::search_field::{self, Outcome};
 use crate::server::Client;
 use crate::thinking_picker::{self, ModelPick, THINKING_LEVELS};
-use crate::utils::fuzzy;
+use crate::utils::fzf;
 
 /// Alias persisted for the Default (unpinned) row.
 pub const UNPINNED_ACTIVE_MODEL: &str = "";
@@ -122,28 +121,24 @@ fn refilter(app: &mut App) {
     app.model_picker.list = OptionList::new(first);
 }
 
-/// Recompute `matches`: models scoring on any of display name, alias, id or provider, best first.
+/// Recompute `matches`: fzf over each model's display name, alias, id and provider, best first.
 fn rank(app: &mut App) {
     let query = query(app).to_owned();
     let picker = &mut app.model_picker;
-    picker.matches.clear();
-    if query.is_empty() {
-        return;
-    }
-    let mut scored: Vec<(i64, usize)> = picker
-        .models
-        .iter()
-        .enumerate()
-        .filter_map(|(i, m)| {
-            [&m.display_name, &m.alias, &m.name, &m.provider]
-                .into_iter()
-                .filter_map(|field| fuzzy::score(&query, field))
-                .max()
-                .map(|score| (score, i))
-        })
-        .collect();
-    scored.sort_by_key(|&(score, i)| (Reverse(score), i));
-    picker.matches = scored.into_iter().map(|(_, i)| i).collect();
+    picker.matches = match query.is_empty() {
+        true => Vec::new(),
+        false => fzf::rank(&picker.models, &query, haystack, |_| ""),
+    };
+}
+
+/// One line per model, so terms can match across fields (`openrouter gpt`).
+fn haystack(model: &ModelOption) -> String {
+    fzf::haystack([
+        model.display_name.as_str(),
+        &model.alias,
+        &model.name,
+        &model.provider,
+    ])
 }
 
 fn query(app: &App) -> &str {

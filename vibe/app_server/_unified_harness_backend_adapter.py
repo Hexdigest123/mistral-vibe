@@ -710,7 +710,7 @@ from vibe.core.model_catalog import (
     fetch_and_cache_model_catalog,
     model_catalog_wait_needed,
 )
-from vibe.core.models import refresh_models
+from vibe.core.models import apply_discovered_models
 from vibe.core.proxy_setup import (
     SUPPORTED_PROXY_VARS,
     ProxySetupError,
@@ -7779,32 +7779,31 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
     async def refresh_models_catalog(
         self, params: ModelsRefreshParams
     ) -> SessionBackendResult[ModelsRefreshResponse]:
-        """Re-run model auto-discovery and reload the config from the result.
+        """Fork feature (AGENTS.md "Fork features"): ask every ``discover =
+        true`` provider for its models again, past this boot's cache.
 
-        The fetched lists land in the provider-models layer (persisted in the
-        on-disk cache), the orchestrator reload re-merges it, and the returned
-        runtime snapshot carries the discovered models to the client.
+        The lists land in the provider-models layer and the boot cache, the
+        reload re-merges them, and the runtime update the dispatch emits
+        carries them to the client. A provider that fails keeps its cached
+        models, with the reason in ``errors``.
         """
         self._require_session(params.session_id)
         self._require_idle()
-        report = await refresh_models(self._context.config_orchestrator)
-        await self._context.config_orchestrator.reload(preflight=self._preflight_config)
-        await self._apply_derivation()
+        orchestrator = self._context.config_orchestrator
+        report = await apply_discovered_models(orchestrator, refresh=True)
+        if report.changed:
+            await orchestrator.reload(preflight=self._preflight_config)
+            await self._apply_derivation()
         entries = [
             ModelCatalogEntryView(
                 provider_name=result.provider_name,
                 endpoint=result.endpoint,
-                model_ids=list(result.model_ids),
+                model_ids=result.model_ids,
             )
             for result in report.results
         ]
-        errors = [
-            f"{result.provider_name}: {result.error}"
-            for result in report.results
-            if not result.ok
-        ]
         response = ModelsRefreshResponse(
-            entries=entries, total_models=report.total_models, errors=errors
+            entries=entries, total_models=report.total_models, errors=report.errors
         )
         return SessionBackendResult(response=response)
 

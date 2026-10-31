@@ -188,7 +188,6 @@ fn handle_input_event(
                 Focus::Trust
                 | Focus::Approval
                 | Focus::VoiceApp
-                | Focus::ResumePicker
                 | Focus::McpOAuth
                 | Focus::ConnectorAuth
                 | Focus::Rewind
@@ -201,6 +200,7 @@ fn handle_input_event(
                 Focus::Config => config::handle_paste(app, text),
                 Focus::ReleaseNotes => crate::release_notes::paste(app, &text),
                 Focus::ModelPicker => crate::model_picker::paste(app, &text),
+                Focus::ResumePicker => crate::resume_picker::search::paste(app, client, &text),
                 Focus::VibeCodeProject => crate::vibe_code_project::input::paste(app, &text),
                 Focus::Mcp => crate::mcp::search::paste(app, &text),
                 Focus::Plugins => crate::plugins::paste(app, &text),

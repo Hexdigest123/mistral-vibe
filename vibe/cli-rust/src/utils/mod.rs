@@ -32,6 +32,7 @@ pub mod datetime;
 pub mod file_index;
 pub mod file_match;
 pub mod fuzzy;
+pub mod fzf;
 pub mod graphemes;
 pub mod greeting_cache;
 pub mod history_manager;

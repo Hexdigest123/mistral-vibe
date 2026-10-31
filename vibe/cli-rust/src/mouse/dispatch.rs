@@ -67,6 +67,9 @@ pub(super) fn dispatch(
             }
         }
         MouseTarget::ResumePicker => {
+            if resume_picker::search::click(app, event) {
+                return;
+            }
             let click = option_gesture(app, event, RegionId::BottomApp, |app| {
                 &mut app.resume_picker.list
             });

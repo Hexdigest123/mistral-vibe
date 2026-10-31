@@ -1,4 +1,4 @@
-//! `/resume` picker view.
+//! `/resume` picker view: title, search row (fork feature, AGENTS.md), sessions, hints.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -9,19 +9,24 @@ use super::{scrollbar, theme};
 use crate::app::App;
 use crate::hints::{self, action};
 
+/// Rows around the list: 2 borders, title, search, blank, margin-top, help.
+const CHROME_ROWS: u16 = 7;
+
 pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
-    let height = (app.resume_picker.sessions.len().max(1) as u16 + 6).min(max_height(area));
+    // Sized from every session, so typing a search never resizes the box.
+    let rows = app.resume_picker.sessions.len().max(1) as u16;
+    let height = (rows + CHROME_ROWS).min(max_height(area));
     let kind = super::bottom_app::Kind::Resume;
     super::bottom_app::draw(app, f, area, height, kind, draw_box);
 }
 
 /// The whole picker takes at most 40% of the screen, keeping one session row.
 fn max_height(area: Rect) -> u16 {
-    (area.height * 2 / 5).max(7)
+    (area.height * 2 / 5).max(CHROME_ROWS + 1)
 }
 
 fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
-    if area.height < 5 {
+    if area.height < CHROME_ROWS {
         return;
     }
     f.render_widget(Clear, area);
@@ -39,11 +44,18 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
         .set_string(area.x + 2, area.y + 1, "local", title);
     f.buffer_mut()
         .set_string(area.x + 8, area.y + 1, cwd, theme::muted_style().bg(bg));
-    let visible = area.height.saturating_sub(6) as usize;
-    let total = app.resume_picker.sessions.len();
+    draw_search(
+        app,
+        f,
+        Rect::new(area.x + 3, area.y + 2, area.width.saturating_sub(6), 1),
+    );
+    let visible = area.height.saturating_sub(CHROME_ROWS) as usize;
+    let shown = crate::resume_picker::search::shown(app);
+    let total = shown.len();
+    let top = area.y + 4;
     let list_area = Rect::new(
         area.x + 1,
-        area.y + 3,
+        top,
         area.width.saturating_sub(2),
         visible as u16,
     );
@@ -60,23 +72,17 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
         .x
         .saturating_add(area.width.saturating_sub(if has_scrollbar { 4 } else { 3 }));
     crate::mouse::register_region(app, list_area, crate::mouse::MouseTarget::ResumePicker);
-    if app.resume_picker.sessions.is_empty() {
-        f.buffer_mut().set_string(
-            area.x + 3,
-            area.y + 3,
-            "Loading sessions...",
-            theme::muted_style().bg(bg),
-        );
+    let empty = match app.resume_picker.sessions.is_empty() {
+        true => "Loading sessions...",
+        false => "No matching sessions",
+    };
+    if shown.is_empty() {
+        f.buffer_mut()
+            .set_string(area.x + 3, top, empty, theme::muted_style().bg(bg));
     }
-    for (row, session) in app
-        .resume_picker
-        .sessions
-        .iter()
-        .skip(scroll)
-        .take(visible)
-        .enumerate()
-    {
-        let y = area.y + 3 + row as u16;
+    for (row, &index) in shown.iter().skip(scroll).take(visible).enumerate() {
+        let session = &app.resume_picker.sessions[index];
+        let y = top + row as u16;
         let selected = scroll + row == app.resume_picker.list.selected();
         let text = if session.title.is_empty() {
             &session.preview
@@ -139,7 +145,7 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
         }
     }
     if has_scrollbar {
-        let bar = Rect::new(area.x + area.width - 4, area.y + 3, 1, visible as u16);
+        let bar = Rect::new(area.x + area.width - 4, top, 1, visible as u16);
         scrollbar::draw(
             app,
             f,
@@ -150,14 +156,36 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
             scroll as u16,
         );
     }
-    let help = [
-        hints::NAVIGATE,
-        hints::SELECT,
-        ("d", action::DELETE),
-        hints::CANCEL,
-    ];
+    let search = &app.resume_picker.search;
+    let help = crate::search_field::hints(
+        search.focused,
+        !search.query.is_empty(),
+        &[
+            hints::NAVIGATE,
+            hints::SELECT,
+            hints::SEARCH,
+            ("d", action::DELETE),
+            hints::CANCEL,
+        ],
+    );
     let width = area.width.saturating_sub(4);
     super::hint_line::draw_clipped(f, area.x + 2, area.y + area.height - 2, width, &help);
+}
+
+/// The search row under the title; the field owns its clicks.
+fn draw_search(app: &mut App, f: &mut Frame, row: Rect) {
+    let input = super::search_field::draw_row(
+        f,
+        row,
+        &app.resume_picker.search,
+        "Search sessions",
+        app.view.cursor_on,
+        theme::background(),
+    );
+    app.resume_picker.search.area = input;
+    crate::mouse::register_region(app, input, crate::mouse::MouseTarget::ResumePicker);
+    let field = (input.y, input.x, input.right().saturating_sub(1));
+    app.view.bottom_app_selection_chrome.push(field);
 }
 
 fn relative_time(timestamp: u64) -> String {

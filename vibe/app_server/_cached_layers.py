@@ -11,6 +11,7 @@ from vibe.core.config.layers.model_catalog import apply_cached_model_catalog
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.experiments.cache import load_cached_eval_response
 from vibe.core.experiments.manager import config_variants_from_response
+from vibe.observability.logging import logger
 from vibe.utils.oidc_marker import is_oidc_marker, oidc_enabled
 
 OIDC_TENANT_UNRESOLVED = AdminConfigApplyResult(
@@ -52,7 +53,7 @@ async def apply_cached_layers(
     org_config: OrgConfigService | None,
 ) -> tuple[OrgConfigKey | None, str | None, AdminConfigApplyResult | None]:
     """Apply the held org config, the cached experiment variants and model
-    catalog.
+    catalog, and the models of ``discover = true`` providers.
 
     Session builds and host reads (``agents/list``, ``config/read``) both go
     through here, so they see the same config. ``org_config=None`` skips the
@@ -70,7 +71,29 @@ async def apply_cached_layers(
     )
     await _apply_cached_experiment_variants(orchestrator)
     await apply_cached_model_catalog(orchestrator)
+    await _apply_discovered_models(orchestrator)
     return org_key, tried, failure
+
+
+async def _apply_discovered_models(
+    orchestrator: ConfigOrchestrator[VibeConfigSchema],
+) -> None:
+    """Fork feature (AGENTS.md "Fork features"): the models of every
+    ``discover = true`` provider, from this boot's cache or fetched once.
+
+    Last, so the providers it reads include the org config's. Fail-open: a
+    provider that cannot be listed only goes without its models.
+    """
+    # Lazy: keeps the HTTP client off the app server's startup import path.
+    from vibe.core.models import apply_discovered_models
+
+    try:
+        report = await apply_discovered_models(orchestrator)
+    except Exception:
+        logger.exception("Model discovery failed")
+        return
+    if report.changed:
+        await orchestrator.reload()
 
 
 async def _apply_cached_experiment_variants(

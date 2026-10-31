@@ -69,35 +69,25 @@ pub fn apply_loaded(app: &mut App, mut loaded: Loaded) {
     app.config_screen.loading = false;
 }
 
-pub fn filtered(app: &App) -> Vec<&ConfigField> {
-    use crate::utils::fuzzy;
-    use std::cmp::Reverse;
+/// Above this many matches the list keeps its Popular and Advanced sections.
+pub const MERGED_MATCHES: usize = 5;
 
-    let query = app.config_screen.search.query.trim();
-    if query.is_empty() {
-        let mut fields: Vec<_> = app.config_screen.fields.iter().collect();
-        fields.sort_by_key(|field| !field.popular);
-        return fields;
+/// Fields for the search (fork feature, AGENTS.md): fzf on names first, then
+/// descriptions holding every term; popular fields win ties. A sectioned list
+/// (`ui::config_options`) numbers its rows popular first, so it gets them so.
+pub fn filtered(app: &App) -> Vec<&ConfigField> {
+    let mut fields: Vec<_> = app.config_screen.fields.iter().collect();
+    fields.sort_by_key(|field| !field.popular);
+    let query = app.config_screen.search.query.as_str();
+    let mut ranked: Vec<_> =
+        crate::utils::fzf::rank(&fields, query, |f| f.name.clone(), |f| &f.description)
+            .into_iter()
+            .map(|index| fields[index])
+            .collect();
+    if ranked.len() > MERGED_MATCHES {
+        ranked.sort_by_key(|field| !field.popular);
     }
-    let mut scored: Vec<_> = app
-        .config_screen
-        .fields
-        .iter()
-        .filter_map(|field| {
-            let name = fuzzy::score(query, &field.name).unwrap_or(0);
-            let description = fuzzy::score(query, &field.description).unwrap_or(0);
-            // Names carry twice the description weight, without rounding.
-            let score = (name * 2).max(description);
-            (score > 0).then_some((score, field))
-        })
-        .collect();
-    if scored.len() <= 5 {
-        // Popular fields get a 1.25x boost only in the merged list.
-        scored.sort_by_key(|(score, field)| Reverse(score * if field.popular { 5 } else { 4 }));
-    } else {
-        scored.sort_by_key(|(score, field)| (!field.popular, Reverse(*score)));
-    }
-    scored.into_iter().map(|(_, field)| field).collect()
+    ranked
 }
 
 pub fn handle_key(app: &mut App, client: &Arc<Client>, tx: &mpsc::Sender<Loaded>, key: KeyEvent) {
