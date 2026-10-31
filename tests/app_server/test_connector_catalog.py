@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
@@ -116,11 +117,11 @@ async def test_manage_connectors_url_none_when_identity_incomplete(monkeypatch) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("scope", "expected"),
-    [("shared_only", True), ("personal_and_shared", False), (None, False)],
+    ("can_access_private_resources", "expected"),
+    [(False, True), (True, False), (None, False)],
 )
-async def test_private_connectors_hidden_only_for_shared_only_keys(
-    monkeypatch, scope: str | None, expected: bool
+async def test_private_connectors_hidden_from_account_context(
+    monkeypatch, can_access_private_resources: bool | None, expected: bool
 ) -> None:
     config = build_test_vibe_config(enable_connectors=True)
     provider = connector_catalog._ConnectorProvider(
@@ -130,7 +131,9 @@ async def test_private_connectors_hidden_only_for_shared_only_keys(
         connector_catalog, "_resolve_provider", lambda _config: provider
     )
     whoami = WhoAmIResult(
-        plan_type=AccountPlanKind.API, plan_name="FREE", primitive_access_scope=scope
+        plan_type=AccountPlanKind.CHAT,
+        plan_name="FREE",
+        can_access_private_resources=can_access_private_resources,
     )
     resolve = AsyncMock(return_value=whoami)
     monkeypatch.setattr(connector_catalog._WHOAMI_CACHE, "resolve", resolve)
@@ -167,7 +170,7 @@ async def test_private_connectors_hidden_retries_whoami_only_after_cooldown(
     resolve.return_value = WhoAmIResult(
         plan_type=AccountPlanKind.API,
         plan_name="FREE",
-        primitive_access_scope="shared_only",
+        can_access_private_resources=False,
     )
 
     assert await connector_catalog._private_connectors_hidden(config) is True
@@ -197,7 +200,7 @@ async def test_private_connectors_hidden_reads_disk_cache_during_cooldown(
         WhoAmIResult(
             plan_type=AccountPlanKind.API,
             plan_name="FREE",
-            primitive_access_scope="shared_only",
+            can_access_private_resources=False,
         ),
     )
 
@@ -641,6 +644,382 @@ async def test_connector_cache_ttl_never_slides(
     assert expired.disposition == "not_loaded"
     assert expired.catalog is None
     assert fetch_count == 1
+
+
+@pytest.mark.asyncio
+async def test_opening_reads_an_expired_catalog_without_fetching(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A catalog cached an hour ago and a service that cannot fetch.
+    *Do*: Read the cached catalog for opening a session, and with nothing cached.
+    *Assert*: The expired catalog is returned without a fetch, and an empty
+      cache answers None: opening never waits on the connector service.
+    """
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    cache_path = tmp_path / "connectors.json"
+
+    async def fetch(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        return {"connectors": [_connector()]}
+
+    async def unreachable(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        raise AssertionError("opening a session must not fetch")
+
+    orchestrator = _orchestrator()
+    await ConnectorCatalogService(
+        implicit_source_enabled=False,
+        cache_path=cache_path,
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    ).resolve_catalog(orchestrator)
+
+    def service(path: Path) -> ConnectorCatalogService:
+        return ConnectorCatalogService(
+            implicit_source_enabled=False,
+            cache_path=path,
+            fetch_bootstrap=unreachable,
+            clock=lambda: 1_000 + 3_600,
+        )
+
+    # Do
+    expired = await service(cache_path).read_cached_catalog(orchestrator)
+    empty = await service(tmp_path / "empty.json").read_cached_catalog(orchestrator)
+
+    # Assert
+    assert expired is not None
+    assert [connector.alias for connector in expired.connectors] == ["wiki"]
+    assert empty is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_bootstrap_answers_the_next_callers_until_it_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A connector backend that fails, with no cached catalog.
+    *Do*: Resolve the catalog again inside the retry window, then after it.
+    *Assert*: Callers inside the window fail at once without another fetch; the
+    first one after it fetches again and recovers. Each caller would otherwise
+    wait out its own bootstrap timeout against a backend that just failed.
+    """
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    now = [1_000]
+    fetches = 0
+    backend_up = False
+
+    async def fetch(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        nonlocal fetches
+        fetches += 1
+        if not backend_up:
+            raise TimeoutError("connectors backend is down")
+        return {"connectors": [_connector()]}
+
+    orchestrator = _orchestrator()
+    service = ConnectorCatalogService(
+        implicit_source_enabled=False,
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+        clock=lambda: now[0],
+    )
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator)
+
+    # Do
+    now[0] = 1_059
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator)
+    fetches_in_window = fetches
+    backend_up = True
+    now[0] = 1_060
+    recovered = await service.resolve_catalog(orchestrator)
+
+    # Assert
+    assert fetches_in_window == 1
+    assert recovered is not None
+    assert fetches == 2
+
+
+@pytest.mark.parametrize(("status", "fails"), [(404, False), (503, True)])
+@pytest.mark.asyncio
+async def test_a_server_without_a_connector_service_has_no_connectors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: int, fails: bool
+) -> None:
+    """*Prepare*: A server answering the bootstrap with 404, as one without the
+      connector service does (self-hosted, Private Cloud, a proxy), or 503.
+    *Do*: Resolve the catalog.
+    *Assert*: A 404 is an empty catalog, not a failure to warn about; a 503
+      still fails.
+    """
+    import httpx2
+
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+
+    async def fetch(
+        base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        request = httpx2.Request("GET", f"{base_url}/v1/connectors/bootstrap")
+        response = httpx2.Response(status, request=request)
+        raise httpx2.HTTPStatusError("bootstrap", request=request, response=response)
+
+    service = ConnectorCatalogService(
+        implicit_source_enabled=False,
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    )
+
+    # Do
+    try:
+        catalog = await service.resolve_catalog(_orchestrator())
+        error = None
+    except ConnectorCatalogUnavailableError as exc:
+        catalog, error = None, exc
+
+    # Assert
+    if fails:
+        assert error is not None
+        assert "HTTP 503" in str(error)
+    else:
+        assert error is None
+        assert catalog is not None
+        assert catalog.connectors == ()
+
+
+@pytest.mark.asyncio
+async def test_a_failure_nobody_remembers_leaves_the_next_caller_to_fetch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A connector backend that fails, with no cached catalog.
+    *Do*: Resolve without remembering the failure, as the app server's warm-up
+      does, then resolve again at once, as a session does.
+    *Assert*: The session's resolve fetches again instead of inheriting the
+      warm-up's failure.
+    """
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    fetches = 0
+
+    async def fetch(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        nonlocal fetches
+        fetches += 1
+        raise TimeoutError("connectors backend is down")
+
+    orchestrator = _orchestrator()
+    service = ConnectorCatalogService(
+        implicit_source_enabled=False,
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    )
+
+    # Do
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator, remember_failure=False)
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator)
+
+    # Assert
+    assert fetches == 2
+
+
+@pytest.mark.asyncio
+async def test_a_failed_bootstrap_answers_another_service_in_the_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: One catalog service whose bootstrap just failed.
+    *Do*: Resolve the same provider's catalog through a second service.
+    *Assert*: The second fails at once without fetching. Every session in a
+    shared app-server process builds its own service, so a failure kept per
+    service would let each session wait out the same dead backend again.
+    """
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    fetches = 0
+
+    async def fetch(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        nonlocal fetches
+        fetches += 1
+        raise TimeoutError("connectors backend is down")
+
+    orchestrator = _orchestrator()
+
+    def service() -> ConnectorCatalogService:
+        return ConnectorCatalogService(
+            implicit_source_enabled=False,
+            cache_path=tmp_path / "connectors.json",
+            fetch_bootstrap=fetch,
+            clock=lambda: 1_000,
+        )
+
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service().resolve_catalog(orchestrator)
+
+    # Do
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service().resolve_catalog(orchestrator)
+
+    # Assert
+    assert fetches == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_fetches_share_one_bootstrap_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: Two catalog services, no cached catalog, and a slow backend.
+    *Do*: Resolve the same provider's catalog through both at once.
+    *Assert*: One request answers both. Two sessions opening together in a
+    shared process would otherwise each wait out the same slow request.
+    """
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    fetches = 0
+    release = asyncio.Event()
+
+    async def fetch(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        nonlocal fetches
+        fetches += 1
+        await release.wait()
+        return {"connectors": [_connector()]}
+
+    orchestrator = _orchestrator()
+
+    def service(name: str) -> ConnectorCatalogService:
+        return ConnectorCatalogService(
+            implicit_source_enabled=False,
+            cache_path=tmp_path / f"{name}.json",
+            fetch_bootstrap=fetch,
+            clock=lambda: 1_000,
+        )
+
+    # Do
+    first = asyncio.create_task(service("first").resolve_catalog(orchestrator))
+    second = asyncio.create_task(service("second").resolve_catalog(orchestrator))
+    await asyncio.sleep(0)
+    release.set()
+    catalogs = await asyncio.gather(first, second)
+
+    # Assert
+    assert fetches == 1
+    assert all(catalog is not None for catalog in catalogs)
+
+
+@pytest.mark.asyncio
+async def test_a_shared_bootstrap_outlives_one_waiter_but_not_all_of_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: Two services waiting on one slow first fetch.
+    *Do*: Cancel one waiter and let the fetch finish, then start another fetch,
+      cancel its only waiter, and resolve again while that one is cancelling.
+    *Assert*: The other waiter still gets the catalog, a fetch nobody waits on
+      any more is cancelled rather than left running past its session, and the
+      caller arriving meanwhile gets a fetch of its own, not the cancellation.
+    """
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    release = asyncio.Event()
+    fetch_cancelled = asyncio.Event()
+
+    async def fetch(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            fetch_cancelled.set()
+            raise
+        return {"connectors": [_connector()]}
+
+    orchestrator = _orchestrator()
+
+    def service(name: str) -> ConnectorCatalogService:
+        return ConnectorCatalogService(
+            implicit_source_enabled=False,
+            cache_path=tmp_path / f"{name}.json",
+            fetch_bootstrap=fetch,
+            clock=lambda: 1_000,
+        )
+
+    async def join(name: str, waiters: int) -> asyncio.Task[object]:
+        task = asyncio.create_task(service(name).resolve_catalog(orchestrator))
+        while (
+            sum(f.waiters for f in connector_catalog._BOOTSTRAP_IN_FLIGHT.values())
+            < waiters
+        ):
+            await asyncio.sleep(0)
+        return task
+
+    # Do
+    leaving = await join("leaving", 1)
+    staying = await join("staying", 2)
+    leaving.cancel()
+    release.set()
+    catalog = await staying
+    release.clear()
+    abandoned = await join("abandoned", 1)
+    abandoned.cancel()
+    await asyncio.sleep(0)
+    arriving = asyncio.create_task(service("arriving").resolve_catalog(orchestrator))
+    await asyncio.wait_for(fetch_cancelled.wait(), timeout=1)
+    release.set()
+    arrived = await asyncio.wait_for(arriving, timeout=1)
+
+    # Assert
+    assert catalog is not None
+    assert leaving.cancelled()
+    assert abandoned.cancelled()
+    assert arrived is not None
+
+
+@pytest.mark.asyncio
+async def test_a_forced_refresh_retries_a_failed_bootstrap_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A bootstrap that just failed and a backend that is back.
+    *Do*: Force a refresh inside the retry window.
+    *Assert*: It fetches and recovers. A user asking to refresh connectors
+    must not be answered from the remembered failure.
+    """
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    backend_up = False
+
+    async def fetch(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        if not backend_up:
+            raise TimeoutError("connectors backend is down")
+        return {"connectors": [_connector()]}
+
+    orchestrator = _orchestrator()
+    service = ConnectorCatalogService(
+        implicit_source_enabled=False,
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    )
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator)
+    backend_up = True
+
+    # Do
+    refreshed = await service.resolve_catalog(orchestrator, force_refresh=True)
+
+    # Assert
+    assert refreshed is not None
 
 
 def test_connector_cache_reads_safe_legacy_record_without_rewrite(
@@ -1801,7 +2180,7 @@ async def test_connect_http_failure_reads_as_a_sentence_without_the_body(
     *Assert*: The message explains the status and never echoes the response body.
     """
     # Prepare
-    respx.post(
+    respx.patch(
         "https://api.example.test/v1/connectors/connector-1/user/credentials"
     ).respond(status, json={"detail": "internal trace id abc123"})
     provider = connector_catalog._ConnectorProvider(
@@ -1830,7 +2209,7 @@ async def test_connect_without_credentials_creates_the_default_user_connection()
     *Assert*: It posts an empty default user connection, as the dashboard does.
     """
     # Prepare
-    route = respx.post(
+    route = respx.patch(
         "https://api.example.test/v1/connectors/connector-1/user/credentials"
     ).respond(json={"message": "ok"})
     provider = connector_catalog._ConnectorProvider(

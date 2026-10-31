@@ -1,6 +1,5 @@
-//! `/model` picker bottom-app: a bordered box with a title, the model option
-//! list (a leading Default row with a `(currently …)` hint, `›` on the current
-//! choice, no live preview), and a hint.
+//! `/model` picker bottom-app: title, search row, the model list (Default row, `›` on the
+//! current choice, each model's provider dimmed), and a hint.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -9,7 +8,19 @@ use ratatui::Frame;
 
 use super::{hint_line, list_cursor, scrollbar, theme};
 use crate::app::App;
-use crate::model_picker::{is_current, option_count};
+use crate::hints::{self, action, key, Hint};
+use crate::model_picker::{is_current, is_default_row, model_at, option_count};
+use crate::mouse::MouseTarget;
+
+const HINTS: &[Hint] = &[
+    hints::NAVIGATE,
+    hints::SEARCH,
+    (key::ENTER, action::SAVE),
+    ("s", action::SESSION_ONLY),
+    hints::CANCEL,
+];
+/// Rows around the list: 2 borders, title, search, blank, margin-top, help.
+const CHROME_ROWS: u16 = 7;
 
 /// Draw the whole screen with the picker replacing the input box; the chat
 /// shrinks to make room for the bottom-app.
@@ -19,18 +30,17 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     super::bottom_app::draw(app, f, area, height, kind, draw_box);
 }
 
-/// Visible option rows: `min(count, 50vh)`.
+/// Visible option rows: `min(all models + Default, 50vh)`, so typing never resizes the box.
 fn visible_rows(app: &App, area_height: u16) -> usize {
-    (area_height as usize / 2).min(option_count(app))
+    (area_height as usize / 2).min(app.model_picker.models.len() + 1)
 }
 
-/// Total box height: 2 borders + title + options + margin-top + help.
 fn box_height(app: &App, area_height: u16) -> u16 {
-    visible_rows(app, area_height) as u16 + 5
+    visible_rows(app, area_height) as u16 + CHROME_ROWS
 }
 
 fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
-    if area.height < 5 {
+    if area.height < CHROME_ROWS {
         return;
     }
     f.render_widget(Clear, area);
@@ -59,8 +69,10 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let visible = h.saturating_sub(5) as usize;
-    let top = by + 2;
+    draw_search(app, f, Rect::new(bx + 3, by + 2, w.saturating_sub(6), 1));
+
+    let visible = h.saturating_sub(CHROME_ROWS) as usize;
+    let top = by + 4;
     let total = option_count(app);
     let list_area = Rect::new(bx + 1, top, w.saturating_sub(2), visible as u16);
     // Without overflow there is no scrollbar gutter, so the options span one
@@ -69,7 +81,17 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
     let gutter = if has_scrollbar { 7 } else { 6 };
     let options = Rect::new(bx + 3, top, w.saturating_sub(gutter), visible as u16);
     let offset = app.model_picker.list.layout_rows(total, options);
-    crate::mouse::register_region(app, list_area, crate::mouse::MouseTarget::ModelPicker);
+    crate::mouse::register_region(app, list_area, MouseTarget::ModelPicker);
+    if total == 0 {
+        let style = theme::dim(theme::text_muted()).bg(theme::background());
+        f.buffer_mut().set_stringn(
+            options.x + 2,
+            top,
+            "No matching models",
+            options.width as usize,
+            style,
+        );
+    }
 
     for (row, i) in (offset..total).take(visible).enumerate() {
         let y = top + row as u16;
@@ -90,7 +112,7 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
         scrollbar::draw(
             app,
             f,
-            crate::mouse::MouseTarget::ModelPicker,
+            MouseTarget::ModelPicker,
             bar,
             total as u16,
             visible as u16,
@@ -98,7 +120,25 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
         );
     }
 
-    hint_line::draw(f, bx + 2, by + h - 2, hint_line::PICK_HINTS);
+    let search = &app.model_picker.search;
+    let help = crate::search_field::hints(search.focused, !search.query.is_empty(), HINTS);
+    hint_line::draw(f, bx + 2, by + h - 2, &help);
+}
+
+/// The search row under the title; the field owns its clicks.
+fn draw_search(app: &mut App, f: &mut Frame, row: Rect) {
+    let input = super::search_field::draw_row(
+        f,
+        row,
+        &app.model_picker.search,
+        "Search models",
+        app.view.cursor_on,
+        theme::background(),
+    );
+    app.model_picker.search.area = input;
+    crate::mouse::register_region(app, input, MouseTarget::ModelPicker);
+    let field = (input.y, input.x, input.right().saturating_sub(1));
+    app.view.bottom_app_selection_chrome.push(field);
 }
 
 /// One option row: the `›`/blank marker, the label, and (row 0) the dim hint.
@@ -119,17 +159,21 @@ fn draw_option(app: &App, f: &mut Frame, row: Rect, i: usize) {
         true => base.add_modifier(Modifier::BOLD),
         false => base,
     };
-    let label = if i == 0 {
-        "Default"
-    } else {
-        &app.model_picker.models[i - 1].display_name
+    let (label, hint) = match (is_default_row(app, i), model_at(app, i)) {
+        (true, _) => (
+            "Default",
+            format!("  (currently {})", app.model_picker.default_display_name),
+        ),
+        (false, Some(model)) if model.provider.is_empty() => {
+            (model.display_name.as_str(), String::new())
+        }
+        (false, Some(model)) => (model.display_name.as_str(), format!("  {}", model.provider)),
+        (false, None) => return,
     };
-    f.buffer_mut().set_string(x + 2, y, label, name_style);
-
-    if i == 0 {
-        let hint = format!("  (currently {})", app.model_picker.default_display_name);
-        let hint_style = dim;
-        let hint_x = x + 2 + label.chars().count() as u16;
-        f.buffer_mut().set_string(hint_x, y, hint, hint_style);
-    }
+    let room = row.width.saturating_sub(2) as usize;
+    let (end, _) = f
+        .buffer_mut()
+        .set_stringn(x + 2, y, label, room, name_style);
+    let room = (row.right()).saturating_sub(end) as usize;
+    f.buffer_mut().set_stringn(end, y, hint, room, dim);
 }

@@ -72,7 +72,7 @@ impl EventLoop {
                 state.real_event_pending = true;
                 continue;
             }
-            if self.app.approval.has_capacity() {
+            if self.app.approval.has_capacity() && crate::question_app::has_capacity(&self.app) {
                 if let Some(notification) = deferred_notification.take() {
                     if !event_handler::apply_notification(
                         &mut self.app,
@@ -107,6 +107,8 @@ impl EventLoop {
                 // convergence, and every wizard round painted its relaunch
                 // before re-entering.
                 _ = redraw_tick.tick(), if state.redraw_pending => {
+                    let mouse = self.app.session.startup_config.enable_mouse_capture;
+                    self.terminal_guard.set_mouse_capture(mouse)?;
                     let (animating, mounting, indexing) = redraw_frame(
                         &mut self.app,
                         &self.client,
@@ -193,15 +195,13 @@ impl EventLoop {
                     state.real_event_pending = true;
                 }
                 // Draws nothing and settles nothing: analytics never alter the UI.
+                // Pre-session events are held until `set_session_id` flushes them.
                 Some(event) = sources.telemetry.recv() => {
                     if let Some(session_id) = self.app.session.session_id.clone() {
                         crate::telemetry::send(&self.client, &session_id, event);
+                    } else {
+                        self.app.session.held_telemetry.push(event);
                     }
-                }
-                Some(event) = sources.narrator.recv() => {
-                    turn_summary::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
                 }
                 Some(event) = sources.ready.recv() => {
                     // The missing-key verdict is a typed loop exit (the
@@ -269,7 +269,7 @@ impl EventLoop {
                     state.redraw_pending = true;
                     state.real_event_pending = true;
                 }
-                _ = tokio::time::sleep_until(typing_pause_deadline(&self.app)), if self.app.question_app.pending.is_some() => {
+                _ = tokio::time::sleep_until(typing_pause_deadline(&self.app)), if crate::question_app::waiting(&self.app) => {
                     crate::question_app::show_pending(&mut self.app);
                     state.redraw_pending = true;
                     state.real_event_pending = true;
@@ -288,108 +288,14 @@ impl EventLoop {
                     crate::subagents::start_refresh(&mut self.app, &self.client);
                     state.redraw_pending = true;
                 }
-                Some(event) = sources.subagents.recv() => {
-                    self.app.commit_finished();
-                    crate::subagents::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.older_history.recv() => {
-                    self.app.commit_finished();
-                    crate::older_history::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.theme.recv() => {
-                    crate::theme_picker::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.model.recv() => {
-                    crate::model_picker::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.log_level.recv() => {
-                    crate::log_level_picker::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.debug_console.recv() => {
-                    // Only a page load claims a busy slot; a poll leaves the app idle.
-                    if matches!(&event, crate::debug_console::Event::Page { .. }) {
-                        self.app.commit_finished();
-                    }
-                    crate::debug_console::apply_event(&mut self.app, &self.client, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.thinking.recv() => {
-                    crate::thinking_picker::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.agents.recv() => {
-                    crate::agents::apply_event(&mut self.app, &self.client, event);
+                Some(event) = sources.events.recv() => {
+                    crate::ui_event::apply(&mut self.app, &self.client, event);
                     state.redraw_pending = true;
                     state.real_event_pending = true;
                 }
                 _ = tokio::time::sleep_until(spinner_deadline(&self.app)), if self.app.agents.spinner_at.is_some() => {
                     crate::agents::show_switch_spinner(&mut self.app);
                     state.redraw_pending = true;
-                }
-                Some(event) = sources.resume.recv() => {
-                    self.app.commit_finished();
-                    crate::resume_picker::apply_event(&mut self.app, &self.client, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.queue.recv() => {
-                    self.app.commit_finished();
-                    if let Some(session) =
-                        crate::message_queue::apply_event(&mut self.app, &self.client, event)
-                    {
-                        crate::feedback::maybe_show(&mut self.app, &self.client, Some(session));
-                    }
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.approval.recv() => {
-                    self.app.commit_finished();
-                    crate::approval::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.feedback.recv() => {
-                    crate::feedback::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.paste_image.recv() => {
-                    self.app.commit_finished();
-                    crate::paste_image::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.rewind.recv() => {
-                    crate::rewind::apply_event(&mut self.app, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.mcp.recv() => {
-                    crate::mcp::apply_event(&mut self.app, &self.client, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.mcp_oauth.recv() => {
-                    crate::mcp_oauth::apply_event(&mut self.app, &self.client, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
-                }
-                Some(event) = sources.connector_auth.recv() => {
-                    crate::connector_auth::apply_event(&mut self.app, &self.client, event);
-                    state.redraw_pending = true;
-                    state.real_event_pending = true;
                 }
                 _ = tokio::time::sleep_until(crate::mcp::refresh_deadline(&self.app)), if self.app.mcp.open => {
                     crate::mcp::background_refresh(&mut self.app, &self.client);

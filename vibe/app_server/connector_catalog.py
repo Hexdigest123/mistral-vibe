@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from functools import partial
 import hashlib
 import json
 import os
@@ -14,11 +14,11 @@ from pathlib import Path
 import re
 import tempfile
 import time
-from typing import Any, BinaryIO, Literal, Protocol, cast, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import quote
 from uuid import uuid4
 
-import httpx
+import httpx2
 from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
@@ -76,16 +76,19 @@ from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.config.types import ConcurrencyConflictError
 from vibe.core.identity_cache import IdentityCache
 from vibe.core.paths import CONNECTOR_BOOTSTRAP_CACHE_FILE
+from vibe.core.platform_auth import ApiKeyPlatformCredentialProvider
 from vibe.core.tools.connectors.connector_registry import builtin_connectors
 from vibe.core.tools.mcp_settings import persist_mcp_toggle
 from vibe.core.utils.matching import name_matches
 from vibe.observability.logging import logger
 from vibe.setup.auth.whoami import WhoAmICache, load_cached_whoami
+from vibe.utils.file_lock import exclusive_file_lock
 from vibe.utils.http import (
     VibeAsyncHTTPClient,
     build_ssl_context,
     get_server_url_from_api_base,
 )
+from vibe.utils.oidc_marker import is_oidc_marker
 
 type BootstrapFetcher = Callable[[str, str, tuple[str, ...]], Awaitable[object]]
 type CacheDisposition = Literal["memory", "fresh_cache", "not_loaded"]
@@ -114,7 +117,14 @@ _WHOAMI_RETRY_SECONDS = 5 * 60
 _WHOAMI_TIMEOUT_SECONDS = 2.0
 _BOOTSTRAP_CACHE_FORMAT = 2
 _BOOTSTRAP_CACHE_TTL_SECONDS = 10 * 60
-_BOOTSTRAP_TIMEOUT_SECONDS = 30.0
+# Also bounds how long a connector call waits for a catalog still loading.
+CONNECTOR_CATALOG_FETCH_TIMEOUT_S = 30.0
+# How long a failed bootstrap answers for the next callers before one retries.
+_BOOTSTRAP_FAILURE_RETRY_SECONDS = 60
+# Process-wide, like the whoami cooldown: every session in a shared process
+# builds its own service, and each would otherwise retry the same failed backend.
+_BOOTSTRAP_FAILURES: dict[str, tuple[int, str]] = {}
+_BOOTSTRAP_IN_FLIGHT: dict[str, _BootstrapFlight] = {}
 _MAX_CONNECTORS = 256
 _MAX_TOOLS_PER_CONNECTOR = 128
 _MAX_INPUT_SCHEMA_BYTES = 64 * 1024
@@ -203,10 +213,19 @@ class ConnectorCatalogReadResult:
 
 @dataclass(frozen=True, slots=True)
 class _ConnectorProvider:
-    fingerprint: str
+    # None: no cache identity yet (OIDC tenant unresolved), fetch uncached.
+    fingerprint: str | None
     base_url: str
     api_key: str
     builtins: tuple[str, ...] = _DEFAULT_BUILTIN_CONNECTORS
+
+
+@dataclass(slots=True)
+class _BootstrapFlight:
+    task: asyncio.Task[ResolvedConnectorCatalog]
+    waiters: int = 0
+    # Only a session's fetch: a failure no session waited for is not memoized.
+    remember_failure: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +287,18 @@ def connector_cache_fingerprint(
     api_key: str,
     base_url: str | None,
     builtins: tuple[str, ...] = _DEFAULT_BUILTIN_CONNECTORS,
-) -> str:
+) -> str | None:
+    """The catalog cache identity, or ``None`` for an unresolved OIDC tenant.
+
+    The OIDC marker is not an identity: the signed-in account and tenant are.
+    """
+    if is_oidc_marker(api_key):
+        from vibe.setup.auth._oidc_runtime import stored_oidc_cache_key
+
+        identity = stored_oidc_cache_key()
+        if identity is None:
+            return None
+        api_key = identity
     normalized_base_url = (base_url or _DEFAULT_BASE_URL).rstrip("/")
     builtins_key = ",".join(builtins)
     return hashlib.sha256(
@@ -385,58 +415,18 @@ def connector_tool_enabled(
     )
 
 
-@contextmanager
-def _cache_update_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_file = path.with_name(f".{path.name}.lock").open("a+b")
-    try:
-        _acquire_cache_file_lock(lock_file)
-    except BaseException:
-        lock_file.close()
-        raise
-    try:
-        yield
-    finally:
-        _release_cache_file_lock(lock_file)
-        lock_file.close()
-
-
-def _acquire_cache_file_lock(file: BinaryIO) -> None:
-    if os.name == "nt":
-        msvcrt = cast(Any, __import__("msvcrt"))
-        file.seek(0)
-        if file.read(1) == b"":
-            file.write(b"\0")
-            file.flush()
-        file.seek(0)
-        msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(file.fileno(), fcntl.LOCK_EX)
-
-
-def _release_cache_file_lock(file: BinaryIO) -> None:
-    if os.name == "nt":
-        msvcrt = cast(Any, __import__("msvcrt"))
-        file.seek(0)
-        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
-
-
 class ConnectorCatalogCache:
     """Read and atomically write bounded connector bootstrap cache records."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
 
-    def read(self, provider_fingerprint: str, *, now: int) -> _CacheHit | None:
+    def read(
+        self, provider_fingerprint: str, *, now: int, fresh: bool = True
+    ) -> _CacheHit | None:
         entries = self._read_entries()
         raw_entry = entries.get(provider_fingerprint)
-        return _parse_cache_entry(provider_fingerprint, raw_entry, now=now)
+        return _parse_cache_entry(provider_fingerprint, raw_entry, now=now, fresh=fresh)
 
     def write(self, catalog: ResolvedConnectorCatalog, *, stored_at: int) -> None:
         raw_entry = _cache_entry(catalog, stored_at=stored_at)
@@ -445,7 +435,7 @@ class ConnectorCatalogCache:
                 "Connector bootstrap cache entry exceeds 2 MiB"
             )
 
-        with _cache_update_lock(self._path):
+        with exclusive_file_lock(self._path):
             entries = self._read_entries()
             fresh_entries = {
                 fingerprint: entry
@@ -822,7 +812,7 @@ class ConnectorCatalogService:
             logger.warning(
                 "Failed to connect a no-auth connector",
                 extra={
-                    "provider_fingerprint": provider.fingerprint[:12],
+                    "provider_fingerprint": (provider.fingerprint or "")[:12],
                     "connector_error": type(exc).__name__,
                     "http_status": getattr(exc, "status_code", None),
                 },
@@ -1258,7 +1248,7 @@ class ConnectorCatalogService:
         self, orchestrator: ConfigOrchestrator[VibeConfigSchema]
     ) -> ConnectorCatalogReadResult:
         provider = _resolve_provider(orchestrator.config)
-        if provider is None:
+        if provider is None or provider.fingerprint is None:
             return _catalog_read_result(None, "not_loaded", backend=self._backend)
         now = self._clock()
         memory = self._memory.get(provider.fingerprint)
@@ -1278,23 +1268,44 @@ class ConnectorCatalogService:
         # Freshness decides when to refetch, not which catalog a session accepted.
         provider = _resolve_provider(orchestrator.config)
         memory = (
-            self._memory.get(provider.fingerprint) if provider is not None else None
+            self._memory.get(provider.fingerprint)
+            if provider is not None and provider.fingerprint is not None
+            else None
         )
         if memory is not None and memory.catalog.revision == revision:
             return memory.catalog
         catalog = self.read_catalog(orchestrator).catalog
         return catalog if catalog is not None and catalog.revision == revision else None
 
+    async def read_cached_catalog(
+        self, orchestrator: ConfigOrchestrator[VibeConfigSchema]
+    ) -> ResolvedConnectorCatalog | None:
+        """The last catalog fetched, however old, without reaching the service.
+
+        For opening a session: an outdated catalog beats none, and the
+        session's background resolve replaces it.
+        """
+        provider = await _resolve_provider_async(orchestrator.config)
+        if provider is None or provider.fingerprint is None:
+            return None
+        memory = self._memory.get(provider.fingerprint)
+        if memory is not None:
+            return memory.catalog
+        hit = await asyncio.to_thread(
+            self._cache.read, provider.fingerprint, now=self._clock(), fresh=False
+        )
+        return hit.catalog if hit is not None else None
+
     async def _read_catalog_async(
         self, orchestrator: ConfigOrchestrator[VibeConfigSchema]
     ) -> ConnectorCatalogReadResult:
-        provider = await asyncio.to_thread(_resolve_provider, orchestrator.config)
+        provider = await _resolve_provider_async(orchestrator.config)
         return await self._read_catalog_for_provider(provider)
 
     async def _read_catalog_for_provider(
         self, provider: _ConnectorProvider | None
     ) -> ConnectorCatalogReadResult:
-        if provider is None:
+        if provider is None or provider.fingerprint is None:
             return _catalog_read_result(None, "not_loaded", backend=self._backend)
         now = self._clock()
         memory = self._memory.get(provider.fingerprint)
@@ -1313,28 +1324,106 @@ class ConnectorCatalogService:
         orchestrator: ConfigOrchestrator[VibeConfigSchema],
         *,
         force_refresh: bool = False,
+        remember_failure: bool = True,
     ) -> ResolvedConnectorCatalog | None:
-        provider = await asyncio.to_thread(_resolve_provider, orchestrator.config)
+        """``remember_failure=False`` keeps a failed fetch out of the memo
+        that spares the next caller in the next minute a retry: for a fetch
+        made ahead of any session, whose failure a session must not inherit.
+        """
+        provider = await _resolve_provider_async(orchestrator.config)
         if provider is None:
             return None
+        if provider.fingerprint is None:
+            return await self._refresh(provider)
         lock = self._locks.setdefault(provider.fingerprint, asyncio.Lock())
         async with lock:
-            if not force_refresh:
-                cached = await self._read_catalog_for_provider(provider)
-                if cached.catalog is not None:
-                    return cached.catalog
-            return await self._refresh(provider)
+            if force_refresh:
+                try:
+                    catalog = await self._refresh(provider)
+                except ConnectorCatalogUnavailableError as exc:
+                    _BOOTSTRAP_FAILURES[provider.fingerprint] = (
+                        self._clock(),
+                        str(exc),
+                    )
+                    raise
+                _BOOTSTRAP_FAILURES.pop(provider.fingerprint, None)
+                return catalog
+            cached = await self._read_catalog_for_provider(provider)
+            if cached.catalog is not None:
+                return cached.catalog
+            if failure := self._recent_failure(provider.fingerprint):
+                raise ConnectorCatalogUnavailableError(failure)
+            return await self._shared_refresh(
+                provider, remember_failure=remember_failure
+            )
+
+    def _recent_failure(self, fingerprint: str) -> str | None:
+        failure = _BOOTSTRAP_FAILURES.get(fingerprint)
+        if failure is None:
+            return None
+        failed_at, message = failure
+        if self._clock() - failed_at >= _BOOTSTRAP_FAILURE_RETRY_SECONDS:
+            return None
+        return message
+
+    async def _shared_refresh(
+        self, provider: _ConnectorProvider, *, remember_failure: bool = True
+    ) -> ResolvedConnectorCatalog:
+        """Fetch the bootstrap once per provider, whichever service asks.
+
+        Every session in a shared process builds its own service, so without
+        this two sessions opening together would each wait out the same request.
+        """
+        fingerprint = provider.fingerprint
+        assert fingerprint is not None
+        flight = _BOOTSTRAP_IN_FLIGHT.get(fingerprint)
+        if flight is None:
+            flight = _BootstrapFlight(asyncio.create_task(self._refresh(provider)))
+            _BOOTSTRAP_IN_FLIGHT[fingerprint] = flight
+            flight.task.add_done_callback(
+                partial(_settle_bootstrap, fingerprint, flight, clock=self._clock)
+            )
+        flight.remember_failure = flight.remember_failure or remember_failure
+        # Shielded: one caller giving up must not cancel the fetch the others
+        # are waiting on. The last one does, so a closed session's fetch does
+        # not outlive it.
+        flight.waiters += 1
+        try:
+            return await asyncio.shield(flight.task)
+        finally:
+            flight.waiters -= 1
+            if flight.waiters == 0 and not flight.task.done():
+                # Unlisted first: a caller arriving before the cancellation
+                # lands starts a fetch of its own rather than joining this one.
+                if _BOOTSTRAP_IN_FLIGHT.get(fingerprint) is flight:
+                    del _BOOTSTRAP_IN_FLIGHT[fingerprint]
+                flight.task.cancel()
+
+    async def _fetch_bootstrap_or_none(self, provider: _ConnectorProvider) -> object:
+        """The bootstrap, or an empty one where the server has no connectors.
+
+        A server without the connector service (self-hosted, Private Cloud, or
+        a proxy in front of the API) answers 404: it has no connectors, rather
+        than failing to load them.
+        """
+        try:
+            return await self._fetch_bootstrap(
+                provider.base_url, provider.api_key, provider.builtins
+            )
+        except httpx2.HTTPStatusError as exc:
+            if exc.response.status_code != httpx2.codes.NOT_FOUND:
+                raise
+        logger.info("The server has no connector service: no connectors")
+        return {"connectors": []}
 
     async def _refresh(self, provider: _ConnectorProvider) -> ResolvedConnectorCatalog:
         started_at = time.perf_counter()
         with _tracer.start_as_current_span("connector_catalog.bootstrap") as span:
             span.set_attribute("mistral_ai.vibe.harness.backend", self._backend)
             try:
-                payload = await self._fetch_bootstrap(
-                    provider.base_url, provider.api_key, provider.builtins
-                )
+                payload = await self._fetch_bootstrap_or_none(provider)
                 catalog = await asyncio.to_thread(
-                    _resolve_catalog, payload, provider.fingerprint
+                    _resolve_catalog, payload, provider.fingerprint or ""
                 )
             except asyncio.CancelledError:
                 span.set_attribute("mistral_ai.vibe.connector.outcome", "cancelled")
@@ -1388,6 +1477,16 @@ class ConnectorCatalogService:
                 backend=self._backend,
             )
 
+        if provider.fingerprint is None or (
+            # The marker resolves the signed-in account per request: a sign-in
+            # during the fetch makes this catalog another account's.
+            is_oidc_marker(provider.api_key)
+            and connector_cache_fingerprint(
+                provider.api_key, provider.base_url, provider.builtins
+            )
+            != provider.fingerprint
+        ):
+            return catalog
         stored_at = self._clock()
         cache_started_at = time.perf_counter()
         try:
@@ -1441,7 +1540,7 @@ async def _fetch_bootstrap(
 
 def _build_bootstrap_http_client() -> VibeAsyncHTTPClient:
     return VibeAsyncHTTPClient(
-        timeout=_BOOTSTRAP_TIMEOUT_SECONDS, verify=build_ssl_context()
+        timeout=CONNECTOR_CATALOG_FETCH_TIMEOUT_S, verify=build_ssl_context()
     )
 
 
@@ -1465,7 +1564,7 @@ async def _connector_auth_url(
     except Exception:
         logger.warning(
             "Failed to obtain a connector authorization URL",
-            extra={"provider_fingerprint": provider.fingerprint[:12]},
+            extra={"provider_fingerprint": (provider.fingerprint or "")[:12]},
         )
         return None
     finally:
@@ -1487,8 +1586,9 @@ async def _connect_without_credentials(
             async_client=http_client,
         )
         async with sdk_client as client:
-            await client.beta.connectors.create_or_update_user_credentials_async(
+            await client.beta.connectors.update_credentials_async(
                 connector_id_or_name=raw_connector_id,
+                consumer_scope="user",
                 name=_DEFAULT_CONNECTION_NAME,
                 is_default=True,
                 credentials={"headers": {}},
@@ -1502,17 +1602,17 @@ def _connect_failure_message(exc: Exception, display_name: str) -> str:
     from mistralai.client.errors import MistralError
 
     prefix = f"Could not connect {display_name}"
-    if isinstance(exc, httpx.TransportError):
+    if isinstance(exc, httpx2.TransportError):
         return f"{prefix}: the Mistral API could not be reached. Try again in a moment."
     if not isinstance(exc, MistralError):
         return f"{prefix}: {type(exc).__name__}."
     match exc.status_code:
-        case httpx.codes.UNAUTHORIZED | httpx.codes.FORBIDDEN:
+        case httpx2.codes.UNAUTHORIZED | httpx2.codes.FORBIDDEN:
             return (
                 f"{prefix}: your API key may not create connections "
                 f"(HTTP {exc.status_code}). Check your MISTRAL_API_KEY."
             )
-        case httpx.codes.NOT_FOUND:
+        case httpx2.codes.NOT_FOUND:
             return f"{prefix}: the connector no longer exists (HTTP 404)."
         case _:
             return (
@@ -1664,6 +1764,17 @@ def _resolve_provider(config: VibeConfigSchema) -> _ConnectorProvider | None:
     )
 
 
+async def _resolve_provider_async(
+    config: VibeConfigSchema,
+) -> _ConnectorProvider | None:
+    """``_resolve_provider``, first discovering an OIDC tenant like other caches."""
+    from vibe.core.telemetry.send import resolve_credential_cache_key
+
+    if config.enable_connectors:
+        await resolve_credential_cache_key(config)
+    return await asyncio.to_thread(_resolve_provider, config)
+
+
 async def _manage_connectors_url(config: VibeConfigSchema) -> str | None:
     """Build the console "manage connectors" link for the caller's tenant.
 
@@ -1681,7 +1792,8 @@ async def _manage_connectors_url(config: VibeConfigSchema) -> str | None:
     # Identity lives under the versioned API base (/v1/users/me), not the bare
     # server root that provider.base_url uses for the connectors bootstrap path.
     identity = await _IDENTITY_CACHE.resolve(
-        base_url=mistral_provider.api_base, api_key=provider.api_key
+        base_url=mistral_provider.api_base,
+        credentials=ApiKeyPlatformCredentialProvider.from_api_key(provider.api_key),
     )
     if identity is None or identity.organization is None or identity.workspace is None:
         return None
@@ -1703,7 +1815,9 @@ async def _private_connectors_hidden(config: VibeConfigSchema) -> bool:
     provider = _resolve_provider(config)
     if provider is None:
         return False
-    key = (config.console_base_url, provider.api_key)
+    # The OIDC marker is shared by every account; its cooldown is per identity.
+    identity = provider.fingerprint if is_oidc_marker(provider.api_key) else None
+    key = (config.console_base_url, identity or provider.api_key)
     failed_at = _WHOAMI_FAILED_AT.get(key)
     cooling_down = (
         failed_at is not None and time.monotonic() - failed_at < _WHOAMI_RETRY_SECONDS
@@ -1713,14 +1827,14 @@ async def _private_connectors_hidden(config: VibeConfigSchema) -> bool:
         whoami = load_cached_whoami(provider.api_key)
     else:
         whoami = await _WHOAMI_CACHE.resolve(
-            base_url=key[0], api_key=key[1], timeout=_WHOAMI_TIMEOUT_SECONDS
+            base_url=key[0], api_key=provider.api_key, timeout=_WHOAMI_TIMEOUT_SECONDS
         )
     if whoami is None:
         if not cooling_down:
             _WHOAMI_FAILED_AT[key] = time.monotonic()
         return False
     _WHOAMI_FAILED_AT.pop(key, None)
-    return whoami.primitive_access_scope == "shared_only"
+    return whoami.can_access_private_resources is False
 
 
 def _resolve_catalog(
@@ -2013,7 +2127,7 @@ def _connector_cache_payload(connector: ResolvedConnector) -> dict[str, object]:
 
 
 def _parse_cache_entry(
-    provider_fingerprint: str, raw_entry: object, *, now: int
+    provider_fingerprint: str, raw_entry: object, *, now: int, fresh: bool = True
 ) -> _CacheHit | None:
     if (
         not isinstance(raw_entry, dict)
@@ -2028,7 +2142,7 @@ def _parse_cache_entry(
     else:
         return None
     payload = raw_entry.get("payload")
-    if not isinstance(stored_at, int) or not _is_fresh(stored_at, now=now):
+    if not isinstance(stored_at, int) or (fresh and not _is_fresh(stored_at, now=now)):
         return None
     if not isinstance(payload, dict):
         return None
@@ -2082,6 +2196,32 @@ def _connector_revision_payload(connector: ResolvedConnector) -> dict[str, objec
     }
 
 
+def _settle_bootstrap(
+    fingerprint: str,
+    settled: _BootstrapFlight,
+    task: asyncio.Task[ResolvedConnectorCatalog],
+    *,
+    clock: Callable[[], int],
+) -> None:
+    flight = _BOOTSTRAP_IN_FLIGHT.get(fingerprint)
+    if flight is not None and flight.task is task:
+        del _BOOTSTRAP_IN_FLIGHT[fingerprint]
+    if task.cancelled():
+        return
+    error = task.exception()
+    if isinstance(error, ConnectorCatalogUnavailableError):
+        if settled.remember_failure:
+            _BOOTSTRAP_FAILURES[fingerprint] = (clock(), str(error))
+    elif error is None:
+        _BOOTSTRAP_FAILURES.pop(fingerprint, None)
+
+
+def reset_bootstrap_failures() -> None:
+    """Forget failed and in-flight bootstrap fetches; for test isolation."""
+    _BOOTSTRAP_FAILURES.clear()
+    _BOOTSTRAP_IN_FLIGHT.clear()
+
+
 def _is_fresh(stored_at: int, *, now: int) -> bool:
     if stored_at > now:
         return False
@@ -2102,12 +2242,13 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _redacted_bootstrap_error(exc: Exception) -> str:
-    if isinstance(exc, httpx.HTTPStatusError):
+    if isinstance(exc, httpx2.HTTPStatusError):
         return f"Failed to load connectors (HTTP {exc.response.status_code})."
     return f"Failed to load connectors: {type(exc).__name__}"
 
 
 __all__ = [
+    "CONNECTOR_CATALOG_FETCH_TIMEOUT_S",
     "ConnectorCatalogCache",
     "ConnectorCatalogError",
     "ConnectorCatalogReadResult",
@@ -2118,5 +2259,6 @@ __all__ = [
     "connector_source_enabled",
     "connector_tool_enabled",
     "normalize_connector_alias",
+    "reset_bootstrap_failures",
     "resolve_connector_selection",
 ]

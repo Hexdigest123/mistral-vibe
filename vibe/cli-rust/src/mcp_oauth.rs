@@ -22,9 +22,6 @@ const HELP: &[hints::Hint] = &[
 const OPTION_PADDING: &str = "  ";
 /// Seconds the copy toast stays up.
 const COPY_TOAST_SECS: u64 = 2;
-/// Native-copy hint appended when the clipboard write is unverified.
-const NATIVE_COPY_HINT: &str = "if paste fails, hold Shift (Option in iTerm2, Fn in Terminal.app) \
-     while selecting for native copy";
 
 /// The answer of one `mcp/login` round-trip, applied on the main thread.
 pub struct Event {
@@ -103,16 +100,14 @@ fn start_login(app: &mut App, client: &Arc<Client>) {
     app.mcp_oauth.generation += 1;
     let generation = app.mcp_oauth.generation;
     let name = app.mcp_oauth.server_name.clone();
-    let (Some(session_id), Some(tx)) = (app.session.session_id.clone(), app.mcp_oauth.tx.clone())
-    else {
+    let Some(session_id) = app.session.session_id.clone() else {
         return;
     };
     let client = client.clone();
     // The login answer repaints the bottom app, so hold the replay marker with a
     // commit until it lands (mirrors `connector_auth`), else the capture races
     // the "Preparing authentication..." placeholder.
-    let pending = app.commit_started();
-    tokio::spawn(async move {
+    crate::ui_event::spawn(app, async move {
         let error = client
             .request(
                 method::MCP_LOGIN,
@@ -121,7 +116,7 @@ fn start_login(app: &mut App, client: &Arc<Client>) {
             .await
             .err()
             .map(|error| error.to_string());
-        crate::input::deliver(Some(tx), Event { generation, error }, &pending).await;
+        Event { generation, error }
     });
 }
 
@@ -136,7 +131,6 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, event: Event) {
             }
         }
     }
-    app.commit_finished();
 }
 
 /// The `mcp/authUrl` notification of the running login.
@@ -192,7 +186,10 @@ fn copy_url(app: &mut App) {
     let message = if clipboard::copy_to_clipboard(&url) {
         "Auth URL copied to clipboard".to_owned()
     } else {
-        format!("Auth URL copied to clipboard · {NATIVE_COPY_HINT}")
+        format!(
+            "Auth URL copied to clipboard · {}",
+            clipboard::unverified_hint()
+        )
     };
     app.show_toast(message, ToastSeverity::Information, COPY_TOAST_SECS);
 }

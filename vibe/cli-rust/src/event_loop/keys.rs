@@ -101,7 +101,10 @@ pub(super) fn handle_input_batch(
     let mut handled = 0;
     loop {
         let burst = event.as_ref().is_some_and(is_pointer_burst);
-        match handle_input_event(app, client, config_tx, event, replaying) {
+        let outcome = handle_input_event(app, client, config_tx, event, replaying);
+        // Any input can start or end a gesture: cell reports are held exactly while one is captured.
+        crate::terminal::hold_cell_reports(app.view.mouse.holds_target());
+        match outcome {
             InputOutcome::Exit => return None,
             outcome => reset_blink |= state.apply_input(outcome),
         }
@@ -162,7 +165,8 @@ fn handle_input_event(
             if input::request_suspend(app, &key) {
                 return InputOutcome::Activity { reset_blink: false };
             }
-            crate::mouse::cancel_capture(app);
+            // Esc aborts a drag in flight; any other key ends it like a release.
+            crate::mouse::cancel_capture(app, key.code != KeyCode::Esc);
             if dispatch_key(app, client, config_tx, key) {
                 return InputOutcome::Exit;
             }
@@ -189,12 +193,14 @@ fn handle_input_event(
                 | Focus::ConnectorAuth
                 | Focus::Rewind
                 | Focus::ThemePicker
-                | Focus::ModelPicker
                 | Focus::LogLevelPicker
-                | Focus::ThinkingPicker => {}
+                | Focus::ThinkingPicker
+                | Focus::ArtifactsModal => {}
                 Focus::Question => crate::question_input::handle_paste(app, text),
                 Focus::ProxySetup => crate::proxy_setup::paste(app, &text),
                 Focus::Config => config::handle_paste(app, text),
+                Focus::ReleaseNotes => crate::release_notes::paste(app, &text),
+                Focus::ModelPicker => crate::model_picker::paste(app, &text),
                 Focus::VibeCodeProject => crate::vibe_code_project::input::paste(app, &text),
                 Focus::Mcp => crate::mcp::search::paste(app, &text),
                 Focus::Plugins => crate::plugins::paste(app, &text),
@@ -215,7 +221,7 @@ fn handle_input_event(
         Some(Event::FocusLost) => {
             app.terminal_notifier.set_focus(false);
             app.set_app_focus(false);
-            crate::mouse::cancel_capture(app);
+            crate::mouse::cancel_capture(app, true);
             app.view.mouse_position = None;
             InputOutcome::Redraw { reset_blink: false }
         }
@@ -253,6 +259,7 @@ fn dispatch_key(
         Focus::Approval => crate::approval::handle_key(app, client, key),
         Focus::Question => crate::question_input::handle_key(app, client, key),
         Focus::Config => config::handle_key(app, client, config_tx, key),
+        Focus::ReleaseNotes => crate::release_notes::handle_key(app, key),
         Focus::VoiceApp => crate::voice_app::handle_key(app, client, key),
         Focus::ProxySetup => crate::proxy_setup::handle_key(app, client, key),
         Focus::VibeCodeProject => crate::vibe_code_project::input::handle_key(app, client, key),
@@ -266,6 +273,7 @@ fn dispatch_key(
         Focus::ModelPicker => input::handle_model_key(app, client, key),
         Focus::LogLevelPicker => input::handle_log_level_key(app, client, key),
         Focus::ThinkingPicker => input::handle_thinking_key(app, client, key),
+        Focus::ArtifactsModal => input::handle_artifacts_modal_key(app, key),
         // Esc cancels a project request in flight before the composer sees it.
         Focus::SubagentList | Focus::Composer if esc && app.vibe_code_project.pending => {
             crate::vibe_code_project::input::handle_key(app, client, key)

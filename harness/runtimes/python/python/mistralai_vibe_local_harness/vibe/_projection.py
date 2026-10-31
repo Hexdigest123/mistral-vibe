@@ -55,6 +55,7 @@ from mistralai_vibe_local_harness.session_protocol import (
     TitleSource,
     TokenUsage,
 )
+from mistralai_vibe_local_harness.vibe._file_images import is_file_image
 from mistralai_vibe_local_harness.vibe._observability import (
     add_uncorrelated_tool_result,
 )
@@ -75,6 +76,8 @@ APPROVAL_NOTE_META_KEY = "approval_note"
 # approval_source) that the local actions gate records on the tool result;
 # lifted into the effect state for telemetry.
 APPROVAL_META_KEY = "approval"
+
+SMART_APPROVE_META_KEY = "smart_approve"
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,13 +132,14 @@ class SessionProjector:
         bookkeeping rather than a decision to abandon the live view.
         """
         rebased = SessionProjector(projection)
-        live = self._projection.snapshot.history.entries
-        if not any(_is_provisional(entry) for entry in live):
-            return rebased
         # ``_durable`` stays the store's snapshot; only the live view gains the
         # entries back.
         stored = rebased._projection.snapshot
-        entries = _restore_provisional_entries(stored.history.entries, live)
+        entries = _restore_live_completion_entries(
+            stored.history.entries, self._projection.snapshot.history.entries
+        )
+        if len(entries) == len(stored.history.entries):
+            return rebased
         rebased._projection = rebased._projection.model_copy(
             update={
                 "snapshot": stored.model_copy(
@@ -767,13 +771,19 @@ def with_session_preview(state: PublicSessionState) -> PublicSessionState:
 def settle_stalled_projection(
     state: PublicSessionState, *, observed_at: int
 ) -> PublicSessionState:
-    """Present a mid-turn projection with no live owner as settled.
+    """Present a projection with no live owner as settled.
 
     Projects a ``running``/``blocked`` turn as ``interrupted``, settles its open
     effects, and marks the session idle, so clients never render a phantom
-    "working" state. A pure presentation transform: the caller decides the
-    session is actually unowned (e.g. via the lease), not this function.
+    "working" state. Its queue is emptied too: a queue lives only in the
+    process that holds the session, so a saved one never runs. A pure
+    presentation transform: the caller decides the session is actually unowned
+    (e.g. via the lease), not this function.
     """
+    if state.turn_queue.items:
+        state = state.model_copy(
+            update={"turn_queue": state.turn_queue.model_copy(update={"items": []})}
+        )
     status = state.session.status
     if not isinstance(status, (RunningSessionStatus, BlockedSessionStatus)):
         return state
@@ -907,23 +917,46 @@ def _is_provisional(entry: JsonObject) -> bool:
     )
 
 
-def _restore_provisional_entries(
+def _restore_live_completion_entries(
     stored: Sequence[JsonObject], live: Sequence[JsonObject]
 ) -> list[JsonObject]:
-    """Re-insert ``live``'s provisional entries into ``stored`` where they sat.
+    """Re-insert ``live``'s completion entries the store lacks where they sat.
 
-    Each one goes back after the durable entry it followed in the live view.
+    These are streamed entries still in progress, and streamed entries an
+    earlier rebase settled that the store has not journaled yet. Each one goes
+    back after the durable entry it followed in the live view.
     Appending them all at the tail instead would drop a streaming answer below
     whatever was journalled while it streamed -- a steering message, say --
     since the live view holds those after the provisional entry, not before.
+
+    The store may already hold the settled outcome of a streamed completion. A
+    live entry whose id the store holds is not restored, since an id must name
+    one entry. One the store's outcome left out, such as reasoning a hook
+    dropped, is restored settled the way that outcome settled its siblings, and
+    kept across later rebases until it is journaled: a published entry is never
+    retracted, so dropping it would leave it in progress on the client.
     """
+    stored_ids = {
+        entry_id for entry in stored if isinstance(entry_id := entry.get("id"), str)
+    }
+    settled = _settled_completion_actions(stored)
     trailing: dict[str | None, list[JsonObject]] = {}
     anchor: str | None = None
     for entry in live:
+        entry_id = entry.get("id")
+        action_id = _completion_action_id(entry)
+        settlement = settled.get(action_id) if action_id is not None else None
         if _is_provisional(entry):
+            if entry_id in stored_ids:
+                continue
+            if settlement is not None:
+                settled_at, cause = settlement
+                entry = _settled_provisional_entry(entry, settled_at, cause=cause)
             trailing.setdefault(anchor, []).append(entry)
             continue
-        entry_id = entry.get("id")
+        if settlement is not None and entry_id not in stored_ids:
+            trailing.setdefault(anchor, []).append(entry)
+            continue
         if isinstance(entry_id, str):
             anchor = entry_id
     restored = list(trailing.pop(None, []))
@@ -938,13 +971,42 @@ def _restore_provisional_entries(
     return restored
 
 
-def _belongs_to_action(entry: JsonObject, action_id: str) -> bool:
+def _settled_completion_actions(
+    entries: Sequence[JsonObject],
+) -> dict[str, tuple[int, PublicDiscardCause]]:
+    """When and why each settled completion's left-out entries are discarded.
+
+    A committed completion discards what it did not keep as ``failure``, as
+    the commit does; a discarded one passes on its own cause.
+    """
+    settled: dict[str, tuple[int, PublicDiscardCause]] = {}
+    for entry in entries:
+        action_id = _completion_action_id(entry)
+        outcome = entry.get("outcome")
+        if action_id is None or _is_provisional(entry) or not isinstance(outcome, dict):
+            continue
+        cause = outcome.get("cause") if outcome.get("type") == "discarded" else None
+        settled[action_id] = (
+            cast(int, entry["updatedAt"]),
+            cast(PublicDiscardCause, cause) if isinstance(cause, str) else "failure",
+        )
+    return settled
+
+
+def _completion_action_id(entry: JsonObject) -> str | None:
+    """The completion action an assistant or reasoning entry was produced by."""
     entry_id = entry.get("id")
     if not isinstance(entry_id, str):
-        return False
-    return entry_id == f"assistant-{action_id}" or entry_id.startswith(
-        f"reasoning-{action_id}-"
-    )
+        return None
+    if entry_id.startswith("assistant-"):
+        return entry_id.removeprefix("assistant-")
+    if entry_id.startswith("reasoning-"):
+        return entry_id.removeprefix("reasoning-").rpartition("-")[0] or None
+    return None
+
+
+def _belongs_to_action(entry: JsonObject, action_id: str) -> bool:
+    return _completion_action_id(entry) == action_id
 
 
 def _merge_provisional_entry(
@@ -1240,15 +1302,21 @@ def _text_preview(parts: Sequence[str]) -> str:
 
 def _public_content_block(part: Any) -> JsonValue:
     serialized = part.model_dump(mode="json", by_alias=True, exclude_none=True)
-    if isinstance(part, RustImageContentBlock):
+    # An image kept with its file shows as the image it was sent as.
+    if isinstance(part, RustImageContentBlock) or is_file_image(part):
+        data, mime_type = (
+            (part.data, part.mime_type)
+            if isinstance(part, RustImageContentBlock)
+            else (part.resource.blob, part.resource.mime_type)
+        )
         return cast(
             JsonValue,
             {
                 "type": "image",
                 "attachment": {
-                    "source": {"kind": "inline", "data": part.data},
+                    "source": {"kind": "inline", "data": data},
                     "alias": "image",
-                    "mimeType": part.mime_type,
+                    "mimeType": mime_type,
                 },
             },
         )

@@ -55,13 +55,19 @@ class FakeConnectorCatalogService(ConnectorCatalogService):
             return ConnectorCatalogReadResult(catalog=None, disposition="not_loaded")
         return ConnectorCatalogReadResult(catalog=self._catalog, disposition="memory")
 
+    async def read_cached_catalog(
+        self, orchestrator: ConfigOrchestrator[VibeConfigSchema]
+    ) -> ResolvedConnectorCatalog | None:
+        return self.read_catalog(orchestrator).catalog
+
     async def resolve_catalog(
         self,
         orchestrator: ConfigOrchestrator[VibeConfigSchema],
         *,
         force_refresh: bool = False,
+        remember_failure: bool = True,
     ) -> ResolvedConnectorCatalog:
-        del orchestrator, force_refresh
+        del orchestrator, force_refresh, remember_failure
         if error := self._registry.bootstrap_error():
             raise ConnectorCatalogUnavailableError(error)
         return self._catalog

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::app::App;
 use crate::server::{method, Client, TelemetryRecordParams};
@@ -34,8 +35,15 @@ pub fn enqueue(
     let Some(tx) = tx else {
         return;
     };
-    if tx.try_send(TelemetryEvent { name, properties }).is_err() {
-        tracing::warn!(name, "telemetry queue full; dropping event");
+    if let Err(error) = tx.try_send(TelemetryEvent { name, properties }) {
+        match error {
+            TrySendError::Full(_) => {
+                tracing::warn!(name, "telemetry queue full; dropping event");
+            }
+            TrySendError::Closed(_) => {
+                tracing::debug!(name, "telemetry channel closed; dropping event");
+            }
+        }
     }
 }
 
@@ -100,6 +108,19 @@ pub fn slash_command_used(app: &App, command: &str, command_type: &str) {
         bmap(json!({
             "command": command.trim_start_matches('/'),
             "command_type": command_type,
+        })),
+    );
+}
+
+/// A builtin command opened by a click instead of typed; `entry_point` names the control.
+pub fn slash_command_clicked(app: &App, command: &str, entry_point: &str) {
+    record(
+        app,
+        event::SLASH_COMMAND_USED,
+        bmap(json!({
+            "command": command.trim_start_matches('/'),
+            "command_type": "builtin",
+            "entry_point": entry_point,
         })),
     );
 }

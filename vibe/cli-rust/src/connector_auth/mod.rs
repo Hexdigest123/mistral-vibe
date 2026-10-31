@@ -9,16 +9,12 @@ use serde_json::{json, Value};
 use crate::app::{App, ToastSeverity};
 use crate::clipboard;
 use crate::external_url;
-use crate::input::deliver;
 use crate::server::{method, Client};
 
 pub use rows::{detail, help_text, rows};
 
 /// Seconds the copy toast stays up.
 const COPY_TOAST_SECS: u64 = 2;
-/// Native-copy hint appended when the clipboard write is unverified.
-const NATIVE_COPY_HINT: &str = "if paste fails, hold Shift (Option in iTerm2, Fn in Terminal.app) \
-     while selecting for native copy";
 
 /// One worker's answer, applied on the main thread.
 pub enum Event {
@@ -71,7 +67,6 @@ pub fn open(app: &mut App, client: &Arc<Client>, connector_name: String) {
         open: true,
         connector_name,
         generation: app.connector_auth.generation + 1,
-        tx: app.connector_auth.tx.clone(),
         ..Default::default()
     };
     fetch_auth_url(app, client);
@@ -94,15 +89,11 @@ pub fn close(app: &mut App, client: &Arc<Client>, refreshed: bool) {
 fn fetch_auth_url(app: &mut App, client: &Arc<Client>) {
     let generation = app.connector_auth.generation;
     let name = app.connector_auth.connector_name.clone();
-    let (Some(session_id), Some(tx)) = (
-        app.session.session_id.clone(),
-        app.connector_auth.tx.clone(),
-    ) else {
+    let Some(session_id) = app.session.session_id.clone() else {
         return;
     };
     let client = client.clone();
-    let pending = app.commit_started();
-    tokio::spawn(async move {
+    crate::ui_event::spawn(app, async move {
         let url = client
             .request(
                 method::CONNECTOR_AUTH_READ,
@@ -111,7 +102,7 @@ fn fetch_auth_url(app: &mut App, client: &Arc<Client>) {
             .await
             .ok()
             .and_then(|result| result.get("url").and_then(Value::as_str).map(str::to_owned));
-        deliver(Some(tx), Event::AuthUrl { generation, url }, &pending).await;
+        Event::AuthUrl { generation, url }
     });
 }
 
@@ -120,15 +111,11 @@ pub fn refresh(app: &mut App, client: &Arc<Client>) {
     app.connector_auth.status_message = Some("Refreshing connector...".to_owned());
     let generation = app.connector_auth.generation;
     let name = app.connector_auth.connector_name.clone();
-    let (Some(session_id), Some(tx)) = (
-        app.session.session_id.clone(),
-        app.connector_auth.tx.clone(),
-    ) else {
+    let Some(session_id) = app.session.session_id.clone() else {
         return;
     };
     let client = client.clone();
-    let pending = app.commit_started();
-    tokio::spawn(async move {
+    crate::ui_event::spawn(app, async move {
         let response = client
             .request(
                 method::CONNECTOR_REFRESH,
@@ -141,12 +128,11 @@ pub fn refresh(app: &mut App, client: &Arc<Client>) {
             .and_then(|response| response.get("toolCount"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let event = Event::Refreshed {
+        Event::Refreshed {
             generation,
             tool_count,
             response,
-        };
-        deliver(Some(tx), event, &pending).await;
+        }
     });
 }
 
@@ -173,7 +159,6 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, event: Event) {
             }
         }
     }
-    app.commit_finished();
 }
 
 fn on_connector_refreshed(app: &mut App, client: &Arc<Client>, tool_count: u64) {
@@ -229,7 +214,10 @@ fn copy_url(app: &mut App) {
     let message = if clipboard::copy_to_clipboard(&url) {
         "Auth URL copied to clipboard".to_owned()
     } else {
-        format!("Auth URL copied to clipboard · {NATIVE_COPY_HINT}")
+        format!(
+            "Auth URL copied to clipboard · {}",
+            clipboard::unverified_hint()
+        )
     };
     app.show_toast(message, ToastSeverity::Information, COPY_TOAST_SECS);
 }

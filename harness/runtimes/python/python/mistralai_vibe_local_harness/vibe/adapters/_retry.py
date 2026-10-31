@@ -21,7 +21,7 @@ import logging
 import random
 import time
 
-import httpx
+import httpx2
 
 from mistralai_vibe_local_harness.vibe._runtime_config import (
     ProviderRetry,
@@ -32,6 +32,7 @@ from mistralai_vibe_local_harness.vibe.adapters._provider_failure import (
     ProviderFailure,
     read_provider_failure,
 )
+from mistralai_vibe_local_harness.vibe.completion_profile import should_retry_stall
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +43,19 @@ async def call_with_retries[T](
     max_elapsed_time_s: float,
     notices: RetryNotices,
 ) -> T:
-    """Run ``attempt`` until it succeeds, fails for good, or the budget is spent.
+    """Run ``attempt`` until it succeeds, fails for good, or its retries are spent.
 
     The budget bounds when a new attempt may start, not how long one may run:
     a retry whose wait would end after the budget is not made. The wait checked
     is the one the provider asked for, before the delay cap shortens it, since
-    an attempt the provider said would fail is not worth making early. A stall is
-    retried at most ``_MAX_STALL_RETRIES`` times: when the silence was a long
-    generation the provider does not stream, every attempt repeats it, and each
-    one is paid for. A response whose tool calls all lack a name is retried at
+    an attempt the provider said would fail is not worth making early. A budget
+    of zero disables retries.
+
+    A stall gets one retry of its own (``should_retry_stall``), and a nonzero
+    budget does not bound it: a stall is noticed only after a limit of the stream
+    guard, which can be longer than the whole budget. It is one because when the
+    silence was a long generation the provider does not stream, every attempt
+    repeats it, and each one is paid for. A response whose tool calls all lack a name is retried at
     most ``_MAX_UNUSABLE_TOOL_CALL_RETRIES`` times for the same reason.
     """
     started = time.monotonic()
@@ -62,7 +67,7 @@ async def call_with_retries[T](
             return await attempt()
         except Exception as error:
             failure = read_provider_failure(error)
-            stalls_spent = failure.stalled and stall_retries >= _MAX_STALL_RETRIES
+            stalls_spent = failure.stalled and not should_retry_stall(stall_retries)
             unusable_spent = (
                 failure.unusable_tool_calls
                 and unusable_tool_call_retries >= _MAX_UNUSABLE_TOOL_CALL_RETRIES
@@ -75,7 +80,9 @@ async def call_with_retries[T](
                 now=datetime.now(UTC),
                 jitter_s=random.uniform(0, _MAX_RETRY_JITTER_S),
             )
-            if time.monotonic() - started + wait_s > max_elapsed_time_s:
+            budget_spent = time.monotonic() - started + wait_s > max_elapsed_time_s
+            stall_exempt = failure.stalled and max_elapsed_time_s > 0
+            if budget_spent and not stall_exempt:
                 raise
             delay_s = min(wait_s, _MAX_RETRY_DELAY_S)
             if failure.stalled:
@@ -104,7 +111,7 @@ class RetryNotices:
     """The retry notice of one completion, from announcement to recovery.
 
     A notice stays up until the provider accepts a later attempt.
-    ``clear_on_success`` is an HTTPX response hook, so it clears the notice as
+    ``clear_on_success`` is an HTTPX2 response hook, so it clears the notice as
     soon as a successful status arrives, before the response body streams.
     """
 
@@ -117,7 +124,7 @@ class RetryNotices:
         if self._observer is not None:
             await self._observer(retry)
 
-    async def clear_on_success(self, response: httpx.Response) -> None:
+    async def clear_on_success(self, response: httpx2.Response) -> None:
         if not response.is_success or not self._showing:
             return
         self._showing = False
@@ -129,7 +136,6 @@ _INITIAL_RETRY_DELAY_S = 0.5
 _RETRY_BACKOFF = 1.5
 _MAX_RETRY_DELAY_S = 30.0
 _MAX_RETRY_JITTER_S = 1.0
-_MAX_STALL_RETRIES = 1
 _MAX_UNUSABLE_TOOL_CALL_RETRIES = 1
 # The backoff reaches its maximum long before this exponent; the cap keeps a
 # large retry budget from overflowing the power.

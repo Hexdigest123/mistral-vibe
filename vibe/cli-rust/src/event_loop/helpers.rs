@@ -30,12 +30,15 @@ pub(super) fn apply_command(app: &mut App, client: &Arc<Client>, command: Comman
         CommandEvent::Result(text) => {
             local::add_command_result(&mut app.view.transcript, &id, &text)
         }
+        CommandEvent::Status(text) => {
+            local::add_command_status(&mut app.view.transcript, &id, &text)
+        }
         CommandEvent::AgentStatistics(text) => {
             crate::commands::provider_auth::add_agent_statistics(app, &id, &text)
         }
         CommandEvent::Renamed(title) => {
             app.terminal_notifier.set_default_title(&title);
-            local::add_command_result(
+            local::add_command_status(
                 &mut app.view.transcript,
                 &id,
                 &format!("Session renamed to \"{title}\"."),
@@ -75,6 +78,7 @@ pub(super) fn apply_command(app: &mut App, client: &Arc<Client>, command: Comman
             cache_reads(app, reads);
             app.view.banner.set_account(plan, greeting);
         }
+        CommandEvent::ArtifactsRead(artifacts) => crate::artifacts::apply_list(app, artifacts),
         CommandEvent::UntrustedConfig(warning) => {
             if let Some(text) = warning {
                 local::add_warning(&mut app.view.transcript, &id, &text);
@@ -88,8 +92,9 @@ pub(super) fn apply_command(app: &mut App, client: &Arc<Client>, command: Comman
             seed,
         } => {
             clear::apply_cleared(app, session_id.clone(), usage, child_sessions);
-            simple::add_text(
-                app,
+            local::add_command_status(
+                &mut app.view.transcript,
+                &id,
                 &clear::new_conversation_text(previous_session_id.as_deref()),
             );
             if let Some(seed) = seed {
@@ -123,8 +128,11 @@ pub(super) fn apply_command(app: &mut App, client: &Arc<Client>, command: Comman
             app.terminal_notifier
                 .remember_completion(crate::program_status::ProgramState::Error);
         }
-        CommandEvent::Whoami(reads) => {
-            let text = simple::whoami_text(reads.as_ref().unwrap_or(&AccountReads::default()));
+        CommandEvent::Whoami { reads, auth } => {
+            let text = simple::whoami_text(
+                reads.as_ref().unwrap_or(&AccountReads::default()),
+                auth.as_ref(),
+            );
             cache_reads(app, reads);
             local::add_command_result(&mut app.view.transcript, &id, &text);
         }
@@ -194,9 +202,16 @@ pub(super) fn redraw_frame(
         .transcript_cache
         .advance_history(&app.view.transcript);
     step_scroll(app, replaying);
+    let notice = app.overlays.notice.as_ref().map(|notice| notice.until);
     draw_synchronized(terminal, app)?;
+    // A paint-time copy can post its notice after the notice row painted: show it next frame.
+    let posted = app
+        .overlays
+        .notice
+        .as_ref()
+        .is_some_and(|new| Some(new.until) != notice);
     // The draw may set a new glide target (an expansion scrolling into view).
-    let animating = app.view.scroll != app.view.scroll_target;
+    let animating = app.view.scroll != app.view.scroll_target || posted;
     crate::older_history::load_older_history_page(app, client);
     let indexing = *files.borrow() == 0 && completion_manager::active_is_file(app);
     Ok((animating, mounting, indexing))
