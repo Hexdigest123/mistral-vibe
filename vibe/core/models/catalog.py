@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import time
 from typing import Any
 
-import httpx
+import httpx2
 from pydantic import BaseModel, ConfigDict, Field
 
 from vibe.observability.logging import logger
@@ -144,13 +144,13 @@ async def fetch_provider_models(
             )
             response.raise_for_status()
             model_ids = _parse_model_ids(response.json())
-    except httpx.HTTPStatusError as exc:
+    except httpx2.HTTPStatusError as exc:
         return ModelCatalogResult(
             provider_name=provider_name,
             endpoint=endpoint,
             error=f"HTTP {exc.response.status_code}",
         )
-    except (httpx.RequestError, ValueError) as exc:
+    except (httpx2.RequestError, ValueError) as exc:
         logger.debug(
             "Model discovery failed provider=%s endpoint=%s error=%s",
             provider_name,
