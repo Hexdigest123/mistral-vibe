@@ -52,6 +52,7 @@ pub struct Transcript {
     hides_live_waits: bool,
 }
 
+#[derive(Clone)]
 pub struct Snapshot {
     entries: Vec<Value>,
     hidden: HashSet<String>,

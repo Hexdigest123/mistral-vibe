@@ -280,6 +280,7 @@ vim_keybindings = false  # Vim Normal and Insert modes in the prompt input
 autocopy_to_clipboard = true  # Enable automatic copying of selected text to clipboard
 enable_mouse_capture = true  # Capture the mouse for scrolling, clicks and selection; false keeps the terminal's native selection
 enable_sticky_prompt = true  # Pin the prompt of the section at the top of the transcript while scrolling
+enable_session_tabs = true  # Show the session tab bar above the conversation; Tab/Shift+Tab, Alt+1-9, /tab switch tabs. false hides it
 collapse_turn_details = false  # Collapse each settled turn's steps into a "Worked for" group above its final answer
 enable_file_autocomplete = true  # Offer @ file completion; off skips the file index entirely
 file_watcher_for_autocomplete = true  # Refresh @ suggestions and pick up skill changes after workspace changes
@@ -1451,6 +1452,14 @@ session's model.
   sessions until the turn ends.
 - `/resume` (or `/continue`) - Open the Sessions page, like `/sessions`, but
   only while idle.
+- `/tab` - Switch session tabs (shown when more than one is open; off with
+  `enable_session_tabs = false`): `/tab new` opens a fresh session in a new
+  tab, `/tab next` / `/tab prev` (also `Tab` / `Shift+Tab`, `Alt+1-9` or a
+  click on the tab bar) switch between the open tabs, `/tab close [N]` closes
+  one (middle-click a tab too), `/tab N` jumps to tab N. Each tab keeps its
+  conversation, scroll position and draft while another tab is active, and
+  opening a session from `/sessions` opens it as a new tab. Switching waits
+  for the current turn to finish.
 - `/storage` - (Behind the `experimental_enable_storage_usage` setting, off by
   default; Mistral turns it on remotely.) Show how much disk Vibe uses: the total, active and archived
   sessions, leftover worktrees, other Vibe data, and free disk space, then every

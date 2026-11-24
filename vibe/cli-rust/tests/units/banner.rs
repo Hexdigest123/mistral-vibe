@@ -136,14 +136,11 @@ fn every_cat_keeps_the_text_at_column_14() {
 }
 
 #[test]
-fn the_cat_uses_the_banner_text_color() {
+fn the_cat_uses_the_brand_color_of_the_title() {
     let config = config("Medium", "off", json!({}));
     let lines = Banner::default().view(&config, None, 120);
     let row = &lines.lines()[1];
-    assert_eq!(
-        row.spans[0].style.fg,
-        Some(vibe_rs::ui::theme::foreground())
-    );
+    assert_eq!(row.spans[0].style.fg, Some(vibe_rs::ui::theme::ORANGE));
 }
 
 /// Ticks `cat` for well over a round; a round must have moved dots meanwhile.

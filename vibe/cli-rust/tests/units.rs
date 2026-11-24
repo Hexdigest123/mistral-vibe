@@ -493,6 +493,8 @@ mod selection_spans;
 mod server_deadline;
 #[path = "units/server_notices.rs"]
 mod server_notices;
+#[path = "units/session_tabs.rs"]
+mod session_tabs;
 #[path = "units/sessions_page_actions.rs"]
 mod sessions_page_actions;
 #[path = "units/sessions_page_folders.rs"]

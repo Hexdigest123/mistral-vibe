@@ -103,6 +103,9 @@ pub fn tab_navigates(app: &App) -> bool {
             browser.confirm.is_some() || (browser.registry && browser.page.is_none())
         }
         Focus::Config => app.config_screen.edit.is_some() && !app.config_screen.targets.is_empty(),
+        // Fork feature (AGENTS.md "Fork features"): with several tabs open, the
+        // composer's Tab/Shift+Tab switch tabs instead of cycling agents.
+        Focus::Composer if crate::session_tabs::switchable(app) => true,
         _ => false,
     }
 }

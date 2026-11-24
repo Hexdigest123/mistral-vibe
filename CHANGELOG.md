@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Model discovery runs only for providers flagged `discover = true` (it replaces `discover_only`, and a `[[model]]` block no longer triggers it); a session start no longer refetches in the background
+- On Linux, child processes Vibe starts (MCP stdio servers, hooks, background processes, the background worker) now carry `PR_SET_PDEATHSIG`, so the kernel kills them when the app-server dies — even on `SIGKILL` or a hard shutdown deadline — instead of leaving orphaned `node` and shell processes behind
 
 ## [3.1.5] - 2026-11-24
 

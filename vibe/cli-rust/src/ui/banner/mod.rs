@@ -94,7 +94,7 @@ impl Banner {
         let grid = self.chat.render();
         let cat = grid
             .lines()
-            .map(|row| Line::from(Span::styled(format!("{row:<CAT_COLS$}"), meta)));
+            .map(|row| Line::from(Span::styled(format!("{row:<CAT_COLS$}"), brand)));
         if info
             .iter()
             .any(|line| CAT_COLS + line.width() > usize::from(width))

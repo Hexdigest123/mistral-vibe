@@ -8,12 +8,16 @@ import pytest
 
 from vibe.app_server._config_introspect import (
     DEFAULT_ORIGIN,
+    FIELD_CATEGORIES,
+    FORK_SETTINGS,
     HIDDEN_SETTINGS,
+    MAX_CONTEXT_LENGTH,
     POPULAR_SETTINGS,
     build_field_wires,
     classify_annotation,
     collect_layer_values,
     effective_config_response,
+    field_category,
     locking_layers,
     shadowed_writes,
 )
@@ -40,6 +44,31 @@ def test_popular_settings_are_valid_fields() -> None:
 def test_hidden_settings_are_valid_fields() -> None:
     unknown = HIDDEN_SETTINGS - set(VibeConfigSchema.model_fields)
     assert not unknown, f"HIDDEN_SETTINGS names not in schema: {sorted(unknown)}"
+
+
+def test_fork_settings_are_valid_and_not_popular() -> None:
+    unknown = FORK_SETTINGS - set(VibeConfigSchema.model_fields)
+    assert not unknown, f"FORK_SETTINGS names not in schema: {sorted(unknown)}"
+    assert not FORK_SETTINGS & POPULAR_SETTINGS, "a field has one section"
+
+
+def test_field_categories_are_valid_fields_and_known_sections() -> None:
+    # ``max_context_length`` is model-scoped: a synthetic row, not a schema field.
+    unknown = (
+        set(FIELD_CATEGORIES)
+        - set(VibeConfigSchema.model_fields)
+        - {MAX_CONTEXT_LENGTH}
+    )
+    assert not unknown, f"FIELD_CATEGORIES names not in schema: {sorted(unknown)}"
+    known = {"fork", "popular", "advanced"} | set(FIELD_CATEGORIES.values())
+    assert set(FIELD_CATEGORIES.values()) <= known
+
+
+def test_field_category_prefers_fork_then_popular_then_topic() -> None:
+    assert field_category("disable_all_telemetry", POPULAR_SETTINGS) == "fork"
+    assert field_category("theme", POPULAR_SETTINGS) == "popular"
+    assert field_category("providers", POPULAR_SETTINGS) == "models"
+    assert field_category("api_timeout", POPULAR_SETTINGS) == "advanced"
 
 
 @pytest.mark.parametrize(
@@ -91,6 +120,24 @@ def test_build_field_wires_covers_schema_and_defaults(
     assert by_name["models"].kind is ConfigFieldKind.COMPLEX
     assert by_name["theme"].path == "/theme"
     assert all(wire.origin == DEFAULT_ORIGIN for wire in by_name.values())
+
+
+def test_build_field_wires_sets_section_categories(
+    make_config: Callable[..., VibeConfigSchema],
+) -> None:
+    config = make_config()
+    by_name = {
+        wire.name: wire
+        for wire in build_field_wires(config, {}, popular=POPULAR_SETTINGS)
+    }
+
+    assert by_name["theme"].category == "popular"
+    assert by_name["disable_all_telemetry"].category == "fork"
+    assert by_name["providers"].category == "models"
+    assert by_name["max_context_length"].category == "models"
+    assert by_name["auto_compact_threshold"].category == "popular"
+    assert by_name["worktree_limit"].category == "worktrees"
+    assert by_name["api_timeout"].category == "advanced"
 
 
 def test_tracing_settings_are_public_and_described(

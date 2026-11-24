@@ -19,6 +19,8 @@ pub fn adopt(app: &mut App, client: &Arc<Client>, state: &PublicSessionState, ve
     // The startup warnings belong to the session the page was opened on.
     crate::notices::close_startup(app);
     app.set_session_id(state.session.id.clone());
+    // Fork feature (AGENTS.md "Fork features"): the adopted session's tab takes its title.
+    crate::session_tabs::note_title(app, state.session.title.as_deref());
     app.terminal_notifier
         .set_default_title(state.session.title.as_deref().unwrap_or(""));
     app.session.active_turn_id = None;

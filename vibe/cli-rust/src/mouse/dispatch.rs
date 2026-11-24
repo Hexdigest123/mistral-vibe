@@ -26,6 +26,16 @@ pub(super) fn dispatch(
     event: MouseEvent,
 ) {
     match target {
+        MouseTarget::TabBar => {
+            let button = match event.kind {
+                MouseEventKind::Up(MouseButton::Left) => Some(MouseButton::Left),
+                MouseEventKind::Down(MouseButton::Middle) => Some(MouseButton::Middle),
+                _ => None,
+            };
+            if let Some(button) = button {
+                crate::session_tabs::click(app, client, event.column, button);
+            }
+        }
         MouseTarget::Transcript | MouseTarget::Composer => {
             selection_event(app, client, target, event)
         }

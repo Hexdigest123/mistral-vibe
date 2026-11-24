@@ -871,6 +871,8 @@ pub struct App {
     pub artifacts_modal: ArtifactsModal,
     /// The full-screen Sessions page.
     pub sessions_page: crate::sessions_page::SessionsPage,
+    /// Fork feature (AGENTS.md "Fork features"): the session tabs above the conversation.
+    pub session_tabs: crate::session_tabs::SessionTabs,
     pub loops: crate::loops::LoopsApp,
     /// The `/storage` panel.
     pub storage: crate::storage_panel::State,
@@ -981,6 +983,8 @@ impl App {
         if let Some(session_tx) = &self.debug_console.session_tx {
             let _ = session_tx.send(session_id.clone());
         }
+        // Fork feature (AGENTS.md "Fork features"): register the attached session as a tab.
+        crate::session_tabs::on_session_id(self, &session_id);
         self.session.session_id = Some(session_id);
         // Background emitters can queue before the handshake lands.
         for event in self.session.held_telemetry.drain(..) {

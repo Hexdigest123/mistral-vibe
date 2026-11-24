@@ -15,7 +15,8 @@ pub mod mouse;
 pub mod preview;
 pub mod preview_view;
 pub mod rename;
-mod requests;
+// Fork feature (AGENTS.md "Fork features"): session tabs send resume/start through these.
+pub(crate) mod requests;
 pub mod row;
 mod switch;
 mod trigger;

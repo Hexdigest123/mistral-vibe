@@ -2049,6 +2049,10 @@ class ConfigFieldWire(ProtocolModel):
     value: JsonValue = None
     path: str
     popular: bool = False
+    # The settings-screen section ("popular", "fork", a topic key, "advanced");
+    # the client owns the section labels and order. Defaulted so a client
+    # reading an older server falls back to ``popular``.
+    category: str = ""
     enum_choices: list[str] = Field(default_factory=list)
     value_labels: dict[str, str] = Field(default_factory=dict)
     layer_values: list[ConfigLayerValueWire] = Field(default_factory=list)

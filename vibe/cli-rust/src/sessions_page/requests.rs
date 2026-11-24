@@ -25,7 +25,7 @@ fn state(value: &Value) -> Option<Box<PublicSessionState>> {
         .map(Box::new)
 }
 
-pub(super) fn resume(
+pub(crate) fn resume(
     app: &App,
     client: &Arc<Client>,
     id: String,
@@ -43,7 +43,7 @@ pub(super) fn resume(
     });
 }
 
-pub(super) fn start(app: &App, client: &Arc<Client>, config: AgentConfig, ticket: u64) {
+pub(crate) fn start(app: &App, client: &Arc<Client>, config: AgentConfig, ticket: u64) {
     spawn(app, client, |client| async move {
         let params = json!({ "agentConfig": config, "historyLimit": HISTORY_LIMIT });
         let result = client.request(method::SESSION_START, params).await;

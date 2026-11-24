@@ -46,6 +46,9 @@ GUARD_TESTS = (
     "tests/core/config/test_telemetry_kill_switch.py",
     "vibe/cli-rust/tests/units/config_dangerous.rs",
     "client-e2e/scenarios/config/telemetry_kill_switch.py",
+    "vibe/cli-rust/tests/units/session_tabs.rs",
+    "client-e2e/scenarios/session_tabs/new_switch.py",
+    "client-e2e/scenarios/session_tabs/disabled.py",
 )
 
 

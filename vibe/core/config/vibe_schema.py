@@ -1362,6 +1362,15 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
             "transcript while scrolling; a click scrolls back to it."
         ),
     )
+    enable_session_tabs: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        description=(
+            "Show session tabs above the conversation: open a new tab with "
+            "/tab new and switch between them with Tab, Shift+Tab, Alt+1-9 or "
+            "a click. Disable to hide the tab bar and keep a single session "
+            "view."
+        ),
+    )
     collapse_turn_details: Annotated[bool, WithReplaceMerge()] = Field(
         default=False,
         description=(

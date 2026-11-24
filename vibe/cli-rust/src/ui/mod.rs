@@ -64,6 +64,7 @@ pub mod rng;
 pub mod scrollbar;
 pub(crate) mod search_field;
 pub mod selection;
+pub mod session_tabs;
 pub mod sessions_page;
 pub mod skills_browser;
 pub mod storage_panel;
@@ -204,17 +205,19 @@ fn draw_base(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect) {
         false => box_height,
     };
     let chunks = Layout::vertical([
-        Constraint::Min(1),                                          // #chat — height: 1fr
-        Constraint::Length(loading_height),                          // #loading-area — height: auto
-        Constraint::Length(popup_height), // #completion-popup — height: auto, max 12
-        Constraint::Length(goal_row::height(app)), // the goal's resume choice
-        Constraint::Length(input_height), // #input-box (grows with rendered rows)
-        Constraint::Length(window_height), // the rail item's window, in the box's place
+        Constraint::Length(session_tabs::height(app)), // #tab-bar — height: auto, one row
+        Constraint::Min(1),                            // #chat — height: 1fr
+        Constraint::Length(loading_height),            // #loading-area — height: auto
+        Constraint::Length(popup_height),              // #completion-popup — height: auto, max 12
+        Constraint::Length(goal_row::height(app)),     // the goal's resume choice
+        Constraint::Length(input_height),              // #input-box (grows with rendered rows)
+        Constraint::Length(window_height),             // the rail item's window, in the box's place
         Constraint::Length(reverse_search::height(app, area.width)), // #bottom-bar — height: auto
     ])
     .split(area);
 
-    app.view.input_area = chunks[4];
+    session_tabs::draw(app, f, chunks[0]);
+    app.view.input_area = chunks[5];
     // A child view swaps the rendered transcript in the same scroll region.
     // The render cache and the last measured height belong to the transcript:
     // their revision streams are independent, so both must follow the swap.
@@ -228,7 +231,7 @@ fn draw_base(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect) {
             swapped = true;
         }
     }
-    transcript::draw(app, f, chunks[0]);
+    transcript::draw(app, f, chunks[1]);
     if swapped {
         let child_id = viewed_child.clone().unwrap_or_default();
         if let Some(child) = app.subagents.transcripts.child_mut(&child_id) {
@@ -244,7 +247,7 @@ fn draw_base(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect) {
             .and_then(|child| child.placeholder())
         {
             if let Some(top) = app.view.entry_hitmap.first().map(|(top, _, _, _)| *top) {
-                if top > chunks[0].y {
+                if top > chunks[1].y {
                     let row = Rect {
                         y: top - 1,
                         width: chunks[0].width.saturating_sub(1),
@@ -260,18 +263,18 @@ fn draw_base(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect) {
         }
     }
     if popup_height > 0 {
-        crate::mouse::register_region(app, chunks[2], crate::mouse::MouseTarget::Completion);
-        completion_popup::draw(app, f, chunks[2]);
+        crate::mouse::register_region(app, chunks[3], crate::mouse::MouseTarget::Completion);
+        completion_popup::draw(app, f, chunks[3]);
     }
-    goal_row::draw(app, f, chunks[3]);
+    goal_row::draw(app, f, chunks[4]);
     if input_height > 0 {
-        crate::mouse::register_region(app, chunks[4], crate::mouse::MouseTarget::Composer);
-        app.view.cursor_position = chat_input::draw(app, f, chunks[4]);
+        crate::mouse::register_region(app, chunks[5], crate::mouse::MouseTarget::Composer);
+        app.view.cursor_position = chat_input::draw(app, f, chunks[5]);
     }
-    rail_window::draw(app, f, chunks[5]);
-    bottom_bar::draw(app, f, chunks[6]);
+    rail_window::draw(app, f, chunks[6]);
+    bottom_bar::draw(app, f, chunks[7]);
     selection::overlay(app, f);
-    code_preview::draw(app, f, chunks[0]);
-    draw_loading_area(app, f, chunks[1]);
-    selection::loading_region(app, f, chunks[1]);
+    code_preview::draw(app, f, chunks[1]);
+    draw_loading_area(app, f, chunks[2]);
+    selection::loading_region(app, f, chunks[2]);
 }

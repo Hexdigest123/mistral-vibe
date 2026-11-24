@@ -40,6 +40,7 @@ from mistralai_vibe_local_harness.vibe._mcp_models import (
     MCPTransportFactory,
     ResolvedMCPServerConfig,
 )
+from mistralai_vibe_local_harness.vibe._pdeathsig import shim_argv
 from mistralai_vibe_local_harness.vibe._ssl import build_ssl_context
 
 logger = logging.getLogger(__name__)
@@ -281,14 +282,18 @@ class _StdioConnection(MCPClientConnection):
             raise MCPRuntimeFailure(
                 "mcp_invalid_configuration", "MCP stdio server has no command"
             )
+        # On Linux the command runs under the parent-death shim: the SDK spawns
+        # it in its own session, so an app-server killed outright (SIGKILL, the
+        # SIGTERM deadline) would otherwise orphan the server process.
+        shimmed = shim_argv([server.command, *server.args])
         stack = AsyncExitStack()
         stderr = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
         try:
             read, write = await stack.enter_async_context(
                 stdio_client(
                     StdioServerParameters(
-                        command=server.command,
-                        args=list(server.args),
+                        command=shimmed[0],
+                        args=shimmed[1:],
                         env=dict(server.env) or None,
                         cwd=str(server.cwd) if server.cwd is not None else None,
                     ),

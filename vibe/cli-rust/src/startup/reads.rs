@@ -111,6 +111,11 @@ pub fn read_enable_sticky_prompt(result: &Value) -> bool {
     config(result).enable_sticky_prompt
 }
 
+/// Whether session tabs show (config `enable_session_tabs`).
+pub fn read_enable_session_tabs(result: &Value) -> bool {
+    config(result).enable_session_tabs
+}
+
 /// Whether a turn's details collapse into a `Worked for` group (config `collapse_turn_details`).
 pub fn read_collapse_turn_details(result: &Value) -> bool {
     config(result).collapse_turn_details

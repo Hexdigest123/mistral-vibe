@@ -426,6 +426,10 @@ fn handle_key_inner(
         return false;
     }
 
+    // Fork feature (AGENTS.md "Fork features"): Tab/Shift+Tab/Alt+1-9 switch session tabs.
+    if crate::session_tabs::handle_key(app, client, &key) {
+        return false;
+    }
     // App-level keys: Esc, scroll, completion/history nav, accept, submit.
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

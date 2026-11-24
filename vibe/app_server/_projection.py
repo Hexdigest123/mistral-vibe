@@ -131,6 +131,7 @@ def project_config_view(
         autocopy_to_clipboard=config.autocopy_to_clipboard,
         enable_mouse_capture=config.enable_mouse_capture,
         enable_sticky_prompt=config.enable_sticky_prompt,
+        enable_session_tabs=config.enable_session_tabs,
         collapse_turn_details=config.collapse_turn_details,
         enable_file_autocomplete=config.enable_file_autocomplete,
         file_watcher_for_autocomplete=config.file_watcher_for_autocomplete,

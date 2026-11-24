@@ -9,6 +9,11 @@ if sys.argv[1:2] == ["--internal-posix-pty-helper"]:
 
     raise SystemExit(_pty_helper_main(sys.argv[2:]))
 
+if sys.argv[1:2] == ["--internal-pdeathsig-exec"]:
+    from mistralai_vibe_local_harness.vibe._pdeathsig import main as _pdeathsig_main
+
+    raise SystemExit(_pdeathsig_main(sys.argv[2:]))
+
 if sys.argv[1:2] == ["--internal-background-worker"]:
     from vibe.app_server._background_worker_process import (
         main as _background_worker_main,

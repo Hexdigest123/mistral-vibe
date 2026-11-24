@@ -9,8 +9,10 @@ use crate::ui::loading::OPENING_SESSION_STATUS;
 /// transcript, with its scroll, to put back when it fails.
 pub struct Switching {
     pub id: String,
-    previous: Snapshot,
-    scroll: (u16, u16),
+    pub previous: Snapshot,
+    pub scroll: (u16, u16),
+    /// Whether the Sessions page started it: only its failure reopens the page.
+    pub from_page: bool,
 }
 
 /// Whether the conversation view is waiting on a switch: it takes no prompt meanwhile.
@@ -39,6 +41,7 @@ pub(super) fn start(app: &mut App, id: String) {
         id,
         previous,
         scroll,
+        from_page: true,
     });
     app.sessions_page.open = false;
     // The session's own resume reads its history: a settling preview read would fetch it twice.
@@ -55,7 +58,14 @@ pub(super) fn landed(app: &mut App) {
 /// The switch failed: the previous conversation comes back under the page,
 /// which reopens to say why.
 pub(super) fn failed(app: &mut App) {
-    if abandon(app) {
+    // Fork feature (AGENTS.md "Fork features"): a tab switch settling here is cancelled too.
+    crate::session_tabs::on_switch_failed(app);
+    let reopen = app
+        .sessions_page
+        .switching
+        .as_ref()
+        .is_some_and(|switching| switching.from_page);
+    if abandon(app) && reopen {
         app.sessions_page.open = true;
     }
 }

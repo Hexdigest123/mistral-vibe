@@ -67,9 +67,91 @@ POPULAR_SETTINGS: frozenset[str] = frozenset({
     "enable_auto_update",
     "voice_mode_enabled",
     "enable_telemetry",
-    # Fork feature (AGENTS.md "Fork features"): the dangerous kill switch.
-    "disable_all_telemetry",
 })
+
+# Fork feature (AGENTS.md "Fork features"): settings this fork adds get their
+# own top-level "fork" section in the settings UI, ahead of the topics.
+FORK_SETTINGS: frozenset[str] = frozenset({
+    "disable_all_telemetry",
+    "enable_session_tabs",
+})
+
+# Section keys for the non-popular fields, by field name; anything unlisted
+# lands in "advanced". The client owns the labels and the section order.
+FIELD_CATEGORIES: dict[str, str] = {
+    "models": "models",
+    "providers": "models",
+    "allowed_models": "models",
+    "compaction_model": "models",
+    "vision_model": "models",
+    "utility_models": "models",
+    "max_context_length": "models",
+    "enable_model_catalog": "models",
+    "enable_builtin_models": "models",
+    "active_transcribe_model": "voice",
+    "transcribe_providers": "voice",
+    "transcribe_models": "voice",
+    "active_tts_model": "voice",
+    "tts_providers": "voice",
+    "tts_models": "voice",
+    "narrator_enabled": "voice",
+    "outside_workdir": "tools",
+    "enabled_tools": "tools",
+    "disabled_tools": "tools",
+    "enable_mcp": "tools",
+    "enable_connectors": "tools",
+    "experimental_enable_document_library_connector": "tools",
+    "experimental_enable_mistral_mcp_connector": "tools",
+    "connectors": "tools",
+    "agent_paths": "agents",
+    "enabled_agents": "agents",
+    "disabled_agents": "agents",
+    "installed_agents": "agents",
+    "default_approval_policy": "agents",
+    "enable_auto_approve": "agents",
+    "enable_subagents": "agents",
+    "max_subagents": "agents",
+    "max_concurrent_subagents": "agents",
+    "skill_paths": "agents",
+    "enabled_skills": "agents",
+    "disabled_skills": "agents",
+    "experimental_enable_registry_skills": "agents",
+    "enabled_plugins": "agents",
+    "disabled_plugins": "agents",
+    "experimental_enable_remote_plugins": "agents",
+    "disable_welcome_banner_animation": "appearance",
+    "disable_selection_animation": "appearance",
+    "cursor_blink": "appearance",
+    "vim_keybindings": "appearance",
+    "enable_mouse_capture": "appearance",
+    "enable_sticky_prompt": "appearance",
+    "collapse_turn_details": "appearance",
+    "enable_file_autocomplete": "appearance",
+    "file_watcher_for_autocomplete": "appearance",
+    "show_thinking_nodes": "appearance",
+    "show_subagent_status_list": "appearance",
+    "experimental_enable_tab_status": "appearance",
+    "show_dangerous_directory_warning": "safety",
+    "strict_config": "safety",
+    "enable_otel": "safety",
+    "otel_endpoint": "safety",
+    "otel_redaction": "safety",
+    "session_logging": "safety",
+    "project_context": "safety",
+    "include_project_context": "safety",
+    "worktree_limit": "worktrees",
+    "auto_worktree": "worktrees",
+    "worktree_copy_on_write": "worktrees",
+}
+
+
+def field_category(name: str, popular: frozenset[str]) -> str:
+    """The settings-screen section a field belongs to."""
+    if name in FORK_SETTINGS:
+        return "fork"
+    if name in popular:
+        return "popular"
+    return FIELD_CATEGORIES.get(name, "advanced")
 
 
 def locking_layers(
@@ -250,6 +332,7 @@ def _model_scoped_wire(
         value=getattr(active_model, name),
         path=path,
         popular=name in popular,
+        category=field_category(name, popular),
         enum_choices=[],
         layer_values=values,
     )
@@ -317,6 +400,7 @@ def build_field_wires(
                 value=value,
                 path=path,
                 popular=name in popular,
+                category=field_category(name, popular),
                 enum_choices=list(choices),
                 layer_values=values,
             )

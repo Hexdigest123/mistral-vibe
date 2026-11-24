@@ -100,7 +100,9 @@ pub mod run_server;
 pub mod search_field;
 pub mod selection;
 pub mod server;
+// Fork feature (AGENTS.md "Fork features"): session tabs (`/tab`, Tab/Shift+Tab, Alt+1-9).
 pub mod session_exit;
+pub mod session_tabs;
 pub mod sessions_page;
 pub mod setup;
 pub mod skill;

@@ -232,6 +232,51 @@ Guards: `tests/core/config/test_telemetry_kill_switch.py`,
 `client-e2e/scenarios/config/telemetry_kill_switch.py`,
 `tests/test_fork_features.py`.
 
+## 7. Session tabs (`enable_session_tabs`, on by default)
+
+Contract:
+- Quick-switch tabs: only the active tab is attached to the app-server (one
+  connection, one session, as before); the other tabs keep their transcript
+  snapshot, scroll and composer draft client-side, and their session in the
+  store. A tab switch sends `session/resume` (or `session/start` for a new
+  tab) on the same connection, so it waits for the current turn to finish
+  (same gate as the Sessions page's switch). The in-flight switch rides the
+  Sessions page's `switching` record, so input/Esc/Ctrl+C gating is shared.
+- UI: a one-row tab bar above the conversation, shown when more than one tab
+  is open (`1 Title  2 Title …`, active tab on the cursor bar, `Tab switch
+  tab` hint at the right edge). Left click switches, middle click closes.
+- Keys (composer only): `Tab`/`Shift+Tab` step (wrapping), `Alt+1-9` jump.
+  With 2+ tabs open, `focus::tab_navigates` is true for the composer, so
+  Shift+Tab reaches the tabs instead of cycling approval policies.
+- `/tab [new|next|prev|close [N]|N]` runs the same actions; hidden from help
+  and completion while the feature is off (`Feature::SessionTabs`), typing it
+  while off shows a notice. Opening a session from the Sessions page opens it
+  as a new tab (or switches to its tab if already open). `/clear`/`/compact`
+  still replace the active tab's session in place.
+- Config: `enable_session_tabs: bool = true` in `vibe_schema.py`, projected
+  in `ConfigView` (`app_server/config.py`, `_projection.py`, ADR 0014 default
+  `yes` in the Rust `proto_runtime.rs`), read by `startup::read_enable_session_tabs`
+  and applied on ready and `runtime/updated`. While off, no tab bar, no tab
+  keys, and `on_session_id` leaves the tab list alone. The field is in
+  `FORK_SETTINGS`, so it renders in `/config`'s "Fork features" section.
+  README.md "Session tabs" documents it.
+
+Map: `vibe/cli-rust/src/session_tabs/` (`mod.rs` state + tab bookkeeping,
+`switch.rs` the switch mechanics, `keys.rs`, `command.rs`), `src/ui/session_tabs.rs`
+(tab bar). Hooks marked `Fork feature (AGENTS.md "Fork features")` in
+`src/lib.rs`, `src/app.rs` (`set_session_id`), `src/event_handler.rs` (flag +
+titles), `src/input.rs`, `src/focus.rs`, `src/mouse.rs` + `src/mouse/dispatch.rs`,
+`src/ui/mod.rs`, `src/commands/{commands,dispatch}.rs`,
+`src/sessions_page/{mod,requests,switch,adopt}.rs`, `src/server/proto_runtime.rs`,
+`src/startup/{mod,reads}.rs`, `src/transcript.rs` (`Snapshot: Clone`).
+Python: `vibe/core/config/vibe_schema.py`, `vibe/app_server/config.py`,
+`vibe/app_server/_projection.py`, `vibe/app_server/_config_introspect.py`.
+
+Guards: `vibe/cli-rust/tests/units/session_tabs.rs`, scenarios
+`client-e2e/scenarios/session_tabs/new_switch.py` and `disabled.py`,
+`tests/app_server/test_projection.py::test_config_view_projects_enable_session_tabs`,
+`tests/test_fork_features.py`.
+
 ## Adding a fork feature
 
 Add its row to the AGENTS.md "Fork features" table, its section here

@@ -87,6 +87,7 @@ from mistralai_vibe_local_harness.vibe._local_actions import (
     HookNoticeData,
     ToolScopedHook,
 )
+from mistralai_vibe_local_harness.vibe._pdeathsig import shim_argv
 from mistralai_vibe_local_harness.vibe._processes._backend import TerminalBackendError
 from mistralai_vibe_local_harness.vibe._processes._windows import WindowsTerminalBackend
 from mistralai_vibe_local_harness.vibe._projection import (
@@ -514,8 +515,12 @@ async def _spawn_hook_command(
                 env=env,
             )
         case _:
-            return await asyncio.create_subprocess_shell(
-                command,
+            # On Linux the parent-death shim wraps the shell, so an
+            # app-server killed outright does not orphan a running hook.
+            # Off Linux shim_argv is the plain ``/bin/sh -c`` the shell
+            # spawn would have used.
+            return await asyncio.create_subprocess_exec(
+                *shim_argv(["/bin/sh", "-c", command]),
                 stdin=pipe,
                 stdout=pipe,
                 stderr=pipe,

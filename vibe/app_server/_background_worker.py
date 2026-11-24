@@ -239,8 +239,12 @@ class BackgroundWorker:
             stdout=subprocess.PIPE,
             # The worker reads VIBE_HOME as this process does, and stands
             # outside every worktree: on Windows a working directory cannot be
-            # deleted.
-            env={**os.environ, "VIBE_HOME": str(home)},
+            # deleted. VIBE_PARENT_PID lets it die with this process (Linux).
+            env={
+                **os.environ,
+                "VIBE_HOME": str(home),
+                "VIBE_PARENT_PID": str(os.getpid()),
+            },
             cwd=home,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )

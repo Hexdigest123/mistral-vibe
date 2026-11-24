@@ -2305,6 +2305,7 @@ async def run_bash(
         "-S",
         "-c",
         _SESSION_GUARD,
+        str(os.getpid()),
         *with_raised_oom_score([resolved, "-c", command_line]),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
@@ -2332,12 +2333,27 @@ async def run_bash(
 # The guard's stdin is a pipe that only the helper holds open: end of file means
 # the helper is gone. Otherwise the guard exits as the shell did. The shell's own
 # stdin is an empty pipe rather than /dev/null, which a command may have deleted.
+# sys.argv[1] is the helper's pid, read before the fork; sys.argv[2:] is the
+# shell command. On Linux the guard arms PR_SET_PDEATHSIG against that pid and
+# the shell (same group) against the guard's own pid, so a helper or guard
+# killed outright takes the command down instead of orphaning it.
 _SESSION_GUARD = """
-import os, signal, subprocess, sys, threading
+import ctypes, os, signal, subprocess, sys, threading
+expected_ppid = int(sys.argv[1])
+guard_pid = os.getpid()
+_libc = ctypes.CDLL(None, use_errno=True) if sys.platform.startswith("linux") else None
+def _pdeathsig(parent_pid):
+    if _libc is not None:
+        _libc.prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+    if os.getppid() != parent_pid:
+        os._exit(1)
+if _libc is not None:
+    _pdeathsig(expected_ppid)
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 empty, writer = os.pipe()
 os.close(writer)
-shell = subprocess.Popen(sys.argv[1:], stdin=empty)
+# Single-threaded so far, so a preexec_fn is safe here.
+shell = subprocess.Popen(sys.argv[2:], stdin=empty, preexec_fn=lambda: _pdeathsig(guard_pid) if _libc is not None else None)
 os.close(empty)
 def guard():
     try:
@@ -2520,8 +2536,9 @@ _ProcessSnapshot = tuple[float, dict[int, tuple[int, int, bool]]]
 
 # Runs in the child before the shell: makes the terminal the controlling one,
 # undoes the signal state a Python parent leaves behind and, on Linux, makes the
-# process the OOM killer's first pick (see COMMAND_OOM_SCORE_ADJ), then becomes
-# the shell, so the shell keeps this process's pid and group.
+# process the OOM killer's first pick (see COMMAND_OOM_SCORE_ADJ) and die with
+# the process server (PR_SET_PDEATHSIG; sys.argv[3] is its pid, read before the
+# fork), then becomes the shell, so the shell keeps this process's pid and group.
 _PROCESS_BOOTSTRAP = f"""
 import fcntl, os, signal, sys, termios
 fcntl.ioctl(0, termios.TIOCSCTTY, 0)
@@ -2531,6 +2548,13 @@ if sys.platform.startswith("linux"):
             oom_score_adj.write("{COMMAND_OOM_SCORE_ADJ}")
     except OSError:
         pass
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+    except (AttributeError, OSError):
+        pass
+    if os.getppid() != int(sys.argv[3]):
+        os._exit(1)
 if hasattr(signal, "pthread_sigmask"):
     signal.pthread_sigmask(signal.SIG_SETMASK, [])
 for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
@@ -3055,6 +3079,7 @@ class ProcessServer:
                     _PROCESS_BOOTSTRAP,
                     shell,
                     login.command(payload["command"]),
+                    str(os.getpid()),
                 ],
                 cwd=cwd,
                 env=env,

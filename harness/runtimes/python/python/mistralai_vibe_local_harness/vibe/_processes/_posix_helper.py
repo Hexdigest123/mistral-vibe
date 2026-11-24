@@ -11,6 +11,8 @@ import sys
 import termios
 from typing import Literal, TypedDict, cast
 
+from mistralai_vibe_local_harness.vibe._pdeathsig import set_pdeathsig
+
 _MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # As _sandbox_helper.COMMAND_OOM_SCORE_ADJ: the most a process can have, so under
 # memory pressure the kernel kills a runaway command before the Host.
@@ -25,11 +27,15 @@ class PosixLaunchRequest(TypedDict):
     env: dict[str, str]
 
 
-def run(request_fd: int, status_fd: int, slave_fd: int) -> None:
+def run(request_fd: int, status_fd: int, slave_fd: int, expected_ppid: int) -> None:
     stage = "request"
     try:
         request = _read_request(request_fd)
         os.close(request_fd)
+        # Die with the app-server however it dies: this helper leads the
+        # session the shell gets, so the shell (same pid after execve) is
+        # covered too. A fresh single-threaded process, so prctl is safe here.
+        set_pdeathsig(expected_ppid)
         stage = "setsid"
         os.setsid()
         _raise_oom_score()
@@ -132,13 +138,15 @@ def _write_error(descriptor: int, stage: str, error_number: int | None) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    if len(arguments) != 3:  # noqa: PLR2004 - argv arity
+    if len(arguments) != 4:  # noqa: PLR2004 - argv arity
         return 2
     try:
-        descriptors = [int(value) for value in arguments]
+        request_fd, status_fd, slave_fd, expected_ppid = (
+            int(value) for value in arguments
+        )
     except ValueError:
         return 2
-    run(*descriptors)
+    run(request_fd, status_fd, slave_fd, expected_ppid)
     return 127
 
 

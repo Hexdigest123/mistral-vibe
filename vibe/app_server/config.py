@@ -118,6 +118,8 @@ class ConfigView(ProtocolModel):
     enable_mouse_capture: bool = True
     # Preserve the pinned prompt when reading an older app-server response (ADR 0014).
     enable_sticky_prompt: bool = True
+    # Preserve session tabs when reading an older app-server response (ADR 0014).
+    enable_session_tabs: bool = True
     # Keep every turn's details shown when reading an older app-server response (ADR 0014).
     collapse_turn_details: bool = False
     # Preserve @ file completion when reading an older app-server response (ADR 0014).

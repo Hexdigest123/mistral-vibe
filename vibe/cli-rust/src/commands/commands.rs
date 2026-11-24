@@ -9,6 +9,8 @@ use crate::skill::Skill;
 pub enum Feature {
     PrMonitoring,
     StorageUsage,
+    /// Fork feature (AGENTS.md "Fork features"): session tabs (`enable_session_tabs`).
+    SessionTabs,
 }
 
 impl Feature {
@@ -16,6 +18,7 @@ impl Feature {
         match self {
             Self::PrMonitoring => app.artifacts_modal.enabled,
             Self::StorageUsage => app.storage.enabled,
+            Self::SessionTabs => app.session_tabs.enabled,
         }
     }
 }
@@ -117,6 +120,9 @@ const COMMANDS: &[Command] = &[
     cmd(&["/proxy-setup"], "Configure proxy and SSL certificate settings", true).after_jobs(),
     cmd(&["/cd"], "Move this session to another folder, keeping the conversation", false).args("[path]"),
     cmd(&["/resume", "/continue"], "Open the Sessions page to resume a saved session", false).drops_queue(),
+    cmd(&["/tab"], "Switch session tabs: open one in the current session's place, or manage the open ones", false)
+        .args("[new|next|prev|close [N]|N]")
+        .requires(Feature::SessionTabs),
     cmd(&["/sessions"], "Open the Sessions page: every session, grouped by project (or press ← on an empty prompt)", true),
     cmd(&["/storage"], "See how much disk Vibe uses and archive or delete old sessions", true)
         .flagged(Feature::StorageUsage),

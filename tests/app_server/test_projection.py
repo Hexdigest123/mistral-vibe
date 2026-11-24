@@ -167,6 +167,16 @@ def test_config_view_projects_enable_sticky_prompt(enabled: bool) -> None:
 
 
 @pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_enable_session_tabs(enabled: bool) -> None:
+    config = project_config_view(build_test_vibe_config(enable_session_tabs=enabled))
+
+    assert config.model_dump(mode="json", by_alias=True)["enableSessionTabs"] is enabled
+    legacy_payload = config.model_dump(mode="json", by_alias=True)
+    del legacy_payload["enableSessionTabs"]
+    assert type(config).model_validate(legacy_payload).enable_session_tabs is True
+
+
+@pytest.mark.parametrize("enabled", [True, False])
 def test_config_view_projects_enable_mouse_capture(enabled: bool) -> None:
     config = project_config_view(build_test_vibe_config(enable_mouse_capture=enabled))
 

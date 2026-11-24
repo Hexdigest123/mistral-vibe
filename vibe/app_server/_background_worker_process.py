@@ -21,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import importlib
 import json
+import os
+import signal
 import sys
 import threading
 from typing import Any, BinaryIO
@@ -41,10 +43,34 @@ class Job:
 type JobSet = Mapping[str, Job]
 
 
+def _die_with_parent() -> None:
+    # Linux PR_SET_PDEATHSIG: this fresh single-threaded process is SIGKILLed
+    # when the app-server dies, however it dies, instead of outliving it. The
+    # expected parent pid arrives in the environment, read before the fork, so
+    # a parent that died during the spawn is detected instead of arming the
+    # signal against PID 1.
+    if sys.platform != "linux":
+        return
+    expected = os.environ.get("VIBE_PARENT_PID", "")
+    if not expected.isdigit():
+        return
+    parent = int(expected)
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+    except (AttributeError, OSError):
+        return
+    if os.getppid() != parent:
+        os._exit(1)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     if args[:1] == [FLAG]:
         args = args[1:]
+    _die_with_parent()
     channel = sys.stdout.buffer
     # Stray prints would corrupt the channel.
     sys.stdout = sys.stderr

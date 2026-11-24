@@ -80,6 +80,9 @@ pub struct ConfigView {
     /// Absent on an older server: the prompt stays pinned, per ADR 0014.
     #[serde(default = "yes")]
     pub enable_sticky_prompt: bool,
+    /// Absent on an older server: session tabs stay on, per ADR 0014.
+    #[serde(default = "yes")]
+    pub enable_session_tabs: bool,
     /// Absent on an older server: every turn keeps its details shown, per ADR 0014.
     #[serde(default)]
     pub collapse_turn_details: bool,

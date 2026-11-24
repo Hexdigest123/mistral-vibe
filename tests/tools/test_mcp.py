@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from pydantic import ValidationError
 import pytest
 
+from mistralai_vibe_local_harness.vibe._pdeathsig import shim_argv
 from tests.conftest import build_test_vibe_config
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 from vibe import __version__
@@ -24,6 +26,7 @@ from vibe.core.tools.mcp import (
     list_tools_http,
     list_tools_stdio,
 )
+from vibe.core.tools.mcp.tools import build_stdio_params
 
 
 @pytest.mark.parametrize(
@@ -753,9 +756,21 @@ class TestMCPStdioCwd:
 
             await list_tools_stdio(["python", "-m", "srv"], cwd="/tmp/myproject")
 
+            shimmed = shim_argv(["python", "-m", "srv"])
             mock_params_cls.assert_called_once_with(
-                command="python", args=["-m", "srv"], env=None, cwd="/tmp/myproject"
+                command=shimmed[0], args=shimmed[1:], env=None, cwd="/tmp/myproject"
             )
+
+    def test_build_stdio_params_wraps_command_in_the_pdeathsig_shim(self):
+        params = build_stdio_params(["node", "server.js"])
+        if sys.platform == "linux":
+            # The MCP SDK spawns the command in its own session with no way to
+            # inject a parent-death signal, so the command runs under the shim.
+            assert params.command == sys.executable
+            assert params.args[-3:] == ["--", "node", "server.js"]
+        else:
+            assert params.command == "node"
+            assert params.args == ["server.js"]
 
     @pytest.mark.asyncio
     async def test_discover_stdio_passes_cwd_to_list_tools(self):

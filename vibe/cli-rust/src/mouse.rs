@@ -86,6 +86,8 @@ pub enum MouseTarget {
     OnboardingInputs,
     SubagentList,
     CodePreview,
+    /// The session tab bar above the conversation: a click switches, middle closes.
+    TabBar,
 }
 
 /// Render-time hit-test metadata for one screen region.
@@ -327,6 +329,7 @@ fn handle_wheel(app: &mut App, event: MouseEvent) -> bool {
         | MouseTarget::OnboardingPreview
         | MouseTarget::OnboardingLinks
         | MouseTarget::OnboardingInputs
+        | MouseTarget::TabBar
         | MouseTarget::Rail => {}
     }
     true

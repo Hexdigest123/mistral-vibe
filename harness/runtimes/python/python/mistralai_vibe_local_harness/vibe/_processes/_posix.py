@@ -239,7 +239,10 @@ class PosixTerminalBackend:
 
 
 def _helper_argv(request_fd: int, status_fd: int, slave_fd: int) -> list[str]:
-    descriptors = [str(request_fd), str(status_fd), str(slave_fd)]
+    # The trailing pid is the parent's, read before the fork: the helper exits
+    # at once if it no longer matches, instead of arming a parent-death
+    # signal against PID 1 after the parent already died.
+    descriptors = [str(request_fd), str(status_fd), str(slave_fd), str(os.getpid())]
     if getattr(sys, "frozen", False):
         return [sys.executable, "--internal-posix-pty-helper", *descriptors]
     return [

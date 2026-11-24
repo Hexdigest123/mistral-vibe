@@ -210,8 +210,13 @@ def build_stdio_params(
     command: list[str], *, env: dict[str, str] | None = None, cwd: str | None = None
 ) -> StdioServerParameters:
     from mcp.client.stdio import StdioServerParameters
+    from mistralai_vibe_local_harness.vibe._pdeathsig import shim_argv
 
-    return StdioServerParameters(command=command[0], args=command[1:], env=env, cwd=cwd)
+    # On Linux the command runs under the parent-death shim: the SDK spawns it
+    # in its own session, so an app-server killed outright would orphan it.
+    # The Harness import stays lazy: importing it would slow every process start.
+    shimmed = shim_argv(list(command))
+    return StdioServerParameters(command=shimmed[0], args=shimmed[1:], env=env, cwd=cwd)
 
 
 async def enter_stdio_session(

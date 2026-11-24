@@ -46,6 +46,7 @@ pub(super) fn run_command(
         "/sessions" => {
             crate::sessions_page::open(app, client, crate::sessions_page::Trigger::SessionsCommand)
         }
+        "/tab" => crate::session_tabs::command(app, client, command_args(value)),
         "/storage" => crate::storage_panel::open(app, client),
         "/rewind" => rewind::command(app, client),
         "/cd" => super::cd::run(app, client, command_args(value)),

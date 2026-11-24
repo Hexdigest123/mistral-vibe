@@ -205,6 +205,8 @@ fn apply_ready(
     app.subagents.status_list_enabled = startup::read_show_subagent_status_list(&runtime);
     app.artifacts_modal.enabled = startup::read_pr_monitoring(&runtime);
     app.view.sticky_prompt_enabled = startup::read_enable_sticky_prompt(&runtime);
+    // Fork feature (AGENTS.md "Fork features"): the `enable_session_tabs` config value.
+    crate::session_tabs::set_enabled(app, startup::read_enable_session_tabs(&runtime));
     app.view.collapse_turn_details = startup::read_collapse_turn_details(&runtime);
     app.quit.ask_confirmation_on_exit = startup::read_ask_confirmation_on_exit(&runtime);
     // Later picker resumes resend this config, so it must keep naming the
@@ -225,6 +227,8 @@ fn apply_ready(
         .set_show_reasoning(startup::read_show_thinking_nodes(&runtime));
     message_queue::reconcile_snapshot(app, client, &state);
     app.set_session_id(state.session.id.clone());
+    // Fork feature (AGENTS.md "Fork features"): the first tab takes the session title.
+    crate::session_tabs::note_title(app, Some(title));
     crate::background_work::adopt_state(app, &state);
     crate::loops::adopt_state(app, &state);
     app.subagents.seed_snapshot(state.child_sessions.clone());
@@ -361,6 +365,8 @@ pub fn apply_runtime_value(app: &mut App, runtime: &Value) {
     app.subagents.status_list_enabled = startup::read_show_subagent_status_list(runtime);
     app.artifacts_modal.enabled = startup::read_pr_monitoring(runtime);
     app.view.sticky_prompt_enabled = startup::read_enable_sticky_prompt(runtime);
+    // Fork feature (AGENTS.md "Fork features"): keep the tab bar in step with the config.
+    crate::session_tabs::set_enabled(app, startup::read_enable_session_tabs(runtime));
     let collapse = startup::read_collapse_turn_details(runtime);
     // Turned on under a bulk-unfolded Ctrl+O state, the new groups open unfolded too.
     if collapse && !app.view.collapse_turn_details && !app.view.tools_collapsed {
@@ -649,6 +655,8 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
         }
         if let Some(title) = crate::terminal_notifier::updated_title(&event.params) {
             app.terminal_notifier.set_default_title(title);
+            // Fork feature (AGENTS.md "Fork features"): the active tab shows the new title.
+            crate::session_tabs::note_title(app, Some(title));
         }
         crate::goal::track_patch(app, &event.params);
         return true;
@@ -672,6 +680,8 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             if entry.detail_kind() == Some("session_title_updated") {
                 if let Some(title) = &entry.detail.title {
                     app.terminal_notifier.set_default_title(title);
+                    // Fork feature (AGENTS.md "Fork features"): the active tab shows the new title.
+                    crate::session_tabs::note_title(app, Some(title));
                 }
             }
             if let Some(entry_id) = &entry.id {
