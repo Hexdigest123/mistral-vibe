@@ -124,6 +124,7 @@ fn shift_tab_moves_the_config_save_target_back() {
             description: String::new(),
             value_labels: Default::default(),
             layers: Vec::new(),
+            dangerous: false,
         },
     );
     assert!(tab_navigates(&app));

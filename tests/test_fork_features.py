@@ -43,6 +43,9 @@ GUARD_TESTS = (
     "client-e2e/scenarios/model/model_refresh_unconfigured.py",
     "client-e2e/scenarios/slash_command/resume_search.py",
     "client-e2e/scenarios/slash_command/config_edit_choice_search.py",
+    "tests/core/config/test_telemetry_kill_switch.py",
+    "vibe/cli-rust/tests/units/config_dangerous.rs",
+    "client-e2e/scenarios/config/telemetry_kill_switch.py",
 )
 
 
@@ -57,7 +60,13 @@ def test_the_guard_tests_still_exist(path: str) -> None:
 
 def test_the_rust_guard_tests_are_registered() -> None:
     units = (REPO / "vibe/cli-rust/tests/units.rs").read_text(encoding="utf-8")
-    for module in ("fork_features", "fzf_rank", "model_refresh", "paste_image"):
+    for module in (
+        "fork_features",
+        "fzf_rank",
+        "model_refresh",
+        "paste_image",
+        "config_dangerous",
+    ):
         assert f"mod {module};" in units, _dropped(f"Rust units module {module}")
 
 
@@ -131,3 +140,23 @@ def test_a_blind_model_on_any_provider_falls_back_to_the_vision_model() -> None:
 def test_make_build_installs_the_vibes_wrapper() -> None:
     makefile = (REPO / "Makefile").read_text(encoding="utf-8")
     assert "$(LOCAL_BIN_DIR)/vibes" in makefile, _dropped("make build -> vibes")
+
+
+def test_the_telemetry_kill_switch_stays() -> None:
+    field = VibeConfigSchema.model_fields.get("disable_all_telemetry")
+    assert field is not None and field.default is False, _dropped(
+        "disable_all_telemetry (off by default)"
+    )
+    from vibe.core.config._telemetry_kill_switch import (
+        DANGEROUS_SETTINGS,
+        telemetry_active,
+    )
+
+    assert "disable_all_telemetry" in DANGEROUS_SETTINGS, _dropped(
+        "the kill switch is flagged dangerous"
+    )
+    config = VibeConfigSchema.model_validate({
+        "enable_telemetry": True,
+        "disable_all_telemetry": True,
+    })
+    assert not telemetry_active(config), _dropped("the kill switch gates telemetry")

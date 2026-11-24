@@ -2181,6 +2181,14 @@ class AppServer:
             self._initialization = InitializationState.INITIALIZED
             self._note_self_hosted_deployment()
             self._gate_crash_reporting(self._host_handler.crash_reports_allowed)
+            # Fork feature (AGENTS.md "Fork features"): purge on-disk telemetry
+            # when the kill switch is armed.
+            purge = asyncio.create_task(
+                self._host_handler.purge_local_telemetry_if_armed()
+            )
+            purge.add_done_callback(
+                lambda task: task.exception() if not task.cancelled() else None
+            )
             self._resume_left_turns()
             return
         if (

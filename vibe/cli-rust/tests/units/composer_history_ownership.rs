@@ -174,6 +174,7 @@ fn history_shortcuts_do_not_clear_a_config_validation_error() {
             description: String::new(),
             value_labels: Default::default(),
             layers: Vec::new(),
+            dangerous: false,
         },
     );
     let client = Arc::new(Client::stub());

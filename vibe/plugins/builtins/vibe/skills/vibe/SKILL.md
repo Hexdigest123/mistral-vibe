@@ -348,6 +348,7 @@ enable_builtin_models = true       # Offer Mistral Large 4 and Mistral Medium 3.
 enable_pr_monitoring = true        # Track the session's PRs/MRs (gh/glab): detect created ones, find existing ones for the branch, keep their status fresh
 system_prompt_id = "cli"          # System prompt: "cli", "lean", or custom .md filename
 enable_telemetry = true
+# disable_all_telemetry = false  # DANGEROUS kill switch: when true, ALL telemetry (usage events, crash reports, OTel traces, experiment evals) is off regardless of enable_telemetry and stored telemetry is deleted; may violate the Terms of Service and get the account banned. Off by default; toggle it in /config (flagged red) or here
 enable_update_checks = true       # Daily update check (uv or PyPI); prompts on next launch when a newer release exists
 enable_notifications = true
 keep_awake = false                # Prevent idle sleep while a turn runs or waits for an approval/question (caffeinate, systemd-inhibit idle lock, SetThreadExecutionState); display sleep and lid close still apply; applies at once, mid-turn too; Vibe Desktop sessions follow Desktop's own setting
@@ -378,7 +379,8 @@ active_tts_model = "voxtral-tts"
 ### OpenTelemetry Tracing
 
 Set `enable_otel = true` to export traces for agent, model, and tool operations
-over OTLP/HTTP. `enable_telemetry` must also be enabled. With no explicit
+over OTLP/HTTP. `enable_telemetry` must also be enabled, and `disable_all_telemetry`
+must stay `false` (the kill switch wins over both). With no explicit
 endpoint, Vibe derives the telemetry endpoint and API key from the configured
 Mistral provider, except public regional API hosts that do not serve telemetry.
 

@@ -15,6 +15,7 @@ This checkout is the `Hexdigest123/mistral-vibe` fork. The features below exist 
 | Linux clipboard image paste (`Ctrl+V`, `/paste-image`): PNG/JPEG/WebP/GIF, file-manager copies, native X11/Wayland fallback without wl-clipboard or xclip | `vibe/cli-rust/tests/units/paste_image.rs` |
 | Vision fallback for blind models, including images read with `read_file` (`builtin:image_describe`) and a `vision_model` on another provider | `tests/app_server/test_image_read_hooks.py`, `tests/app_server/test_vision.py` |
 | `make build` → standalone `~/.local/bin/vibes` | `tests/test_fork_features.py` |
+| Telemetry kill switch `disable_all_telemetry` (off by default): when on, all telemetry is off (datalake events, Sentry, OTel, GrowthBook eval) regardless of `enable_telemetry`, on-disk telemetry is purged, project/agent layers may arm but never disarm it, and the setting is flagged `dangerous` in `/config` | `tests/core/config/test_telemetry_kill_switch.py`, `vibe/cli-rust/tests/units/config_dangerous.rs`; client-e2e `config/telemetry_kill_switch` |
 
 1. Before you finish any change, and after every upstream merge, run `uv run pytest tests/test_fork_features.py` and the guard tests of every feature the change touches, plus `make test_golden` when the TUI changed. A failing guard means a fork feature broke: fix the code, never the guard.
 2. Never delete, skip, xfail or weaken a guard test or a fork golden, and never shorten `GUARD_TESTS` in `tests/test_fork_features.py`. Only the user's explicit decision to change a feature changes its guards.

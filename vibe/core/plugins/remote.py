@@ -45,6 +45,8 @@ import zipfile
 import httpx2
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
+# Fork feature (AGENTS.md "Fork features"): the kill switch gates this too.
+from vibe.core.config._telemetry_kill_switch import telemetry_active
 from vibe.core.paths import VIBE_HOME, GlobalPath
 from vibe.core.platform_auth import (
     CachedPrincipal,
@@ -658,7 +660,8 @@ def _report_sync(
     Counts and codes only: no plugin names, ids or error messages.
     """
     try:
-        if not config.enable_telemetry:
+        # Fork feature (AGENTS.md "Fork features"): the kill switch wins.
+        if not telemetry_active(config):
             return
         from vibe.core.telemetry.send import TelemetryClient
 

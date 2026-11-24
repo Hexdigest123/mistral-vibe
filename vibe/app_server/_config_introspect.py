@@ -18,6 +18,12 @@ from vibe.app_server.protocol import (
     TelemetrySettingView,
 )
 from vibe.core.config._catalog_filter import CATALOG_FILTER_KEY, with_remote_models
+
+# Fork feature (AGENTS.md "Fork features"): the kill switch and its flag.
+from vibe.core.config._telemetry_kill_switch import (
+    DANGEROUS_SETTINGS,
+    without_kill_switch_disarms,
+)
 from vibe.core.config._telemetry_off_only import without_telemetry_opt_ins
 from vibe.core.config.layer import ConfigLayer, ConfigLayerError, RawConfig
 from vibe.core.config.layers.admin import AdminConfigLayer
@@ -61,6 +67,8 @@ POPULAR_SETTINGS: frozenset[str] = frozenset({
     "enable_auto_update",
     "voice_mode_enabled",
     "enable_telemetry",
+    # Fork feature (AGENTS.md "Fork features"): the dangerous kill switch.
+    "disable_all_telemetry",
 })
 
 
@@ -178,8 +186,10 @@ async def collect_layer_values(
             continue
     values: dict[str, list[ConfigLayerValueWire]] = {}
     # The models as the merge sees them, without a project config's or agent
-    # profile's telemetry opt-in, which the merge drops too.
-    shown = with_remote_models(without_telemetry_opt_ins(loaded))
+    # profile's telemetry opt-in (or kill-switch disarm), which the merge drops.
+    shown = with_remote_models(
+        without_telemetry_opt_ins(without_kill_switch_disarms(loaded))
+    )
     for layer_name, data in reversed(shown):
         for name, value in data.items():
             # The default layer materializes an unset threshold; it means "no
@@ -328,7 +338,13 @@ def build_field_wires(
         )
     )
     return [
-        wire.model_copy(update={"locked": wire.origin in locking_layers})
+        wire.model_copy(
+            update={
+                "locked": wire.origin in locking_layers,
+                # Fork feature (AGENTS.md "Fork features"): flag dangerous rows.
+                "dangerous": wire.name in DANGEROUS_SETTINGS,
+            }
+        )
         for wire in wires
     ]
 

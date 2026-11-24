@@ -18,6 +18,9 @@ pub struct ConfigField {
     pub description: String,
     pub value_labels: BTreeMap<String, String>,
     pub layers: Vec<(String, Value)>,
+    /// Fork feature (AGENTS.md "Fork features"): a dangerous setting (e.g. the
+    /// telemetry kill switch) is flagged red and warns when switched on.
+    pub dangerous: bool,
 }
 
 impl ConfigField {
@@ -67,6 +70,7 @@ struct WireField {
     value_labels: BTreeMap<String, String>,
     #[serde(deserialize_with = "crate::utils::json::lenient")]
     layer_values: Vec<WireLayer>,
+    dangerous: bool,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +112,7 @@ fn field(wire: WireField) -> ConfigField {
         description: wire.description,
         value_labels: wire.value_labels,
         layers,
+        dangerous: wire.dangerous,
     }
 }
 

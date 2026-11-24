@@ -59,6 +59,11 @@ from vibe.core.config._model_aliases import (
     warn_ignored_alias,
 )
 from vibe.core.config._self_hosted import speech_server, transcription_server
+from vibe.core.config._telemetry_kill_switch import (
+    disarms_kill_switch_off_only,
+    ignored_kill_switch_disarm_warning,
+    without_kill_switch_disarms,
+)
 from vibe.core.config._telemetry_off_only import (
     ignored_telemetry_opt_in_warning,
     sets_telemetry_on_off_only,
@@ -708,6 +713,9 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         cls, layers: list[tuple[str, dict[str, Any]]]
     ) -> list[tuple[str, dict[str, Any]]]:
         layers = [(name, _with_policy_default(data)) for name, data in layers]
+        # Fork feature (AGENTS.md "Fork features"): a project or agent layer
+        # may arm the kill switch, never disarm it.
+        layers = without_kill_switch_disarms(layers)
         layers = _without_vibe_bot_local_tools(
             _without_vibe_bot_ceiling(
                 with_remote_models(without_telemetry_opt_ins(layers))
@@ -853,6 +861,12 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         for name, data in layers:
             if sets_telemetry_on_off_only(name, data):
                 warning = ignored_telemetry_opt_in_warning(name)
+                logger.warning(warning)
+                self._validation_warnings.append(warning)
+            # Fork feature (AGENTS.md "Fork features"): same rule, opposite
+            # polarity, for the kill switch.
+            if disarms_kill_switch_off_only(name, data):
+                warning = ignored_kill_switch_disarm_warning(name)
                 logger.warning(warning)
                 self._validation_warnings.append(warning)
         check_strict_config_env()
@@ -1418,6 +1432,21 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
         description="Deprecated: accepted for older configs, with no effect on Unified execution.",
     )
     enable_telemetry: Annotated[bool, WithReplaceMerge()] = True
+    # Fork feature (AGENTS.md "Fork features"): the all-telemetry kill switch,
+    # off by default so installing this fork never risks a ban. DANGEROUS when
+    # enabled: disabling telemetry may violate the Terms of Service.
+    disable_all_telemetry: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description=(
+            "DANGEROUS: fully disable ALL telemetry (usage events, crash "
+            "reports, OpenTelemetry traces, experiment/A-B evals) regardless "
+            "of enable_telemetry, and delete the telemetry stored on disk. "
+            "This may violate the Terms of Service and can get your account "
+            "banned. Data already sent to Mistral's servers cannot be removed "
+            "from the client; see the README for what is irremovable and how "
+            "to block the endpoints at the firewall. Off by default."
+        ),
+    )
     system_prompt_id: Annotated[str, WithReplaceMerge()] = SystemPrompt.CLI
     # The system prompt's behavior, supplied at runtime by the GrowthBook layer.
     # When set, the Unified runtime uses it in place of the ``system_prompt_id``

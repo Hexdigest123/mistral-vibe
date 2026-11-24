@@ -89,6 +89,8 @@ config/config 1224469bf291
 
 config/config_search f017ea2887ed
 
+config/telemetry_kill_switch 808c1eb32ae3
+
 context/context_click_over_rail_window 92418a263362
 
 context/context_command d6b5fd9e6526
@@ -1001,7 +1003,7 @@ model/model_refresh 236a014c247f
 
 model/model_refresh_unconfigured 1042df34e0eb
 
-model/model_search 32c64a179d28
+model/model_search b23da88f3727
 
 model/model_search_empty a3cb3e7be066
 

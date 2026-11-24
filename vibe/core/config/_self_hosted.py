@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from vibe.core.config._defaults import PUBLIC_REGIONAL_MISTRAL_API_HOSTS
+
+# Fork feature (AGENTS.md "Fork features"): the kill switch gates everything.
+from vibe.core.config._telemetry_kill_switch import telemetry_active
 from vibe.observability.logging import logger
 
 if TYPE_CHECKING:
@@ -37,10 +40,10 @@ def _self_hosted_host(api_base: str) -> str | None:
 
 def experiments_allowed(config: VibeConfigSchema) -> bool:
     """Whether *config* lets Vibe ask GrowthBook: telemetry and the A/B opt-in
-    are on, and the deployment is not self-hosted.
+    are on, the kill switch is off, and the deployment is not self-hosted.
     """
     return (
-        config.enable_telemetry
+        telemetry_active(config)
         and config.experiments.enable
         and self_hosted_host(config) is None
     )
@@ -48,7 +51,7 @@ def experiments_allowed(config: VibeConfigSchema) -> bool:
 
 def crash_reports_allowed(config: VibeConfigSchema) -> bool:
     """Whether *config* lets Vibe send crash reports to Mistral's Sentry."""
-    return config.enable_telemetry and self_hosted_host(config) is None
+    return telemetry_active(config) and self_hosted_host(config) is None
 
 
 def log_self_hosted_services(config: VibeConfigSchema) -> None:

@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Any, Final
 
 from vibe import __version__
 from vibe.core.config._self_hosted import experiments_allowed
+
+# Fork feature (AGENTS.md "Fork features"): the kill switch gates all of it.
+from vibe.core.config._telemetry_kill_switch import telemetry_active
 from vibe.core.experiments.active import ExperimentSurface
 from vibe.core.experiments.cache import (
     clear_cached_eval_responses,
@@ -123,7 +126,8 @@ async def resolve_plan_attributes(
     if not experiments_allowed(config):
         # The `vibe` launcher reads this cache without the config, so opting out must drop it.
         clear_cached_eval_responses()
-    if not config.enable_telemetry:
+    # Fork feature (AGENTS.md "Fork features"): the kill switch wins too.
+    if not telemetry_active(config):
         return None, None
     return await _fetch_plan_attributes(
         config=config,
@@ -165,7 +169,8 @@ async def initialize_experiments(
         experiment_system_prompt_id=experiment_system_prompt_id,
         credentials=credentials,
     )
-    if not config.enable_telemetry:
+    # Fork feature (AGENTS.md "Fork features"): the kill switch wins too.
+    if not telemetry_active(config):
         return False, None
     if attributes is None:
         # Mistral provider present but key missing — tried but failed.

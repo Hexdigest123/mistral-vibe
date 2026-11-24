@@ -193,6 +193,45 @@ plugin data).
 
 Guards: `tests/test_fork_features.py`.
 
+## 6. Telemetry kill switch `disable_all_telemetry`
+
+Contract:
+- `VibeConfigSchema.disable_all_telemetry: bool = False` — off by default, so
+  installing the fork changes nothing; when `true`, every telemetry channel is
+  off regardless of `enable_telemetry`: datalake events
+  (`TelemetryClient._is_enabled`), Sentry crash reports
+  (`crash_reports_allowed`), OpenTelemetry traces (`setup_tracing`), the
+  GrowthBook eval and its identity fetches (`experiments_allowed`,
+  `experiments/session.py`), and remote-plugin sync telemetry. The gate is
+  `telemetry_active(config)` = `enable_telemetry and not kill switch`; the
+  armed check is strict (`is True`) so test doubles read as disarmed.
+- Arming it purges on-disk telemetry (`purge_local_telemetry`): the two
+  GrowthBook eval caches under `~/.vibe/` and `telemetry event=` payload lines
+  in `~/.vibe/logs/vibe.log`. Purged at app-server boot, after a successful
+  `config/write`/`config/reload` that leaves it armed. Already-sent data is
+  server-side and irremovable; the README documents it and the firewall hosts.
+- Off-only merge rule, opposite polarity to `enable_telemetry`: a
+  `project-toml` or `agent-profile` layer's `disable_all_telemetry = false` is
+  dropped in `prepare_layers` (with a validation warning); `= true` is kept.
+- The settings UI flags it: `ConfigFieldWire.dangerous` (defaulted for skew)
+  is set in `build_field_wires`, the TUI renders the row in the error color
+  and shows a ban-risk warning when it is switched on.
+
+Map: `vibe/core/config/_telemetry_kill_switch.py` (all fork-only logic),
+hooks in `vibe_schema.py` (field, `prepare_layers`, `check_layer_keys`),
+`vibe/core/telemetry/send.py`, `vibe/core/config/_self_hosted.py`,
+`vibe/core/tracing.py`, `vibe/core/experiments/session.py`,
+`vibe/core/plugins/remote.py`, `vibe/app_server/protocol.py` (`dangerous`),
+`vibe/app_server/_config_introspect.py`, `vibe/app_server/_host.py` (boot
+purge), `vibe/app_server/server.py`, `vibe/app_server/_unified_harness_backend_adapter.py`
+(write/reload purge); TUI `src/config_fields.rs`, `src/ui/config_options.rs`,
+`src/ui/config.rs`, `src/config_edit.rs`. README.md "Telemetry kill switch".
+
+Guards: `tests/core/config/test_telemetry_kill_switch.py`,
+`vibe/cli-rust/tests/units/config_dangerous.rs`, scenario
+`client-e2e/scenarios/config/telemetry_kill_switch.py`,
+`tests/test_fork_features.py`.
+
 ## Adding a fork feature
 
 Add its row to the AGENTS.md "Fork features" table, its section here

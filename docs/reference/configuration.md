@@ -89,6 +89,17 @@ The environment and the org admin config still decide above the project
 config; an agent profile's `false` wins over the environment, as any profile
 value does.
 
+The same off-only rule applies to the kill switch `disable_all_telemetry`
+(default `false`): a project config or an agent profile may set it to `true`
+(disable all telemetry for its sessions) but their `false` is dropped before
+the merge, so a cloned repository cannot re-enable telemetry. When the switch
+is on, every telemetry channel is off regardless of `enable_telemetry` (usage
+events, crash reports, OpenTelemetry traces, the GrowthBook eval), and the
+telemetry stored on disk is deleted; the setting is flagged `dangerous` in
+`config/fields/read` because disabling telemetry may violate the Terms of
+Service. See the README for the irremovable (already-sent) telemetry and
+firewall blocking.
+
 The default write target is selected from the installed layers:
 
 - `~/.vibe/config.toml` is the default write target whenever the user source is
@@ -300,7 +311,9 @@ session keeps running the higher layer's value.
 - `config/fields/read` returns each field's `origin` (the layer its value comes
   from) and `locked` (the origin is the environment or admin layer above the
   default write target). Older servers send neither; clients treat a missing
-  `locked` as writable.
+  `locked` as writable. It also returns `dangerous` for settings the UI flags
+  as dangerous (currently `disable_all_telemetry`); a missing `dangerous` reads
+  as not dangerous.
 - `config/write` keeps a shadowed write and lists it in `shadowed`
   (`{path, origin}` per top-level field), so a client can say why the value it
   wrote does not run. Only whole top-level fields are checked. The session's

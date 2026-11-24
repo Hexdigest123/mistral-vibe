@@ -76,6 +76,14 @@ def _start_crash_reporting(config: VibeConfigSchema) -> None:
         )
     except Exception:
         pass  # error reporting disabled
+    # Fork feature (AGENTS.md "Fork features"): arming the kill switch deletes
+    # the telemetry stored on disk.
+    try:
+        from vibe.core.config._telemetry_kill_switch import purge_local_telemetry
+
+        purge_local_telemetry(config)
+    except Exception:
+        pass
 
 
 def main() -> None:

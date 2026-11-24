@@ -13,6 +13,7 @@ pub(super) fn build_lines(fields: &[ConfigField], sections: bool) -> Vec<Opt> {
                 index,
                 name: truncate(&field.name, NAME_W),
                 value: truncate(&field.display_value(), VALUE_W),
+                dangerous: field.dangerous,
             })
             .collect();
     }
@@ -36,6 +37,7 @@ pub(super) fn build_lines(fields: &[ConfigField], sections: bool) -> Vec<Opt> {
                 index: rank,
                 name: truncate(&field.name, NAME_W),
                 value: truncate(&field.display_value(), VALUE_W),
+                dangerous: field.dangerous,
             });
             rank += 1;
         }

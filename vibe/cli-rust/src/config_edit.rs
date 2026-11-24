@@ -10,12 +10,17 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::app::App;
+use crate::app::{App, Severity};
 use crate::config::{self, ConfigField};
 use crate::option_list::{OptionList, SingleAction};
 use crate::search_field::Search;
+use crate::ui::notice::Notice;
 
 pub const MAX_VISIBLE_CHOICES: usize = 14;
+
+/// Fork feature (AGENTS.md "Fork features"): shown when a dangerous setting
+/// (the telemetry kill switch) is switched on.
+pub const DANGEROUS_ENABLE_WARNING: &str = "Dangerous: disable_all_telemetry turns off ALL telemetry and deletes stored telemetry; it may violate the Terms of Service and get the account banned.";
 
 pub struct ConfigEdit {
     pub field: ConfigField,
@@ -217,6 +222,15 @@ pub(crate) fn commit(app: &mut App, client: &Arc<Client>, tx: &mpsc::Sender<conf
     };
     match parse_value(&edit.draft, &edit.field.kind) {
         Ok(value) => {
+            // Fork feature (AGENTS.md "Fork features"): arming a dangerous
+            // setting warns in place; the write itself is unchanged.
+            if edit.field.dangerous && value == Value::Bool(true) {
+                app.config_screen.status = Some(Notice::new(
+                    Severity::Warning,
+                    DANGEROUS_ENABLE_WARNING,
+                    None,
+                ));
+            }
             let target = app
                 .config_screen
                 .targets

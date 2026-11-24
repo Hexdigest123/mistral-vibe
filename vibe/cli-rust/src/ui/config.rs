@@ -41,6 +41,9 @@ pub(super) enum Opt {
         index: usize,
         name: String,
         value: String,
+        /// Fork feature (AGENTS.md "Fork features"): dangerous settings (the
+        /// telemetry kill switch) render in the error color.
+        dangerous: bool,
     },
 }
 
@@ -146,11 +149,31 @@ fn draw_options(app: &mut App, f: &mut Frame, bx: u16, top: u16, w: u16, help_y:
                         .add_modifier(Modifier::DIM),
                 );
             }
-            Opt::Row { index, name, value } => {
+            Opt::Row {
+                index,
+                name,
+                value,
+                dangerous,
+            } => {
                 let (name_style, value_style) = if *index == highlighted {
                     let bar = Rect::new(opt_x, y, opt_width.saturating_sub(1), 1);
                     f.buffer_mut().set_style(bar, list_cursor::style());
-                    (list_cursor::style(), list_cursor::style())
+                    let cursor = if *dangerous {
+                        list_cursor::style().fg(theme::error())
+                    } else {
+                        list_cursor::style()
+                    };
+                    (cursor, cursor)
+                } else if *dangerous {
+                    // Fork feature (AGENTS.md "Fork features"): the kill switch
+                    // and friends stay visibly dangerous when not highlighted.
+                    (
+                        Style::default()
+                            .fg(theme::error())
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme::muted()).bg(bg),
+                    )
                 } else {
                     let name = Style::default().fg(theme::foreground()).bg(bg);
                     let value = Style::default().fg(theme::muted()).bg(bg);

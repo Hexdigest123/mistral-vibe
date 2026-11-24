@@ -105,6 +105,8 @@ mod composer_stash_hint;
 mod composer_stash_recall;
 #[path = "units/composer_yank.rs"]
 mod composer_yank;
+#[path = "units/config_dangerous.rs"]
+mod config_dangerous;
 #[path = "units/config_filter.rs"]
 mod config_filter;
 #[path = "units/config_selection.rs"]

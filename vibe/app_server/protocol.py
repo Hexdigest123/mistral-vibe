@@ -2058,6 +2058,10 @@ class ConfigFieldWire(ProtocolModel):
     # environment, the org's admin config), so a write would not take effect.
     # Defaulted so a client reading an older server sees every field writable.
     locked: bool = False
+    # Fork feature (AGENTS.md "Fork features"): the setting is dangerous (the
+    # UI flags it, e.g. the telemetry kill switch). Defaulted so a client
+    # reading an older server sees no dangerous field.
+    dangerous: bool = False
 
     @model_validator(mode="after")
     def _origin_from_layers(self) -> Self:

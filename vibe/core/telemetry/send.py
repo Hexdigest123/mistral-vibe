@@ -12,6 +12,7 @@ import httpx2
 
 from vibe import __version__
 from vibe.core.config import ProviderConfig, VibeConfigSchema
+from vibe.core.config._telemetry_kill_switch import telemetry_active
 from vibe.core.config.admin_config import AdminConfigOutcome
 from vibe.core.platform_auth import (
     PlatformCredentialFactory,
@@ -299,7 +300,8 @@ class TelemetryClient:
 
     def _is_enabled(self) -> bool:
         try:
-            return self._config_getter().enable_telemetry
+            # Fork feature (AGENTS.md "Fork features"): the kill switch wins.
+            return telemetry_active(self._config_getter())
         except Exception:
             return False
 

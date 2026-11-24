@@ -17,6 +17,9 @@ from vibe.core.config import (
     OtelSpanExporterConfig,
 )
 from vibe.core.config._defaults import PUBLIC_REGIONAL_MISTRAL_API_HOSTS
+
+# Fork feature (AGENTS.md "Fork features"): the kill switch gates all tracing.
+from vibe.core.config._telemetry_kill_switch import telemetry_active
 from vibe.utils.api_keys import resolve_api_key
 from vibe.utils.http import get_server_url_from_api_base
 from vibe.utils.oidc_marker import is_oidc_authorization
@@ -85,7 +88,8 @@ def build_otel_span_exporter_config(
 
 
 def setup_tracing(config: VibeConfigSchema) -> None:
-    if not config.enable_telemetry or not config.enable_otel:
+    # Fork feature (AGENTS.md "Fork features"): the kill switch wins over both.
+    if not telemetry_active(config) or not config.enable_otel:
         return
 
     exporter_cfg = build_otel_span_exporter_config(

@@ -865,6 +865,12 @@ from vibe.core.agents.models import (
 )
 from vibe.core.config import MCPServer, MissingAPIKeyError, VibeConfigSchema
 from vibe.core.config._setting_keys import UnusedConfigKeysError
+
+# Fork feature (AGENTS.md "Fork features"): the kill switch and its purge.
+from vibe.core.config._telemetry_kill_switch import (
+    purge_local_telemetry,
+    telemetry_kill_switch_active,
+)
 from vibe.core.config.admin_config import AdminConfigApplyResult, AdminConfigOutcome
 from vibe.core.config.builder import InvalidConfigError
 from vibe.core.config.harness_files import HarnessFilesManager
@@ -11473,6 +11479,10 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                     )
                 )
         await apply_derivation()
+        # Fork feature (AGENTS.md "Fork features"): arming the kill switch
+        # deletes the telemetry stored on disk.
+        if telemetry_kill_switch_active(orchestrator.config):
+            await asyncio.to_thread(purge_local_telemetry, orchestrator.config)
         self._telemetry.send_config_updated(
             fields=sorted({_config_write_field(op.path) for op in params.ops}),
             target_layers=sorted({op.target_layer or "default" for op in params.ops}),
@@ -11538,6 +11548,12 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         await self._converge(strict=True)
         self._follow_missing_model_catalog()
         await self._rebind_unpromoted_agent_types(was_ephemeral=was_ephemeral)
+        # Fork feature (AGENTS.md "Fork features"): a reloaded config may arm
+        # the kill switch (edited in the TOML meanwhile); purge then.
+        if telemetry_kill_switch_active(context.config_orchestrator.config):
+            await asyncio.to_thread(
+                purge_local_telemetry, context.config_orchestrator.config
+            )
         return SessionBackendResult(
             response=ConfigMutationResponse(runtime=self._runtime)
         )

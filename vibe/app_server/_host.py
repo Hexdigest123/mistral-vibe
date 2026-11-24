@@ -894,6 +894,27 @@ class HostRequestHandler:
         orchestrator = await self._load_orchestrator(self._session_files(None))
         return crash_reports_allowed(orchestrator.config)
 
+    async def purge_local_telemetry_if_armed(self) -> None:
+        """Fork feature (AGENTS.md "Fork features"): when the kill switch is
+        armed (set since the last boot), delete the telemetry Vibe stored on
+        disk. Never raises.
+        """
+        from vibe.core.config._telemetry_kill_switch import (
+            purge_local_telemetry,
+            telemetry_kill_switch_active,
+        )
+
+        try:
+            config = await self._load_config(None)
+            if telemetry_kill_switch_active(config):
+                purged = await asyncio.to_thread(purge_local_telemetry, config)
+                if purged:
+                    logger.info(
+                        "disable_all_telemetry is on: deleted locally stored telemetry"
+                    )
+        except Exception:
+            logger.debug("Telemetry purge failed", exc_info=True)
+
     async def log_self_hosted_services(self) -> None:
         """Note a self-hosted deployment in ``vibe.log``, from local and cached
         config, never fetched.

@@ -22,6 +22,7 @@ fn enum_field(value: &str) -> ConfigField {
         description: String::new(),
         value_labels: Default::default(),
         layers: vec![],
+        dangerous: false,
     }
 }
 
