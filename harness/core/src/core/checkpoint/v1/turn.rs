@@ -12,6 +12,7 @@ use crate::core::step_protocol::ToolDefinition;
 use crate::core::turn::{PendingLifecycleHook, TurnOutcome};
 use crate::core::wire::content::{ContentBlock, validate_non_empty_content};
 use crate::core::wire::message::StoredMessage;
+use crate::core::wire::user_message::OutputType;
 
 use super::context::CheckpointStoredMessage;
 use super::schema::{CheckpointCompletionCandidate, CheckpointProtocolError};
@@ -30,6 +31,7 @@ pub(super) struct CompactionRestore<'a> {
 #[serde(transparent)]
 pub(super) struct CheckpointTurnState(CheckpointTurnStateRepr);
 
+#[allow(clippy::large_enum_variant)] // A short-lived serialization form; boxing would only add indirection.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum CheckpointTurnStateRepr {
@@ -45,10 +47,25 @@ enum CheckpointTurnStateRepr {
         phase: CheckpointActivePhase,
         /// Retained for V1 compatibility; new checkpoints always write Empty.
         queued: CheckpointQueuedTurn,
+        /// Steering stored by earlier V1 captures; restore moves it into the
+        /// pending input queue. Current captures keep steering in the
+        /// checkpoint's `pending_input` and always write this field as an
+        /// empty array, so Core versions that require the field can still read
+        /// the checkpoint.
+        #[serde(default)]
         pending_steer: Vec<CheckpointStoredMessage>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_context: Vec<CheckpointStoredMessage>,
         model_input_ready: bool,
         #[serde(default, skip_serializing_if = "is_zero")]
         output_limit_retries: u32,
+        /// Absent when the Turn has none, as in checkpoints written before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_type: Option<OutputType>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        delivered_steering: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        input_reduced: bool,
     },
     Terminal {
         turn_id: String,
@@ -82,9 +99,13 @@ impl CheckpointTurnState {
                         active.iterations,
                     )?,
                     queued: CheckpointQueuedTurn::Empty,
-                    pending_steer: capture_pending_steer(&active.pending_steer)?,
+                    pending_steer: Vec::new(),
+                    pending_context: capture_pending_context(&active.pending_context)?,
                     model_input_ready: active.model_input_ready,
                     output_limit_retries: active.output_limit_retries,
+                    output_type: active.output_type.clone(),
+                    delivered_steering: active.delivered_steering,
+                    input_reduced: active.input_reduced,
                 }))
             }
             TurnState::Terminal { turn_id, outcome } => {
@@ -94,6 +115,15 @@ impl CheckpointTurnState {
                     outcome: CheckpointTurnOutcome::capture(outcome),
                 }))
             }
+        }
+    }
+
+    /// Removes steering stored by an earlier V1 capture so restore can move it
+    /// into the pending input queue.
+    pub(super) fn take_legacy_steering(&mut self) -> Vec<CheckpointStoredMessage> {
+        match &mut self.0 {
+            CheckpointTurnStateRepr::Active { pending_steer, .. } => std::mem::take(pending_steer),
+            _ => Vec::new(),
         }
     }
 
@@ -123,9 +153,13 @@ impl CheckpointTurnState {
                 iterations,
                 phase,
                 queued,
-                pending_steer,
+                pending_steer: _,
+                pending_context,
                 model_input_ready,
                 output_limit_retries,
+                output_type,
+                delivered_steering,
+                input_reduced,
             } => {
                 if !matches!(queued, CheckpointQueuedTurn::Empty) {
                     return Err("checkpoint contains pending queued requests; resume with the previous build before upgrading".to_string());
@@ -139,9 +173,12 @@ impl CheckpointTurnState {
                     turn_id,
                     iterations,
                     phase,
-                    pending_steer: restore_pending_steer(pending_steer)?,
+                    pending_context: restore_pending_context(pending_context)?,
                     model_input_ready,
                     output_limit_retries,
+                    output_type,
+                    delivered_steering,
+                    input_reduced,
                 }))
             }
             CheckpointTurnStateRepr::Terminal { turn_id, outcome } => {
@@ -401,21 +438,23 @@ impl CheckpointActivePhase {
     }
 }
 
-fn capture_pending_steer(
+fn capture_pending_context(
     messages: &[StoredMessage],
 ) -> Result<Vec<CheckpointStoredMessage>, String> {
     messages
         .iter()
-        .map(|message| CheckpointStoredMessage::capture_visible_user(message, "pending steering"))
+        .map(|message| {
+            CheckpointStoredMessage::capture_injected_context(message, "pending context")
+        })
         .collect()
 }
 
-fn restore_pending_steer(
+fn restore_pending_context(
     messages: Vec<CheckpointStoredMessage>,
 ) -> Result<Vec<StoredMessage>, String> {
     messages
         .into_iter()
-        .map(|message| message.restore_visible_user("pending steering"))
+        .map(|message| message.restore_injected_context("pending context"))
         .collect()
 }
 
@@ -629,6 +668,10 @@ fn validate_identity(id: &str, label: &str) -> Result<(), String> {
         return Err(format!("{label} must not be empty"));
     }
     Ok(())
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 fn is_zero(value: &u32) -> bool {

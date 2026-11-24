@@ -1,4 +1,5 @@
 //! A run stopped before its session opens ends at once, without the stop grace.
+#![allow(clippy::disallowed_methods)] // Tests drive tasks directly; replay acks never run here.
 
 use std::io::BufRead;
 use std::sync::Arc;
@@ -32,7 +33,9 @@ fn options() -> HeadlessOptions {
         output_dir: None,
         system_prompt: None,
         model: None,
+        thinking: None,
         agent: None,
+        approval_policy: None,
         auto_approve: false,
         enabled_tools: Vec::new(),
         disabled_tools: Vec::new(),

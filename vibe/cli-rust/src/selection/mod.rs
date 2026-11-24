@@ -6,17 +6,20 @@ mod composer;
 mod flow;
 pub mod fold;
 mod gesture;
+mod preview;
 pub mod region;
+mod row_ranges;
+mod snap;
 mod table;
 
 pub use bottom_bar::BottomBarSelection;
 pub use composer::{blur_composer, in_input, offset_at};
 pub use fold::{Fold, Folds};
-pub use gesture::{ClickChain, Granularity};
+pub use gesture::{chained, ClickChain, Granularity};
+pub use preview::copy as copy_preview;
 pub use region::{Region, RegionId, RowSpan, ScrollTarget};
+pub use row_ranges::RowChrome;
 pub use table::{TableCellHit, TableCellKey, TableCellSelection, TableCellSpan};
-
-use std::time::Instant;
 
 use crate::app::{App, Selection, Surface};
 
@@ -35,25 +38,13 @@ pub fn press(app: &mut App, at: (u16, u16)) {
     press_with_padding(app, at, RegionId::Main, false, true);
 }
 
-/// Start a gesture in the toast the pointer is over, which owns it until
-/// release. A press routed by a rectangle the newest frame no longer paints
-/// starts nothing.
-pub fn press_toast(app: &mut App, at: (u16, u16)) {
-    let Some(id) = crate::ui::toast::claim_region(app, at) else {
-        app.selection.region = None;
-        cancel_drag(app);
-        return;
-    };
-    press_with_padding(app, at, RegionId::Toast(id), false, false);
-}
-
 /// Start a region gesture even when `at` is on its bare centering padding.
 pub fn press_including_padding(app: &mut App, at: (u16, u16)) {
     press_with_padding(app, at, RegionId::Main, true, true);
 }
 
 /// Start a gesture in a region that paints all its own text (the question box,
-/// the loading row), so the copy comes from the frame like a toast's.
+/// the loading row), so the copy comes from the painted frame.
 pub fn press_owned(app: &mut App, at: (u16, u16), owner: RegionId) {
     press_with_padding(app, at, owner, false, false);
 }
@@ -68,7 +59,7 @@ fn press_with_padding(
     app.selection.bottom_bar = None;
     app.selection.press = Some(at);
     app.selection.dragged = false;
-    app.selection.granularity = app.selection.chain.press(at, Instant::now());
+    app.selection.granularity = app.selection.chain.press(at, crate::clock::now());
     if include_composer {
         if let Some(offset) = offset_at(app, at) {
             app.selection.drag = Some(Surface::Composer);
@@ -128,8 +119,15 @@ pub fn drag(app: &mut App, at: (u16, u16)) {
             } else {
                 Some(i32::from(at.1))
             };
+            let output = region::get(app, owner).scroll_area;
             let edge_scroll = match scroll_target {
                 ScrollTarget::None => 0,
+                // Past the output's top or bottom edge, it scrolls a row at a time.
+                ScrollTarget::Output => match i32::from(at.1) {
+                    row if row < i32::from(output.y) => -1,
+                    row if row >= i32::from(output.bottom()) => 1,
+                    _ => 0,
+                },
                 _ => edge_row.map_or(0, |row| {
                     app.view.selection_scrollbar.selection_edge_scroll(row)
                 }),
@@ -252,6 +250,7 @@ pub fn auto_scroll(app: &mut App) -> bool {
             -(i32::from(scroll) - i32::from(old_scroll))
         }
         ScrollTarget::Trust => crate::trust_folders::scroll_by(app, i16::from(edge_scroll)),
+        ScrollTarget::Output => crate::rail::scroll_by(app, i32::from(edge_scroll)),
     };
     if delta == 0 {
         stop_auto_scroll(app);
@@ -304,7 +303,28 @@ pub fn honor_pending_copy(app: &mut App) {
         selection.text = text.clone();
         selection.pending_copy = false;
     }
-    crate::ui::notice::copy_if_autocopy(app, &text);
+    crate::ui::selection::autocopy(app, &text);
+}
+
+/// Move `owner`'s document selection by `rows`, when rows above it went away; one left with nothing selected clears.
+pub fn shift(app: &mut App, owner: RegionId, rows: i32) {
+    let left = region::get(app, owner).scroll_area.x;
+    let Some(selection) = app.selection.region.as_mut() else {
+        return;
+    };
+    if selection.owner != owner || selection.scroll_target == ScrollTarget::None || rows == 0 {
+        return;
+    }
+    selection.anchor.1 += rows;
+    selection.head.1 += rows;
+    if selection.anchor.1.max(selection.head.1) < 0 {
+        return clear_region(app, owner);
+    }
+    for point in [&mut selection.anchor, &mut selection.head] {
+        if point.1 < 0 {
+            *point = (left, 0);
+        }
+    }
 }
 
 /// Clear a selection when its rendered region disappears or changes content.

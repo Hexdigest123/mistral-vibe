@@ -9,8 +9,8 @@ pub const ENABLE: &str = "\x1b[?1016h";
 pub const DISABLE: &str = "\x1b[?1016l";
 /// Back to cell reports mid-session: dropping 1016 alone falls back to X10, which stops at cell 223.
 pub const CELLS: &str = "\x1b[?1016l\x1b[?1006h";
-/// DECRQM 1016, the cell size in report pixels (`CSI 16 t`), then DA1, which every terminal answers.
-pub const QUERY: &[u8] = b"\x1b[?1016$p\x1b[16t\x1b[c";
+/// DECRQM 1016 and the cell size in report pixels (`CSI 16 t`); the startup probe sends them.
+pub const QUERY: &[u8] = b"\x1b[?1016$p\x1b[16t";
 
 /// The probed cell size, packed `width << 16 | height`; 0 when pixel reports are unsupported.
 static CELL: AtomicU32 = AtomicU32::new(0);
@@ -96,37 +96,19 @@ impl Grid {
     }
 }
 
-/// Ask the terminal whether it reports SGR-pixels mouse positions, and in which pixels.
-pub fn probe() {
-    #[cfg(unix)]
-    {
-        if Grid::current().is_none() || crate::tty_query::in_multiplexer() {
-            return;
-        }
-        if let Some((width, height)) =
-            crate::tty_query::open().and_then(|mut tty| probe_tty(&mut tty))
-        {
-            CELL.store(
-                u32::from(width) << 16 | u32::from(height),
-                Ordering::Relaxed,
-            );
-        }
+/// Keep the cell size a startup probe response reports, when the terminal recognizes mode 1016.
+pub fn record(response: &[u8]) {
+    if let Some((width, height)) = reported_cell(response) {
+        CELL.store(
+            u32::from(width) << 16 | u32::from(height),
+            Ordering::Relaxed,
+        );
     }
 }
 
 /// The cell size in report pixels when the terminal recognizes mode 1016.
-#[cfg(unix)]
-pub fn probe_tty(tty: &mut std::fs::File) -> Option<(u16, u16)> {
-    let response = crate::tty_query::query(tty, QUERY, is_answered)?;
-    supports(&response).then(|| cell_size(&response)).flatten()
-}
-
-/// The DA1 reply (`CSI ? … c`) arrived: the replies before it came first.
-pub fn is_answered(response: &[u8]) -> bool {
-    response
-        .rsplit(|byte| *byte == 0x1b)
-        .next()
-        .is_some_and(|last| last.starts_with(b"[?") && last.ends_with(b"c"))
+pub fn reported_cell(response: &[u8]) -> Option<(u16, u16)> {
+    supports(response).then(|| cell_size(response)).flatten()
 }
 
 /// DECRPM recognizes mode 1016 (set or reset).
@@ -240,6 +222,11 @@ pub fn grid() -> Option<Grid> {
     Grid::unpack(GRID.load(Ordering::Relaxed))
 }
 
+/// Whether a pointer row from `to_cells` lies in the window padding past the last row, which cells clamp onto the footer.
+pub fn past_last_row(row: f64) -> bool {
+    grid().is_some_and(|grid| row >= f64::from(grid.rows))
+}
+
 /// The cell event for a terminal mouse event, and its pointer row in fractional cells.
 pub fn to_cells(event: MouseEvent) -> (MouseEvent, f64) {
     if VALID.load(Ordering::Relaxed) == 0 {
@@ -291,7 +278,9 @@ pub fn cells(grid: Option<Grid>, event: MouseEvent) -> (MouseEvent, f64) {
     let (cell_width, cell_height) = grid.cell();
     let column = pixel(event.column) / cell_width;
     let row = pixel(event.row) / cell_height;
-    let cell = |value: f64, count: u16| (value as u16).min(count.saturating_sub(1));
+    // A move past the grid left the window: it lands one cell beyond, on nothing. Gestures clamp to the edge.
+    let outside = u16::from(event.kind == MouseEventKind::Moved);
+    let cell = |value: f64, count: u16| (value as u16).min((count + outside).saturating_sub(1));
     let cells = MouseEvent {
         column: cell(column, grid.columns),
         row: cell(row, grid.rows),
@@ -312,7 +301,8 @@ impl Coalesce {
         };
         let (cell, row) = cells(grid, *mouse);
         let drag = matches!(mouse.kind, MouseEventKind::Drag(_));
-        let row = if drag { (row * 8.0) as u16 } else { cell.row };
+        // Unclamped, so a move into the padding below the last row is not dropped as the footer's cell.
+        let row = if drag { (row * 8.0) as u16 } else { row as u16 };
         let key = (mouse.kind, cell.column, row, mouse.modifiers);
         if (drag || mouse.kind == MouseEventKind::Moved) && self.0 == Some(key) {
             return false;

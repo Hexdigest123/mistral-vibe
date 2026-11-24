@@ -84,7 +84,7 @@ pub async fn onboarding_round(run: EventLoop, provider: Option<String>) -> Resul
     // SIGKILL is all the cleanup it needs.
     run.client.close_stdin().await;
     if let Some(child) = run.child.take() {
-        tokio::spawn(async move {
+        crate::work::spawn_daemon(async move {
             match child.wait_with_grace().await {
                 Some(status) => {
                     tracing::debug!(status = %status, "app-server reaped before onboarding")
@@ -96,14 +96,9 @@ pub async fn onboarding_round(run: EventLoop, provider: Option<String>) -> Resul
     let (client, child, notifications, crash_rx) = match Client::spawn(run.launch.clone()).await {
         Ok(spawned) => spawned,
         Err(error) => {
-            // The Sentry bridge only carries ERROR records, so the startup
-            // window's own failure sites log their own fatal errors.
-            tracing::error!(
-                vibe_boundary = "startup",
-                fatal = true,
-                "respawn app-server: {error:#}"
-            );
-            return Err(error.context("respawn app-server"));
+            let error = error.context("respawn app-server");
+            crate::startup::failure::log_spawn(&error);
+            return Err(error);
         }
     };
     let client = Arc::new(client);
@@ -230,7 +225,7 @@ pub fn retry_handshake(
 ) {
     let (trust_tx, trust_rx) = mpsc::channel::<String>(1);
     run.app.trust.tx = Some(trust_tx);
-    tokio::spawn(crate::startup::handshake(
+    crate::work::spawn_daemon(crate::startup::handshake(
         run.client.clone(),
         run.ready_tx.clone(),
         trust_rx,
@@ -239,6 +234,7 @@ pub fn retry_handshake(
             show_unready_config: run.show_unready_config,
             resume: run.app.session.startup_resume.clone(),
             agent_config: run.app.session.agent_config.clone(),
+            start_model: run.app.session.start_model.clone(),
             notifications,
             pre_initialized: server_version,
             trust_already_resolved,

@@ -2,7 +2,8 @@
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -43,17 +44,33 @@ fn text_color() -> ratatui::style::Color {
 }
 
 pub(super) fn draw(app: &mut App, wizard: &mut OnboardingState, f: &mut Frame, area: Rect) {
-    // The fixed stack (title, list, gaps) needs 14 rows; below that nothing
-    // is drawn rather than written past the buffer bottom.
-    if area.height < 14 {
-        return;
-    }
     // Paint-time hit targets are rebuilt every frame.
     wizard.theme_rows.clear();
     let opts = crate::theme_picker::options();
     let total = opts.len();
     let selected = wizard.theme_index.min(total - 1);
     let half = 3;
+    let list_h = (half * 2 + 3) as u16;
+    // The fixed stack (title, list, gaps, preview) needs 14 rows; below that
+    // the preview and gaps drop out so the title and list still show in 11
+    // rows, and below that a wrapped notice keeps the screen from going blank.
+    if area.height < 14 {
+        if area.height >= 2 + list_h {
+            let top = area.y + area.height.saturating_sub(2 + list_h) / 2;
+            draw_title(f, area, top);
+            draw_list(
+                app,
+                wizard,
+                f,
+                Rect::new(area.x, top + 2, area.width, list_h),
+                selected,
+                &opts,
+            );
+        } else {
+            super::draw_too_small(f, area);
+        }
+        return;
+    }
     let preview = preview_pane(area.width, area.height.saturating_sub(17).max(7));
     // The preview may not push the stack past the screen: the fixed rows
     // (title, list, gaps) need 14, and a rect outside the buffer panics.
@@ -65,27 +82,45 @@ pub(super) fn draw(app: &mut App, wizard: &mut OnboardingState, f: &mut Frame, a
         Constraint::Length(top),
         Constraint::Length(1),
         Constraint::Length(2),
-        Constraint::Length((half * 2 + 3) as u16),
+        Constraint::Length(list_h),
         Constraint::Length(2),
         Constraint::Length(preview_h),
     ])
     .split(area);
+    draw_title(f, area, chunks[1].y);
+    draw_list(app, wizard, f, chunks[3], selected, &opts);
+    draw_preview(app, wizard, f, chunks[5], preview);
+}
+
+/// The screen's title, centered on `y`.
+fn draw_title(f: &mut Frame, area: Rect, y: u16) {
     let title = "Select your preferred theme";
     f.buffer_mut().set_string(
         area.x + area.width.saturating_sub(title.len() as u16) / 2,
-        chunks[1].y,
+        y,
         title,
         Style::default().fg(theme::foreground()),
     );
-    let list_area = chunks[3];
+}
+
+/// The theme list: the selected theme's bordered row, its faded neighbors,
+/// the inline key hints, and the wheel/click region.
+fn draw_list(
+    app: &mut App,
+    wizard: &mut OnboardingState,
+    f: &mut Frame,
+    list_area: Rect,
+    selected: usize,
+    opts: &[&str],
+) {
+    let half = 3;
     let list_w = 30u16;
     let list_x = list_area.x + (list_area.width.saturating_sub(list_w)) / 2;
     let selected_y = list_area.y + half as u16;
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::popup_border())),
+            .border_style(theme::border_style()),
         Rect::new(list_x, selected_y, list_w, 3),
     );
     let centered = format!(
@@ -105,14 +140,13 @@ pub(super) fn draw(app: &mut App, wizard: &mut OnboardingState, f: &mut Frame, a
         selected,
     ));
     draw_navigation_hints(f, list_x, list_w, selected_y + 1);
-    draw_neighboring_themes(app, wizard, f, list_area, list_x, list_w, selected, &opts);
+    draw_neighboring_themes(app, wizard, f, list_area, list_x, list_w, selected, opts);
     // The whole list wheel-navigates and click-selects through one region.
     crate::mouse::register_region(
         app,
         Rect::new(list_x, list_area.y, list_w, list_area.height),
         crate::mouse::MouseTarget::OnboardingThemeList,
     );
-    draw_preview(app, wizard, f, chunks[5], preview);
 }
 
 /// Whether the pointer currently sits inside `rect` (hover highlight).
@@ -125,8 +159,10 @@ fn hovered_row(app: &App, rect: Rect) -> bool {
 fn draw_navigation_hints(f: &mut Frame, list_x: u16, list_w: u16, y: u16) {
     let left = [hints::NAVIGATE];
     let x = list_x.saturating_sub(hints::width(&left) + 2);
-    hint_line::draw_clipped(f, x, y, list_x.saturating_sub(x), &left);
-    hint_line::draw(f, list_x + list_w + 2, y, &[hints::SELECT]);
+    hint_line::draw(f, Rect::new(x, y, list_x.saturating_sub(x), 1), &left);
+    let right = list_x + list_w + 2;
+    let width = f.area().right().saturating_sub(right);
+    hint_line::draw(f, Rect::new(right, y, width, 1), &[hints::SELECT]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -184,7 +220,7 @@ fn fade_style(distance: usize) -> Style {
 /// (content height, clipped by the pane's maximum height), and the content
 /// width (the container scrollbar, when the pane clips, narrows the widget
 /// by two columns).
-type Preview = (u16, u16, Vec<ratatui::text::Line<'static>>);
+type Preview = (u16, u16, Vec<Line<'static>>);
 
 fn preview_pane(area_width: u16, max_height: u16) -> Preview {
     let width = 70u16.min(area_width);
@@ -221,9 +257,11 @@ fn draw_preview(
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::popup_border()))
-            .title(" Preview ")
+            .border_style(theme::border_style())
+            .title(Line::styled(
+                " Preview ",
+                theme::text(theme::popup_border()),
+            ))
             .title_alignment(Alignment::Center),
         Rect::new(x, area.y, width, pane_h),
     );

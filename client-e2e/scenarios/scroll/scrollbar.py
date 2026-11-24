@@ -1,12 +1,10 @@
 from __future__ import annotations
 
+from e2e.app_server.config import COLUMNS
 from e2e.app_server.events import assistant_msg, turn_completed, turn_started, user_msg
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _SHIFT_UP = "\x1b[1;2A"
-
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
-settle_per_key = True
 
 
 def _tall_reply(tag: str, lines: int) -> str:
@@ -28,11 +26,16 @@ def _turn(prompt: str, reply: str) -> Timeline:
 timeline: Timeline = [
     *_turn("hi", _tall_reply("a", 24)),
     {"release": 5},
+    take_snapshot(),
     *_turn("more", _tall_reply("b", 24)),
     {"release": 5},
+    take_snapshot(),
     _SHIFT_UP * 1,
+    take_snapshot(),
 ]
 
 # The input-only frames are intentionally busy; compare the settled turn
 # frames and the final manual scroll instead.
-capture_steps = {1, 3, 4}
+
+# The final thumb spans rows 21-30: a lower block, full blocks, then a native upper eighth (the harness pins Ghostty).
+screen_rows = {21: "▇".rjust(COLUMNS), 30: "  b21".ljust(COLUMNS - 1) + "🮄"}

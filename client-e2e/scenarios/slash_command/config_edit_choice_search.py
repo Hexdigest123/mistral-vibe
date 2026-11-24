@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 
 def _model(alias: str, display_name: str) -> dict[str, Any]:
@@ -26,6 +26,5 @@ handshake = {
     "runtime/read": {"runtime": {"config": {"models": models}}},
 }
 
-capture_startup = False
-timeline: Timeline = ["/config\r", "\r", "/", "gpt mini", "\x1b", "\r"]
+timeline: Timeline = ["/config\r", "\r", "/", "gpt mini", take_snapshot(), "\x1b", "\r", take_snapshot()]
 screen_excludes = ("Search choices",)

@@ -4,10 +4,15 @@ mod answers;
 mod other;
 
 pub use answers::{apply_event, cancel, dismiss, select, submit_other, toggle_focused, Event};
-pub use other::{handle_other_key, other_caret_at, paste_other, OtherField};
+pub use other::{
+    discard_other_edit, edit_other, handle_other_key, holds_answer, other_caret_at, other_editing,
+    other_locked, other_typing, paste_other, OtherField,
+};
 
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::UiInstant;
 
 use crate::server::{CallbackAddress, UserQuestion, UserQuestionRequest};
 use serde_json::Value;
@@ -24,11 +29,10 @@ pub const MAX_PENDING_QUESTIONS: usize = 64;
 const DEFAULT_TYPING_DEBOUNCE_MS: u64 = 1000;
 const TYPING_DEBOUNCE_ENV_VAR: &str = "VIBE_TYPING_GRACE_PERIOD_MS";
 
-/// Who answers the open question: a server callback or a local question.
+/// Who answers the open question: a server callback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QuestionSource {
     Callback(CallbackAddress),
-    TeleportPush,
 }
 
 /// Whether a `user_input` callback question is open or waiting to open.
@@ -72,7 +76,7 @@ fn typing_debounce() -> Duration {
 }
 
 /// When the next question may open, or `None` when none is waiting.
-pub fn typing_pause_deadline(app: &App) -> Option<Instant> {
+pub fn typing_pause_deadline(app: &App) -> Option<UiInstant> {
     let last = app.chat_input.last_keystroke?;
     waiting(app).then(|| last + typing_debounce())
 }
@@ -80,7 +84,7 @@ pub fn typing_pause_deadline(app: &App) -> Option<Instant> {
 /// Take the input box with the oldest delivered question once the user has paused.
 pub fn show_pending(app: &mut App) {
     if app.question_app.open
-        || typing_pause_deadline(app).is_some_and(|deadline| Instant::now() < deadline)
+        || typing_pause_deadline(app).is_some_and(|deadline| crate::clock::now() < deadline)
     {
         return;
     }
@@ -99,8 +103,9 @@ pub fn show_pending(app: &mut App) {
     state.other_texts.clear();
     state.other_cursor = 0;
     state.other_scroll = 0;
+    state.other_unlocked = false;
     state.other_field = None;
-    state.mount_time = Some(Instant::now());
+    state.mount_time = Some(crate::clock::now());
     crate::terminal_notifier::action_required(app);
 }
 
@@ -177,7 +182,7 @@ pub fn is_submit_selected(app: &App) -> bool {
 pub fn is_within_grace_period(app: &App) -> bool {
     app.question_app
         .mount_time
-        .is_some_and(|at| at.elapsed() < input_grace_period())
+        .is_some_and(|at| crate::clock::since(at) < input_grace_period())
 }
 
 /// `INPUT_GRACE_PERIOD`, overridable so replayed keys can answer at once.
@@ -201,6 +206,7 @@ pub fn other_text(app: &App, question_idx: usize) -> &str {
 pub fn set_selected_option(app: &mut App, option_idx: usize) {
     app.question_app.list.highlight(option_idx);
     app.question_app.other_cursor = other_text(app, app.question_app.current_question_idx).len();
+    app.question_app.other_unlocked = false;
 }
 
 /// Move by keyboard and reattach the viewport to the selected option.
@@ -221,6 +227,7 @@ fn step(app: &mut App, down: bool) {
     let total = total_options(app);
     app.question_app.list.step(down, total, true, |_| true);
     app.question_app.other_cursor = other_text(app, app.question_app.current_question_idx).len();
+    app.question_app.other_unlocked = false;
 }
 
 pub fn next_question(app: &mut App) {
@@ -258,15 +265,21 @@ fn restore_cursor(app: &App, question_idx: usize) -> usize {
             .and_then(|selections| selections.iter().min().copied())
             .unwrap_or(0);
     }
-    let Some((answer_text, is_other)) = app.question_app.answers.get(&question_idx) else {
-        return 0;
-    };
+    answered_option(app, question_idx).unwrap_or(0)
+}
+
+/// The option a single-select question was last answered with, the free-text row for a typed answer.
+pub fn answered_option(app: &App, question_idx: usize) -> Option<usize> {
+    let question = &app.question_app.questions[question_idx];
+    if question.multi_select {
+        return None;
+    }
+    let (answer_text, is_other) = app.question_app.answers.get(&question_idx)?;
     if *is_other {
-        return question.options.len();
+        return Some(question.options.len());
     }
     question
         .options
         .iter()
         .position(|option| &option.label == answer_text)
-        .unwrap_or(0)
 }

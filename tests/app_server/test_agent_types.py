@@ -12,6 +12,8 @@ from vibe.app_server._agent_types import (
     AgentToolCatalogue,
     AgentTypeRejection,
     AgentTypeSource,
+    _route_authority,
+    agent_file_issues,
     resolve_agent_types,
     workspace_agent_rejections,
     workspace_agent_types,
@@ -84,6 +86,28 @@ def _write_agent(project_root: Path, name: str, body: str) -> Path:
     path = agents / f"{name}.toml"
     path.write_text(body, encoding="utf-8")
     return path
+
+
+def test_completion_pricing_does_not_change_agent_authority_digest() -> None:
+    """*Prepare*: One completion route with and without budget pricing.
+    *Do*: Project both into declared-agent authority.
+    *Assert*: Invocation-local accounting metadata changes no authority.
+    """
+    from dataclasses import replace
+
+    from mistralai_vibe_local_harness.vibe import CompletionPricing, LocalModelRoute
+    from mistralai_vibe_local_harness.vibe.plugins import DeclaredCompletionRoute
+
+    route = DeclaredCompletionRoute(model=LocalModelRoute(model="reviewer"))
+    priced = replace(
+        route,
+        model=replace(
+            route.model,
+            pricing=CompletionPricing(input_per_million=1.5, output_per_million=7.5),
+        ),
+    )
+
+    assert _route_authority(priced) == _route_authority(route)
 
 
 def test_a_project_subagent_is_advertised_and_bound(
@@ -657,3 +681,25 @@ def test_an_agent_file_that_does_not_load_is_reported_with_the_failing_field(
     assert rejection.name == "reviewer"
     assert rejection.file == str(path)
     assert rejection.reason.startswith(reason)
+
+
+def test_an_agent_setting_an_agent_may_not_set_is_a_coded_issue(
+    tmp_path: Path, manager_for: ManagerFor
+) -> None:
+    """*Prepare*: A project agent that grants itself an allowlist.
+    *Do*: Project the workspace's agent file issues.
+    *Assert*: One machine-readable issue names the agent, the key and the file.
+    """
+    path = _write_agent(
+        tmp_path, "loose", '[tools.bash]\npermission = "ask"\nallowlist = ["rm -rf"]\n'
+    )
+
+    (issue,) = agent_file_issues(manager_for(tmp_path))
+
+    assert issue.code == "agent.setting_ignored"
+    assert issue.file == str(path)
+    assert "'loose'" in issue.message
+    assert "'tools.bash.allowlist'" in issue.message
+    assert issue.model_dump(mode="json", by_alias=True)["code"] == (
+        "agent.setting_ignored"
+    )

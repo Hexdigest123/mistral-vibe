@@ -2,7 +2,7 @@
 
 Conventions for AI agents and humans contributing to **Mistral Vibe** — a CLI coding assistant: a Rust terminal UI over a Python 3.12+ app server managed with `uv`.
 
-Layout: Unified Harness Core and Runtime are external dependencies that execute and persist sessions; `vibe/app_server` hosts sessions and exposes product features and RPCs to every client, including Vibe Desktop; `vibe/core` retains shared config, tool, permission and other utilities; `vibe/cli-rust` is the terminal UI (Rust, Ratatui), a thin client over `vibe-app-server`; `vibe/cli` holds the `vibe` launcher that execs it and the audio helpers `vibe/acp` uses; `vibe/acp` bridges to the Agent Client Protocol; `vibe/setup` holds auth and onboarding config shared by the app server and `vibe-acp`. Tests live in `tests/` with autouse fixtures in `conftest.py` and test doubles in `tests/stubs/`.
+Layout: Unified Harness Core and Runtime are external dependencies that execute and persist sessions; `vibe/app_server` hosts sessions and exposes product features and RPCs to every client, including Vibe Desktop; `vibe/core` retains shared config, tool, permission and other utilities; `vibe/cli-rust` is the terminal UI (Rust, Ratatui), a thin client over `vibe-app-server`; `vibe/cli` holds the `vibe` launcher that execs it and the audio helpers the app server's `voice/*` capability uses; `vibe/acp` bridges to the Agent Client Protocol; `vibe/setup` holds auth and onboarding config shared by the app server and `vibe-acp`. Tests live in `tests/` with autouse fixtures in `conftest.py` and test doubles in `tests/stubs/`.
 
 ## Fork features (never drop)
 
@@ -30,12 +30,12 @@ This checkout is the `Hexdigest123/mistral-vibe` fork. The features below exist 
 
 ## Architecture Decisions
 
-Before architecture-affecting changes, read [0002 Ownership Boundaries](docs/adr/0002-core-engine-and-delivery-surfaces.md) and the matching ADR below. For new agent capabilities, also read [0018](docs/adr/0018-modular-app-server-capabilities.md), including its Runtime/Core scope rule. Flag conflicts with ADR direction before implementing. When writing ADRs, follow the `write-vibe-adr` skill.
+Before architecture-affecting changes, read [0002 Ownership Boundaries](docs/adr/0002-core-engine-and-delivery-surfaces.md) and the matching ADR below. For new agent capabilities, also read [0018](docs/adr/0018-modular-app-server-capabilities.md), including its Runtime/Core scope rule. "Runtime/Core" there means the Unified Harness, not `vibe/core`: extend a `vibe/core` utility that owns a shared format, per [0001](docs/adr/0001-architecture-principles.md). Flag conflicts with ADR direction before implementing. When writing ADRs, follow the `write-vibe-adr` skill.
 
 | Change area | ADR |
 | --- | --- |
-| Architecture principles, module boundaries, startup/runtime speed, simple changes | [0001 Architecture Principles](docs/adr/0001-architecture-principles.md) |
-| Core/Runtime/app-server ownership, session hosting, adapters, or delivery clients | [0002 Ownership Boundaries](docs/adr/0002-core-engine-and-delivery-surfaces.md) |
+| Architecture principles, module boundaries, startup/runtime speed, simple changes, or a new route, event, listener, lock, on-disk format or helper | [0001 Architecture Principles](docs/adr/0001-architecture-principles.md) |
+| Core/Runtime/app-server ownership, session hosting, adapters, delivery clients, or a client deciding from shared state | [0002 Ownership Boundaries](docs/adr/0002-core-engine-and-delivery-surfaces.md) |
 | Tool contracts, permissions, tool output, UI metadata, or tool adapters | [0004 Typed Permissioned Tools](docs/adr/0004-typed-permissioned-tools.md) |
 | Config models, layering, defaults, migrations, reloads, or runtime overrides | [0005 Layered Configuration](docs/adr/0005-layered-configuration.md) |
 | Session logging, resume, rewind, transcript metadata, or migrations | [0006 Local Sessions](docs/adr/0006-local-sessions.md) |
@@ -50,6 +50,8 @@ Before architecture-affecting changes, read [0002 Ownership Boundaries](docs/adr
 | Narration playback, TTS, audio output device following, or the `AudioPlayer`/`DeviceFollower`/`NarrationController` classes | [0017 Narration Playback in the ACP Subprocess](docs/adr/0017-narration-playback-in-subprocess.md) |
 | Adding agent behavior, custom tools, built-in plugins/skills, RPC families, or feature-module dependencies | [0018 Modular App-Server Capabilities](docs/adr/0018-modular-app-server-capabilities.md) |
 | Adding state shared by every channel or session of the process, a remote value refreshed for all sessions, or an app-server entry point | [0019 Process Services](docs/adr/0019-process-services.md) |
+| Calling the runtime from the app server, adding a direct runtime call or a `vibe.*` extension item, the Session API path switch, the target runtime opt-in or a Session's saved runtime, or moving work between the app server and the runtime | [0020 Runtime Access Through the Session API](docs/adr/0020-runtime-access-through-the-session-api.md) |
+| Registry skill resolution, the machine's skill store, its sync, leases or cleanup, or the sandbox copy of registry skills | [0021 Registry Skills Resolution and Store](docs/adr/0021-registry-skills-resolution-and-store.md) |
 
 Superseded records: [0003](docs/adr/0003-event-driven-agent-loop.md) → 0009; [0011](docs/adr/0011-unified-harness-backend.md) → 0002. Their paths remain for existing links.
 
@@ -88,6 +90,6 @@ Never stop processes by name or pattern (`pkill`, `killall`, `pgrep | xargs kill
 ## Autoimprovement
 
 - When a change request can be generalized as a rule, prefer adding it to the relevant `.agents/skills/` SKILL.md rather than appending to AGENTS.md. AGENTS.md should stay small and universal; domain-specific conventions belong in skills so they load only when needed. Create a new skill when no existing one fits.
-- Suggest updates to the README.md file according to feature changes or additions.
+- Keep `README.md` a short landing page: install, getting started, highlights and links. Document feature details on docs.mistral.ai (`mistralai/platform-docs`) or in `docs/`, never in the README.
 - Keep the builtin Vibe Skill (`vibe/plugins/builtins/vibe/skills/vibe/SKILL.md`) up-to-date. It documents the CLI's features, such as args, flags, config options and persistence, commands, built-in agents, file discovery logic.
 - When adding or changing Vibe config fields, check whether Settings Manager's Vibe Code managed-config UI and Le Chat Web's backend allowlist/schema must be updated. If no update is needed, say so explicitly in the change notes.

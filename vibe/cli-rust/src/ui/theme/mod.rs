@@ -3,21 +3,26 @@
 use ratatui::style::{Color, Modifier, Style};
 
 pub mod color_system;
+mod context;
 pub mod fixed;
 mod markdown;
+pub mod oklab;
+pub mod palette;
 mod registry;
 pub(crate) mod syntax;
 
+pub use context::{context_buffer, context_palette, context_track};
 pub use fixed::{LOADING_GRADIENT, ORANGE};
 pub use markdown::{
     code_plain, md_accent, md_code_inline, md_fence_border, md_heading, md_keyline, md_link,
     md_table_header, md_widget_code_inline, md_widget_fence_bg, md_widget_marker,
     md_widget_quote_bar,
 };
+pub use palette::channels;
 
 pub use registry::{
-    active, active_index, ansi_background, resolve, selection_fg, set_active_index,
-    toast_background, ALL, AUTO_NAME,
+    active, active_index, ansi_background, chip_background, resolve, selection_fg, selection_fg_of,
+    set_active_index, ALL, AUTO_NAME,
 };
 
 /// Seed the detected `auto` palette, then activate the configured name.
@@ -65,6 +70,14 @@ pub fn dim(color: Color) -> Style {
 pub fn muted_style() -> Style {
     dim(muted())
 }
+/// Composer placeholder text, fainter than muted labels.
+pub fn placeholder_style() -> Style {
+    match (is_ansi(), is_dark()) {
+        (true, true) => text(Color::DarkGray),
+        (true, false) => text(Color::Gray),
+        (false, _) => text(blend(background(), auto_contrast(), 0.35)),
+    }
+}
 /// Link cells under the mouse.
 pub fn link_hover_style() -> Style {
     let style = if is_ansi() {
@@ -93,6 +106,10 @@ pub fn muted() -> Color {
 pub fn popup_border() -> Color {
     active().popup_border
 }
+/// Border lines in `popup_border`, SGR-dimmed on ANSI themes to match the truecolor blend.
+pub fn border_style() -> Style {
+    dim(popup_border())
+}
 /// Text-selection highlight background (`$screen-selection-background`).
 pub fn selection_bg() -> Color {
     active().selection_bg
@@ -102,7 +119,7 @@ pub fn selection_bg() -> Color {
 pub fn warning() -> Color {
     active().warning
 }
-/// $success — a safe agent's input border, completed effects, added diff lines.
+/// $success — a safe agent's mode label, completed effects, added diff lines.
 pub fn success() -> Color {
     active().success
 }
@@ -111,6 +128,13 @@ pub fn status_ready() -> Color {
 }
 pub fn error() -> Color {
     active().error
+}
+/// A merged PR/MR: GitHub's purple, magenta on ANSI themes.
+pub fn merged() -> Color {
+    if is_ansi() {
+        return Color::Magenta;
+    }
+    fixed::MERGED
 }
 
 // Completed-effect row: dim $primary verb and muted grey message.
@@ -189,12 +213,25 @@ pub fn is_ansi() -> bool {
     active().background == Color::Reset
 }
 
-/// Scrollbar thumb ($scrollbar) and track ($scrollbar-background).
+/// A footer gauge's fill and the track it fills: white on bright black on ANSI themes, else the text on a faint tint.
+pub fn gauge_fill() -> Color {
+    match (is_ansi(), is_dark()) {
+        (true, true) => Color::White,
+        (true, false) => Color::Black,
+        (false, _) => foreground(),
+    }
+}
+pub fn gauge_track() -> Color {
+    match (is_ansi(), is_dark()) {
+        (true, true) => Color::DarkGray,
+        (true, false) => Color::Gray,
+        (false, _) => blend(background(), auto_contrast(), 0.22),
+    }
+}
+
+/// Scrollbar thumb ($scrollbar).
 pub fn scrollbar() -> Color {
     active().scrollbar
-}
-pub fn scrollbar_bg() -> Color {
-    active().scrollbar_bg
 }
 
 // Blends computed at render time rather than stored in the theme table.

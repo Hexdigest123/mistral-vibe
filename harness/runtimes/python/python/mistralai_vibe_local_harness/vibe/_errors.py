@@ -121,7 +121,9 @@ class HarnessConfigurationRejectedError(HarnessSessionError):
 class HarnessForkEntryRequiredError(HarnessSessionError):
     def __init__(self) -> None:
         super().__init__(
-            "fork_entry_required", "entry_id is required to fork a running session"
+            "fork_entry_required",
+            "Cannot find where the active Turn starts: fork at an entry_id or "
+            "once the Turn finishes",
         )
 
 
@@ -241,6 +243,13 @@ class HarnessCallbackNotFoundError(HarnessSessionError):
         )
 
 
+class HarnessCallbackRejectedError(HarnessSessionError):
+    def __init__(self, callback_id: str, message: str) -> None:
+        super().__init__(
+            "callback_rejected", message, details={"callback_id": callback_id}
+        )
+
+
 class HarnessCallbackConflictError(HarnessSessionError):
     def __init__(self, callback_id: str) -> None:
         super().__init__(
@@ -293,6 +302,7 @@ __all__ = [
     "HarnessCallbackClosedError",
     "HarnessCallbackConflictError",
     "HarnessCallbackNotFoundError",
+    "HarnessCallbackRejectedError",
     "HarnessChildSessionRequiresParentError",
     "HarnessCommandConflictError",
     "HarnessContextCompactionError",

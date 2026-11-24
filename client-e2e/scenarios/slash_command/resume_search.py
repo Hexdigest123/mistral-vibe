@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 
 def _session(index: int, title: str, preview: str) -> dict[str, object]:
@@ -32,16 +32,17 @@ handshake = {
         "previousCursor": None,
     }
 }
-capture_startup = False
 # `d` and `j` type into the field; a title term, then a verbatim preview term.
 timeline: Timeline = [
     "/resume\r",
     "/",
     "disc cache",
+    take_snapshot(),
     "\x1b",
     "\x1b",
     "/",
     "flaky",
+    take_snapshot(),
     "\x1b",
     "\x1b",
 ]

@@ -25,7 +25,10 @@ from vibe.core.git.errors import (
 from vibe.core.git.fetch import UnsafeGitFetchError, fetch_remote
 from vibe.core.git.remote import GitHubRemoteInfo, find_github_remote, find_remote_url
 from vibe.core.trusted_folders import TrustedFoldersManager, trusted_folders_manager
-from vibe.utils.platform import configure_git_python_executable
+from vibe.utils.platform import (
+    configure_git_python_executable,
+    git_python_import_environment,
+)
 
 _GIT_USAGE_ERROR_STATUS = 129
 _DEFAULT_REMOTE = "origin"
@@ -121,8 +124,9 @@ def _git_python() -> _GitPython:
             "GIT_PYTHON_GIT_EXECUTABLE to an absolute path."
         )
     try:
-        from git import Git, InvalidGitRepositoryError, Repo, refresh
-        from git.exc import GitCommandError, GitCommandNotFound, NoSuchPathError
+        with git_python_import_environment(executable):
+            from git import Git, InvalidGitRepositoryError, Repo, refresh
+            from git.exc import GitCommandError, GitCommandNotFound, NoSuchPathError
     except ImportError as e:
         raise GitUnavailableError("Git operations require git to be installed.") from e
     try:
@@ -446,7 +450,7 @@ class GitRepo:  # noqa: PLR0904 - every git operation goes through here
             repo_url=find_remote_url(self._repo),
         )
 
-    def _has_uncommitted_changes(self) -> bool:
+    def has_uncommitted_changes(self) -> bool:
         """Whether tracked or untracked work exists outside the current HEAD."""
         options = untrusted_status_options(
             self._repo, self.trust_store, trust_root=self._trust_root
@@ -463,9 +467,10 @@ class GitRepo:  # noqa: PLR0904 - every git operation goes through here
         return find_github_remote(self._repo)
 
     def has_commits(self) -> bool:
-        """Whether HEAD resolves to a commit."""
+        # Refs only: peeling HEAD to its commit opens the packs, which takes
+        # seconds in a partial clone with thousands of them.
         try:
-            self._repo.git.rev_parse("--quiet", "--verify", "HEAD^{commit}")
+            self._repo.git.rev_parse("--quiet", "--verify", "HEAD")
         except self._gitpy.git_command_error as e:
             # An unborn HEAD names no commit; other failures are git's own.
             if e.status == 1:
@@ -679,6 +684,20 @@ class GitRepo:  # noqa: PLR0904 - every git operation goes through here
         prefix = "refs/remotes/"
         return ref[len(prefix) :] if ref.startswith(prefix) else None
 
+    def remote_branch_ref(
+        self, branch: str, remote: str = _DEFAULT_REMOTE
+    ) -> str | None:
+        """``<remote>/<branch>``, fetched fresh when the remote answers.
+
+        A failed fetch falls back to the tip last fetched, as the default
+        branch does, so a branch the clone already knew is still continued.
+        None when the clone has no such ref: the branch is a new one.
+        """
+        with suppress(GitError):
+            self.fetch_branch(remote, branch)
+        ref = f"{remote}/{branch}"
+        return ref if self._has_ref(f"refs/remotes/{ref}") else None
+
     def fetch_branch(self, remote: str, branch: str) -> None:
         # Use an explicit destination refspec so callers see the fetched tip
         # without trusting the repository's remote.<name>.fetch configuration.
@@ -740,7 +759,17 @@ class GitRepo:  # noqa: PLR0904 - every git operation goes through here
         try:
             git = self._sanitized_git()
             if branch_created:
-                create = ["add", "--no-checkout", "-b", branch, str(target)]
+                # --no-track: tracking a remote start point writes the shared
+                # .git/config, and git fails rather than waits on its lock, so
+                # two sessions creating worktrees at once would fail one.
+                create = [
+                    "add",
+                    "--no-checkout",
+                    "--no-track",
+                    "-b",
+                    branch,
+                    str(target),
+                ]
                 # Omitted rather than defaulted, because git's own default is
                 # the invoking checkout's HEAD and that is the right answer for
                 # a repository with no remote to start from.

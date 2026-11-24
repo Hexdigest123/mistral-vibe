@@ -1,16 +1,22 @@
 //! Transcript reducer: raw JSON and its typed render projection, kept in sync by id.
 
+mod folds;
+mod goal_notice;
 pub(crate) mod grouping;
+mod hook_anchor;
 pub(crate) mod local;
 mod older;
 pub(crate) mod patch;
 mod scheduled_loop;
 mod settle;
+mod shown;
 mod subagent;
+mod turn_details;
+mod unanswered;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::server::HistoryEntry;
+use crate::server::{is_discarded_draft, HistoryEntry};
 use serde_json::Value;
 
 use grouping::is_hidden_hook_notice;
@@ -18,14 +24,17 @@ pub use grouping::{effect_kind, groups_with_tools, Group};
 pub use older::HistoryCursor;
 use patch::appended_text;
 pub use patch::apply_json_patch;
-pub use scheduled_loop::FiredLoop;
+pub use scheduled_loop::{split_prompt as split_loop_prompt, FiredLoop};
+pub use turn_details::{TurnDetails, KEY_PREFIX as TURN_DETAILS_PREFIX};
 
 #[derive(Default)]
 pub struct Transcript {
     entries: Vec<StoredEntry>,
     indices: HashMap<String, usize>,
-    /// Entries kept in store but not rendered: retry-continuation sources.
+    /// Entries kept in store but not rendered: attached subagent notifications.
     hidden: HashSet<String>,
+    /// Server rows a successful `/retry` replaced; a live snapshot keeps them hidden.
+    dismissed: HashSet<String>,
     next_rev: u64,
     pub last_event_id: u64,
     /// Whether reasoning entries are shown (`show_thinking_nodes` config).
@@ -38,11 +47,15 @@ pub struct Transcript {
     highest_image_label: usize,
     /// Where paging resumes when older server history is not loaded yet.
     history_before_cursor: Option<HistoryCursor>,
+    /// Whether a running `wait` hides behind the waiting status line. Only the
+    /// main transcript has that line; a subagent's view keeps its `wait` row.
+    hides_live_waits: bool,
 }
 
 pub struct Snapshot {
     entries: Vec<Value>,
     hidden: HashSet<String>,
+    dismissed: HashSet<String>,
     last_event_id: u64,
     history_before_cursor: Option<HistoryCursor>,
 }
@@ -85,6 +98,8 @@ pub struct TranscriptEntry<'a> {
     pub follows_user: bool,
     /// The next user prompt is visually packed against this prompt.
     pub followed_by_user: bool,
+    /// A message the user steered into the running turn.
+    pub steer: bool,
     /// Opens the queued run, so it paints the `» Queued` header above itself.
     pub queue_header: bool,
     /// What's-new body mounted below history.
@@ -98,11 +113,24 @@ pub struct TranscriptEntry<'a> {
     pub entry: &'a HistoryEntry,
 }
 
+/// What every member of one tool group shares, computed once per group.
+struct GroupSpan<'a> {
+    end: usize,
+    visible: Vec<(usize, &'a StoredEntry)>,
+    /// The live trailing group still spins.
+    open: bool,
+    reasoning: bool,
+    /// A reasoning row is still streaming.
+    thinking: bool,
+    hooks: usize,
+}
+
 impl Transcript {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             entries: self.entries.iter().map(|entry| entry.raw.clone()).collect(),
             hidden: self.hidden.clone(),
+            dismissed: self.dismissed.clone(),
             last_event_id: self.last_event_id,
             history_before_cursor: self.history_before_cursor.clone(),
         }
@@ -112,6 +140,7 @@ impl Transcript {
         self.entries.clear();
         self.indices.clear();
         self.hidden = snapshot.hidden;
+        self.dismissed = snapshot.dismissed;
         self.next_rev += 1;
         self.last_event_id = snapshot.last_event_id;
         self.history_before_cursor = snapshot.history_before_cursor;
@@ -124,6 +153,7 @@ impl Transcript {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.indices.clear();
+        self.dismissed.clear();
         self.next_rev += 1;
         self.live_tail_open = false;
         self.history_before_cursor = None;
@@ -135,16 +165,15 @@ impl Transcript {
         self.live_tail_open = false;
     }
 
-    /// Most recent non-empty assistant text, for `/copy`. Skips hidden entries
-    /// (an active retry continuation's source row would otherwise be copied
-    /// instead of the merged answer it feeds).
+    /// Most recent non-empty assistant text, for `/copy`, skipping hidden entries
+    /// and drafts a hook sent back or rejected.
     pub fn last_assistant_message(&self) -> Option<String> {
         self.entries
             .iter()
             .enumerate()
             .rev()
             .find_map(|(index, stored)| {
-                if self.is_hidden(index) {
+                if self.is_hidden(index) || is_discarded_draft(&stored.raw) {
                     return None;
                 }
                 let HistoryEntry::Message(message) = &stored.typed else {
@@ -197,6 +226,7 @@ impl Transcript {
         self.entries.clear();
         self.indices.clear();
         self.hidden.clear();
+        self.dismissed.clear();
         self.next_rev += 1;
         self.live_tail_open = false;
         self.last_event_id = state.event_id;
@@ -341,14 +371,16 @@ impl Transcript {
         }
         // The queued run is pinned to the bottom, so content arriving for the
         // running turn slots in above it; a bottom-pinned banner stays below even
-        // the queue. A pre-tool hook notice slots in ahead of its paired tool entry.
-        let at = grouping::pre_tool_anchor(&stored.typed)
-            .and_then(|anchor| self.indices.get(&anchor).copied())
+        // the queue. A tool and its pre-tool hook notices slot in next to each other.
+        let at = hook_anchor::above_its_tool(&stored.typed, &self.entries)
+            .or_else(|| hook_anchor::below_its_hook_lines(&stored.typed, &self.entries))
             .unwrap_or_else(|| match (stored.pinned_bottom, stored.pending) {
                 (true, _) => self.entries.len(),
                 (false, true) => self.first_pinned(),
                 (false, false) => self.first_pending().min(self.first_pinned()),
             });
+        // A goal notice tied to a turn sits with that turn's output.
+        let at = goal_notice::anchor(&self.entries[..at], &stored.typed, &stored.raw).unwrap_or(at);
         if let Some(notification) = subagent::notification(&stored.typed) {
             let previous = [
                 subagent::EffectMatch::ChildSession,
@@ -435,13 +467,33 @@ impl Transcript {
         self.next_rev += 1;
     }
 
-    /// Keep an entry in store but out of the render (retry-continuation source).
-    pub fn hide(&mut self, id: &str) {
-        self.hidden.insert(id.to_owned());
+    /// Hide a row for good: a client row is dropped, a server row stays stored but hidden.
+    pub fn dismiss(&mut self, id: &str) {
+        let Some(&index) = self.indices.get(id) else {
+            return;
+        };
+        if self.entries[index].local {
+            self.remove(id);
+            return;
+        }
+        self.dismissed.insert(id.to_owned());
         self.next_rev += 1;
     }
 
-    /// The raw `content` array of an entry; the retry merge freezes it as its base.
+    /// The `turn_id` rows the server settled as output the model never kept.
+    pub fn discarded_ids(&self, turn_id: &str) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|stored| {
+                stored.raw["turnId"].as_str() == Some(turn_id)
+                    && stored.raw.pointer("/outcome/type").and_then(Value::as_str)
+                        == Some("discarded")
+            })
+            .map(|stored| stored.id.clone())
+            .collect()
+    }
+
+    /// The raw `content` array of an entry.
     pub fn entry_content(&self, id: &str) -> Option<Value> {
         let index = *self.indices.get(id)?;
         Some(self.entries[index].raw.get("content")?.clone())
@@ -453,50 +505,6 @@ impl Transcript {
         Some(&self.entries[index].raw)
     }
 
-    /// Merge the hidden retried entry into the interrupted assistant row:
-    /// recompute the row as its frozen base with the continuation's text spliced
-    /// into the last text block, with no separator, and the continuation's
-    /// status applied.
-    pub fn merge_continuation(&mut self, dst: &str, src: &str, base: &Value) {
-        let (Some(&src_index), Some(&dst_index)) = (self.indices.get(src), self.indices.get(dst))
-        else {
-            return;
-        };
-        // The continuation's text blocks joined, like `PublicMessageEntry.text`.
-        let appended = match &self.entries[src_index].typed {
-            HistoryEntry::Message(message) => message.text("\n\n"),
-            _ => String::new(),
-        };
-        let status = self.entries[src_index].raw.get("generationStatus").cloned();
-        let mut content = base.clone();
-        if !content.is_array() {
-            content = Value::Array(Vec::new());
-        }
-        if let Some(blocks) = content.as_array_mut() {
-            let last_text = blocks
-                .iter_mut()
-                .rev()
-                .find(|block| block["type"] == "text");
-            match last_text {
-                // Append straight into the existing text: no separator.
-                Some(block) => {
-                    let merged =
-                        format!("{}{appended}", block["text"].as_str().unwrap_or_default());
-                    block["text"] = Value::String(merged);
-                }
-                None => blocks.push(serde_json::json!({"type": "text", "text": appended})),
-            }
-        }
-        let stored = &mut self.entries[dst_index];
-        stored.raw["content"] = content;
-        if let Some(status) = status {
-            stored.raw["generationStatus"] = status;
-        }
-        stored.typed = HistoryEntry::from_value(&stored.raw);
-        self.next_rev += 1;
-        stored.rev = self.next_rev;
-    }
-
     fn bump_event(&mut self, params: &Value) {
         if let Some(id) = params["eventId"].as_u64() {
             self.last_event_id = id;
@@ -505,12 +513,16 @@ impl Transcript {
 
     /// Shown entries in order, minus hidden hook notices and hidden reasoning.
     pub fn lines_from(&self, start: usize) -> impl Iterator<Item = TranscriptEntry<'_>> + '_ {
+        let mut span = None;
         self.entries
             .iter()
             .enumerate()
             .skip(start)
             .filter(|(index, _)| !self.is_hidden(*index))
-            .map(|(index, stored)| self.borrow(index, stored))
+            .map(move |(index, stored)| {
+                let group = self.group_at(index, stored, &mut span);
+                self.borrow(index, stored, group)
+            })
     }
 
     fn is_hidden(&self, index: usize) -> bool {
@@ -518,22 +530,35 @@ impl Transcript {
         if is_hidden_hook_notice(&stored.typed, &self.entries[..index]) {
             return true;
         }
-        if self.hidden.contains(&stored.id) || scheduled_loop::is_fired(&stored.typed) {
+        if self.hidden.contains(&stored.id)
+            || self.dismissed.contains(&stored.id)
+            || scheduled_loop::is_fired(&stored.typed)
+        {
+            return true;
+        }
+        // A running wait paints nothing: the waiting status line says it.
+        if self.is_live_wait(stored) {
             return true;
         }
         !self.show_reasoning && matches!(stored.typed, HistoryEntry::Reasoning(_))
     }
 
-    fn borrow<'a>(&'a self, index: usize, stored: &'a StoredEntry) -> TranscriptEntry<'a> {
+    fn borrow<'a>(
+        &'a self,
+        index: usize,
+        stored: &'a StoredEntry,
+        group: Option<Group<'a>>,
+    ) -> TranscriptEntry<'a> {
         TranscriptEntry {
             index,
             id: &stored.id,
             rev: stored.rev,
             local: stored.local,
-            group: self.group_at(index, stored),
+            group,
             pending: stored.pending,
             follows_user: stored.follows_user,
             followed_by_user: stored.followed_by_user,
+            steer: crate::server::is_steer(&stored.raw),
             queue_header: stored.pending && !self.previous_is_pending(index),
             after_history: stored.after_history,
             stream_delta: stored.stream_delta.as_deref(),
@@ -565,10 +590,52 @@ impl Transcript {
     }
 
     /// The visible part of the consecutive effect/reasoning group, or `None` for a single member.
-    fn group_at<'a>(&'a self, index: usize, stored: &'a StoredEntry) -> Option<Group<'a>> {
+    /// `span` carries the group's shared facts from one member to the next.
+    fn group_at<'a>(
+        &'a self,
+        index: usize,
+        stored: &'a StoredEntry,
+        span: &mut Option<GroupSpan<'a>>,
+    ) -> Option<Group<'a>> {
         if !groups_with_tools(&stored.typed) || (stored.local && !stored.historical) {
             return None;
         }
+        if span.as_ref().is_none_or(|span| index >= span.end) {
+            *span = Some(self.group_span(index));
+        }
+        let span = span.as_ref()?;
+        if span.visible.len() < 2 {
+            return None;
+        }
+        let (first_index, first_entry) = span.visible.first()?;
+        let first = index == *first_index;
+        let finalized = stored.local || stored.historical || !span.open;
+        let (running, kinds) = if first {
+            let effects = span
+                .visible
+                .iter()
+                .filter_map(|(_, entry)| match &entry.typed {
+                    HistoryEntry::Effect(effect) => Some(effect.as_ref()),
+                    _ => None,
+                });
+            grouping::count_kinds(effects, !finalized)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Some(Group {
+            key: format!("{}{}", grouping::KEY_PREFIX, first_entry.id),
+            first,
+            last: index == span.visible.last()?.0,
+            finalized,
+            kinds,
+            running,
+            reasoning: span.reasoning,
+            thinking: !finalized && span.thinking,
+            hooks: span.hooks,
+        })
+    }
+
+    fn group_span(&self, index: usize) -> GroupSpan<'_> {
         let start = self.entries[..index]
             .iter()
             .enumerate()
@@ -589,35 +656,31 @@ impl Transcript {
             })
             .map(|(offset, entry)| (start + offset, entry))
             .collect::<Vec<_>>();
-        if visible.len() < 2 {
-            return None;
-        }
-        let (first_index, first_entry) = visible.first()?;
-        let last_index = visible.last()?.0;
-        let first = index == *first_index;
-        let effects = visible.iter().filter_map(|(_, entry)| match &entry.typed {
-            HistoryEntry::Effect(effect) => Some(effect.as_ref()),
-            _ => None,
-        });
-        let kinds = if first {
-            grouping::count_kinds(effects)
-        } else {
-            Vec::new()
-        };
-        let reasoning = visible
+        // A group whose only calls still running are hidden waits reads as done:
+        // the waiting status line says the rest.
+        let mut live = self.entries[start..end]
             .iter()
-            .any(|(_, entry)| matches!(entry.typed, HistoryEntry::Reasoning(_)));
-        Some(Group {
-            key: format!("{}{}", grouping::KEY_PREFIX, first_entry.id),
-            first,
-            last: index == last_index,
-            finalized: stored.local
-                || stored.historical
-                || end < self.entries.len()
-                || !self.live_tail_open,
-            kinds,
-            reasoning,
-        })
+            .filter(|stored| {
+                matches!(&stored.typed, HistoryEntry::Effect(effect)
+                    if !stored.local && !effect.is_terminal())
+            })
+            .peekable();
+        let only_waits = live.peek().is_some() && live.all(|stored| self.is_live_wait(stored));
+        GroupSpan {
+            end,
+            open: end == self.entries.len() && self.live_tail_open && !only_waits,
+            reasoning: visible
+                .iter()
+                .any(|(_, entry)| matches!(entry.typed, HistoryEntry::Reasoning(_))),
+            thinking: visible.iter().any(|(_, entry)| {
+                matches!(entry.typed, HistoryEntry::Reasoning(_)) && entry.typed.in_progress()
+            }),
+            hooks: visible
+                .iter()
+                .filter(|(_, entry)| matches!(entry.typed, HistoryEntry::Notice(_)))
+                .count(),
+            visible,
+        }
     }
 
     /// Borrow renderable entries in order without rebuilding their typed values.
@@ -643,6 +706,14 @@ impl Transcript {
         self.next_rev
     }
 
+    /// The main transcript: a running `wait` hides behind the waiting status line.
+    pub fn main() -> Self {
+        Self {
+            hides_live_waits: true,
+            ..Self::default()
+        }
+    }
+
     pub fn set_show_reasoning(&mut self, show: bool) {
         if self.show_reasoning != show {
             self.show_reasoning = show;
@@ -658,7 +729,7 @@ impl Transcript {
     /// Borrow one entry by its stable position in the append-only transcript.
     pub fn entry(&self, index: usize) -> Option<TranscriptEntry<'_>> {
         let stored = self.entries.get(index)?;
-        Some(self.borrow(index, stored))
+        Some(self.borrow(index, stored, self.group_at(index, stored, &mut None)))
     }
 
     /// Whether any entry would render (cheaper than building `lines`). A
@@ -685,8 +756,11 @@ impl Transcript {
             .is_some_and(|&index| self.entries[index].pending)
     }
 
-    /// Whether the entry `id` toggles on click: a tool row or a reasoning trace.
+    /// Whether the entry `id` toggles on click: a tool row, reasoning trace, loop prompt or `Worked for` group.
     pub fn is_expandable(&self, id: &str) -> bool {
+        if let Some(prompt) = id.strip_prefix(turn_details::KEY_PREFIX) {
+            return self.contains(prompt);
+        }
         if let Some(entry_id) = id.strip_prefix(grouping::KEY_PREFIX) {
             return self
                 .indices
@@ -711,6 +785,7 @@ impl Transcript {
                                 .is_some_and(|output| !output.is_empty()))
                 }
                 HistoryEntry::Reasoning(_) => true,
+                HistoryEntry::Message(_) => stored.fired_loop.is_some(),
                 _ => false,
             },
             _ => false,
@@ -773,6 +848,74 @@ impl Transcript {
                 && stored.id != skip
                 && matches!(&stored.typed, HistoryEntry::Effect(effect) if !effect.is_terminal())
         })
+    }
+
+    /// The `statusText` of the latest call of `turn_id` still running, for a
+    /// loader adopted mid-turn. A call an earlier turn left unsettled never counts.
+    pub fn live_status_text<'a>(&'a self, turn_id: &str) -> Option<&'a str> {
+        self.turn_entries(turn_id)
+            .find_map(|stored| match &stored.typed {
+                HistoryEntry::Effect(effect) if !effect.is_terminal() => {
+                    Some(effect.status_text()).filter(|text| !text.is_empty())
+                }
+                _ => None,
+            })
+    }
+
+    /// The server entries of `turn_id`, newest first. The walk stops at the
+    /// first entry of another turn, so its cost follows the turn, not the
+    /// session: the loader asks on every frame.
+    fn turn_entries<'a, 'b>(
+        &'a self,
+        turn_id: &'b str,
+    ) -> impl Iterator<Item = &'a StoredEntry> + use<'a, 'b> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|stored| !stored.local)
+            .take_while(move |stored| {
+                stored.raw["turnId"]
+                    .as_str()
+                    .is_none_or(|turn| turn == turn_id)
+            })
+            .filter(move |stored| stored.raw["turnId"].as_str() == Some(turn_id))
+    }
+
+    /// A standalone `wait` of the latest turn that has not settled. One an
+    /// earlier turn left unsettled is not live: it paints like any other call.
+    fn is_live_wait(&self, stored: &StoredEntry) -> bool {
+        let HistoryEntry::Effect(effect) = &stored.typed else {
+            return false;
+        };
+        self.hides_live_waits
+            && !stored.local
+            && effect.is_model_wait()
+            && !effect.is_terminal()
+            && stored.raw["turnId"].as_str() == self.latest_turn_id()
+    }
+
+    /// The turn of the latest server entry that belongs to a turn. Entries
+    /// outside any turn, like hook notices, carry a null `turnId`.
+    fn latest_turn_id(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|stored| !stored.local)
+            .find_map(|stored| stored.raw["turnId"].as_str())
+    }
+
+    /// Whether the agent only runs a standalone `wait` for its background work:
+    /// some call of `turn_id` still runs, and every one is such a wait. A call
+    /// an earlier turn left unsettled never counts.
+    pub fn only_model_waiting(&self, turn_id: &str) -> bool {
+        let mut live = self
+            .turn_entries(turn_id)
+            .filter_map(|stored| match &stored.typed {
+                HistoryEntry::Effect(effect) if !effect.is_terminal() => Some(effect),
+                _ => None,
+            })
+            .peekable();
+        live.peek().is_some() && live.all(|effect| effect.is_model_wait())
     }
 }
 

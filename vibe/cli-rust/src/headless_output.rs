@@ -7,7 +7,8 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use crate::cli::OutputFormat;
-use crate::server::HistoryEntry;
+use crate::run_export::RunWarning;
+use crate::server::{is_discarded_draft, HistoryEntry};
 use crate::transcript::apply_json_patch;
 
 const MAX_TRACKED_ENTRIES: usize = 512;
@@ -78,10 +79,15 @@ impl Output {
         write_line(&line)
     }
 
-    /// Emit the final output and return the turn's answer. Returns the I/O
-    /// error instead of panicking so the caller can still run session/stop
-    /// cleanup on a closed pipe.
-    pub fn finalize(&self, history: Value, turn_id: Option<&str>) -> io::Result<Option<String>> {
+    /// Emit the final output and return the turn's answer: `answer` when the
+    /// server sent one, else the history's. Returns the I/O error instead of
+    /// panicking so the caller can still run session/stop cleanup on a closed pipe.
+    pub fn finalize(
+        &self,
+        history: Value,
+        turn_id: Option<&str>,
+        answer: Option<&str>,
+    ) -> io::Result<Option<String>> {
         match self.format {
             OutputFormat::Streaming => Ok(None),
             OutputFormat::Json if history.is_array() => {
@@ -90,7 +96,10 @@ impl Output {
             }
             OutputFormat::Json => Ok(None),
             OutputFormat::Text | OutputFormat::Silent => {
-                let text = last_assistant_text(&turn_entries(&history, turn_id));
+                let text = match answer {
+                    Some(answer) => Some(answer.to_owned()).filter(|answer| !answer.is_empty()),
+                    None => last_assistant_text(&turn_entries(&history, turn_id)),
+                };
                 if let (OutputFormat::Text, Some(text)) = (&self.format, &text) {
                     write_line(text)?;
                 }
@@ -122,17 +131,38 @@ pub fn turn_entries(history: &Value, turn_id: Option<&str>) -> Value {
     )
 }
 
+/// The warning for a tool call the run denied, or None for any other entry.
+pub fn denied_tool_warning(entry: &Value) -> Option<RunWarning> {
+    let state = &entry["state"];
+    if entry["type"] != "effect" || state["error"]["code"] != "tool_denied" {
+        return None;
+    }
+    let tool = entry["detail"]["toolName"]
+        .as_str()
+        .or_else(|| entry["title"].as_str())?;
+    let message = state["error"]["message"].as_str();
+    let reason = match state["approvalSource"].as_str() {
+        // The approval prompt a headless run cannot show, answered "deny".
+        Some("user") if message == Some("Tool execution denied by approval callback") => {
+            "needs approval, which a headless run cannot give"
+        }
+        _ => message.unwrap_or("denied"),
+    };
+    Some(RunWarning {
+        message: format!("Tool call denied: {tool} ({reason})"),
+        source: Some(tool.to_owned()),
+    })
+}
+
 /// Last assistant text from a history array: all text blocks joined with
 /// `\n\n`, like the server's `PublicMessageEntry.text` property.
 pub fn last_assistant_text(history: &Value) -> Option<String> {
     history.as_array()?.iter().rev().find_map(|entry| {
-        // A draft a post_agent hook rejected: shown while it streamed, never the answer.
-        let retried =
-            entry["outcome"]["type"] == "discarded" && entry["outcome"]["cause"] == "retry";
+        let discarded = is_discarded_draft(entry);
         let HistoryEntry::Message(message) = HistoryEntry::from_value(entry) else {
             return None;
         };
         let text = message.text("\n\n");
-        (message.role == "assistant" && !retried && !text.is_empty()).then_some(text)
+        (message.role == "assistant" && !discarded && !text.trim().is_empty()).then_some(text)
     })
 }

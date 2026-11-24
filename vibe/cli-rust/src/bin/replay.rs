@@ -10,10 +10,14 @@ use std::thread;
 
 use serde_json::{json, Map, Value};
 
+#[path = "replay/jitter.rs"]
+mod jitter;
+
 const TURN_ENQUEUE: &str = "session/turn/enqueue";
 const TURN_START: &str = "turn/start";
 const TURN_QUEUE_REPLACE: &str = "session/turn/queue/replace";
 const AGENT_UPDATE: &str = "session/agent/update";
+const APPROVAL_POLICY_UPDATE: &str = "session/approvalPolicy/update";
 const SHELL_COMMAND: &str = "session/shellCommand";
 const SESSION_RESUME: &str = "session/resume";
 const SESSION_START: &str = "session/start";
@@ -39,6 +43,11 @@ enum Emit {
 /// Tells the client a request's response and every event it released are written.
 fn drained_frame(request_id: &Value) -> Value {
     json!({"jsonrpc": "2.0", "method": "replay/drained", "params": {"requestId": request_id}})
+}
+
+/// A harness fence: the client acks it once the gated event before it has settled.
+fn fence_frame() -> Value {
+    json!({"jsonrpc": "2.0", "method": "replay/fence", "params": {}})
 }
 
 /// Methods answered with another method's canned result: resume reuses start, continue the saved session.
@@ -70,6 +79,14 @@ fn canned(entry: &mut Value) -> Option<Value> {
         return Some(answers[0].clone());
     }
     Some(entry.clone())
+}
+
+/// A request's events: a list on every call, or `{"calls": [[...], ...]}` one batch per call, repeating the last.
+fn per_call_events(entry: &mut Value) -> Option<Vec<Value>> {
+    match entry.get_mut("calls") {
+        Some(calls) => canned(calls).and_then(|batch| batch.as_array().cloned()),
+        None => entry.as_array().cloned(),
+    }
 }
 
 /// Check if the handshake declares an error response for a method, per session first.
@@ -154,24 +171,33 @@ fn resume_response(handshake: &Map<String, Value>, params: Option<&Value>) -> Op
     }
 }
 
-/// Answer an agent switch from the stored runtime: the requested agent becomes
-/// the active one, and `adopt_runtime` keeps it for later reads, so a scenario
-/// can cycle through every agent like the real server.
-fn agent_update_response(handshake: &Map<String, Value>, params: Option<&Value>) -> Option<Value> {
-    let name = params?.get("agentName")?.as_str()?;
+/// Answer an agent or approval policy switch from the stored runtime: the
+/// requested entry of `list` becomes `active`, and `adopt_runtime` keeps it for
+/// later reads, so a scenario can cycle through every entry like the real server.
+fn switch_response(
+    handshake: &Map<String, Value>,
+    name: Option<&Value>,
+    list: &str,
+    active: &str,
+) -> Option<Value> {
+    let name = name?.as_str()?;
     let mut runtime = handshake.get("runtime/read")?.get("runtime")?.clone();
-    let agent = runtime
-        .get("agents")?
+    let entry = runtime
+        .get(list)?
         .as_array()?
         .iter()
-        .find(|agent| agent.get("name").and_then(Value::as_str) == Some(name))?
+        .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))?
         .clone();
-    runtime["activeAgent"] = agent;
+    runtime[active] = entry;
     Some(json!({ "runtime": runtime }))
 }
 
-/// Rewrite the first user message entry's id to the turn's client id.
-fn stamp_user_message_id(batch: &mut [Value], client_message_id: &str) {
+/// Rewrite the first user message entry's id to the turn's client id, remembering the rename.
+fn stamp_user_message_id(
+    batch: &mut [Value],
+    client_message_id: &str,
+    renamed: &mut HashMap<String, String>,
+) {
     for event in batch.iter_mut() {
         if event.get("method").and_then(Value::as_str) != Some("history/entryAdded") {
             continue;
@@ -182,22 +208,41 @@ fn stamp_user_message_id(batch: &mut [Value], client_message_id: &str) {
         let is_user = entry.get("type").and_then(Value::as_str) == Some("message")
             && entry.get("role").and_then(Value::as_str) == Some("user");
         if is_user {
+            if let Some(scripted) = entry.get("id").and_then(Value::as_str) {
+                renamed.insert(scripted.to_owned(), client_message_id.to_owned());
+            }
             entry["id"] = json!(client_message_id);
             return;
         }
     }
 }
 
-/// Bind `$operationId` placeholders (shell entry ids, teleport events) to the request's id.
+/// Give snapshot history the client ids the live user messages were renamed to.
+fn stamp_snapshot_ids(batch: &mut [Value], renamed: &HashMap<String, String>) {
+    for event in batch.iter_mut() {
+        let Some(history) = event
+            .pointer_mut("/params/state/history")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for entry in history.iter_mut() {
+            let client_id = entry["id"].as_str().and_then(|id| renamed.get(id));
+            if let Some(client_id) = client_id {
+                entry["id"] = json!(client_id);
+            }
+        }
+    }
+}
+
+/// Bind `$operationId` shell entry id placeholders to the request's id.
 fn stamp_operation_id(events: &mut [Value], operation_id: &str) {
     for event in events {
-        for pointer in ["/params/entry/id", "/params/event/operationId"] {
-            if let Some(slot) = event
-                .pointer_mut(pointer)
-                .filter(|slot| slot.as_str() == Some("$operationId"))
-            {
-                *slot = json!(operation_id);
-            }
+        if let Some(slot) = event
+            .pointer_mut("/params/entry/id")
+            .filter(|slot| slot.as_str() == Some("$operationId"))
+        {
+            *slot = json!(operation_id);
         }
     }
 }
@@ -332,6 +377,7 @@ fn send_event(writer: &Writer, event_id: &AtomicU64, event: &Value) {
 fn run_emitter(rx: std::sync::mpsc::Receiver<Emit>, writer: Writer, event_id: Arc<AtomicU64>) {
     let mut step = std::env::var_os(STEP_FIFO_ENV)
         .and_then(|path| OpenOptions::new().read(true).write(true).open(path).ok());
+    let mut renamed = HashMap::new();
     while let Ok(emit) = rx.recv() {
         let (client_message_id, queue_item_id, mut batch) = match emit {
             Emit::Batch(batch) => batch,
@@ -341,14 +387,18 @@ fn run_emitter(rx: std::sync::mpsc::Receiver<Emit>, writer: Writer, event_id: Ar
             }
         };
         if let Some(id) = client_message_id.as_deref() {
-            stamp_user_message_id(&mut batch, id);
+            stamp_user_message_id(&mut batch, id, &mut renamed);
         }
+        stamp_snapshot_ids(&mut batch, &renamed);
         if let Some(id) = queue_item_id.as_deref() {
             stamp_queue_item_id(&mut batch, id);
         }
         for event in batch {
             await_step(&mut step);
             send_event(&writer, &event_id, &event);
+            if step.is_some() {
+                send(&writer, fence_frame());
+            }
         }
     }
 }
@@ -419,7 +469,7 @@ fn main() {
     let Fixture {
         mut handshake,
         batches,
-        on_request,
+        mut on_request,
         declared,
         catalogs,
     } = load_fixture();
@@ -430,7 +480,11 @@ fn main() {
     let writer = thread::spawn(move || {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        let mut jitter = jitter::Jitter::from_env();
         while let Ok(Some(line)) = writer_rx.recv() {
+            if let Some(jitter) = jitter.as_mut() {
+                jitter.delay();
+            }
             if out.write_all(line.as_bytes()).is_err() || out.write_all(b"\n").is_err() {
                 break;
             }
@@ -510,9 +564,8 @@ fn main() {
         let shell_run = method == SHELL_COMMAND
             && msg.pointer("/params/action").and_then(Value::as_str) == Some("run");
         let mut request_events = on_request
-            .get(method)
-            .and_then(Value::as_array)
-            .cloned()
+            .get_mut(method)
+            .and_then(per_call_events)
             .filter(|_| method != SHELL_COMMAND || shell_run)
             .unwrap_or_default();
         if let Some(operation_id) = msg.pointer("/params/operationId").and_then(Value::as_str) {
@@ -524,7 +577,18 @@ fn main() {
             }
         }
         let response = match method {
-            AGENT_UPDATE => agent_update_response(&handshake, msg.get("params")),
+            AGENT_UPDATE => switch_response(
+                &handshake,
+                msg.pointer("/params/agentName"),
+                "agents",
+                "activeAgent",
+            ),
+            APPROVAL_POLICY_UPDATE => switch_response(
+                &handshake,
+                msg.pointer("/params/approvalPolicy"),
+                "approvalPolicies",
+                "activeApprovalPolicy",
+            ),
             SESSION_RESUME => resume_response(&handshake, msg.get("params")),
             // Session-scoped pins win, then the shared (list-consuming) canned answers.
             _ => {

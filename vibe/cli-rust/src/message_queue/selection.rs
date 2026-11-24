@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, Status};
+use crate::app::{App, Severity, Status};
 use crate::hints::{action, key, Hint};
 use crate::server::Client;
 use crate::ui;
@@ -23,7 +23,6 @@ const CONSUMED_EDIT_HINTS: &[Hint] = &[
     (key::ESC, action::DISCARD),
 ];
 const CONSUMED_EDIT_HINT: &str = "This message was already processed - press Enter again.";
-const CONSUMED_EDIT_HINT_SECS: u64 = 8;
 const REPLACEMENT_PENDING_HINT: &str = "Saving queued prompt…";
 const REPLACEMENT_PENDING_HINT_SECS: u64 = 3;
 
@@ -37,13 +36,14 @@ pub fn mode_hints(app: &App) -> Option<&'static [Hint]> {
     })
 }
 
-/// Whether Up opens queue mode: startup or a turn is running, and prompts are queued.
+/// Whether Up opens queue mode: prompts are queued while startup or a turn runs, or the server holds them.
 pub fn is_available(app: &App) -> bool {
-    matches!(
-        app.session.status,
-        Status::Starting | Status::Generating { .. }
-    ) && !app.queue.is_empty()
-        && !super::mutation_in_flight(app)
+    let open = match app.session.status {
+        Status::Starting | Status::Generating { .. } => true,
+        Status::Ready => app.queue.paused,
+        Status::Failed => false,
+    };
+    open && !app.queue.is_empty() && !super::mutation_in_flight(app)
 }
 
 /// Selection mode owns the whole keyboard: ↑↓/jk move the highlight, Enter
@@ -114,14 +114,18 @@ pub fn edit_selected(app: &mut App) {
         .filter(|item| &item.server_message_id == server_message_id)
         .any(|item| item.replacing)
     {
-        ui::notice::show(app, REPLACEMENT_PENDING_HINT, REPLACEMENT_PENDING_HINT_SECS);
+        ui::notice::show(
+            app,
+            Severity::Information,
+            REPLACEMENT_PENDING_HINT,
+            REPLACEMENT_PENDING_HINT_SECS,
+        );
         return;
     }
     app.queue.editing = true;
     app.queue.consumed_edit = None;
     let text = app.queue.items[position].raw_edit_text();
     crate::long_paste::load_collapsed_prompt(app, text);
-    crate::composer_paths::rewrite_image_paths(&mut app.chat_input);
 }
 
 /// Leave edit mode back to selection, dropping any consumed-edit warning.
@@ -132,7 +136,7 @@ pub fn end_edit(app: &mut App) {
         }
     });
     if let Some(position) = consumed_position {
-        ui::notice::clear(app);
+        clear_consumed_hint(app);
         if app.queue.is_empty() {
             app.queue.editing = false;
             exit(app);
@@ -150,7 +154,7 @@ pub fn confirm_consumed_edit(app: &mut App) -> bool {
         return false;
     };
     app.queue.consumed_edit = Some(ConsumedEdit::Confirmed { position });
-    ui::notice::show_warning(app, CONSUMED_EDIT_HINT, CONSUMED_EDIT_HINT_SECS);
+    ui::notice::show_sticky(app, Severity::Warning, CONSUMED_EDIT_HINT);
     true
 }
 
@@ -164,10 +168,22 @@ pub fn finish_consumed_edit(app: &mut App) -> bool {
         return false;
     }
     app.queue.editing = false;
-    ui::notice::clear(app);
+    clear_consumed_hint(app);
     exit(app);
     crate::completion_manager::input_changed(app);
     true
+}
+
+/// Drop the consumed-edit hint, leaving any other notice (e.g. a held failure) up.
+fn clear_consumed_hint(app: &mut App) {
+    if app
+        .overlays
+        .notice
+        .as_ref()
+        .is_some_and(|notice| notice.text == CONSUMED_EDIT_HINT)
+    {
+        ui::notice::clear(app);
+    }
 }
 
 /// Leave queue mode, restoring the draft the user had before it opened.

@@ -5,6 +5,7 @@ use crate::core::action_id;
 use crate::core::error::CoreError;
 use crate::core::features::large_output::{ResultDisposition, evaluate_result};
 use crate::core::features::permissions::{ApprovalFailureReason, ApprovalOutcome};
+use crate::core::features::programmatic_tool_calling;
 use crate::core::features::programmatic_tool_calling::{
     AcceptedProgramResult, CompletedProgramResult, ProgramAdvance, ProgramInput, ProgramOutcome,
     ProgramTransition, dispatch as dispatch_program,
@@ -23,6 +24,7 @@ use crate::core::tools::execution::{
     LargeOutputSource, ToolBatch, ToolExecution, ToolExecutionState,
 };
 use crate::core::tools::external::ExternalToolCall;
+use crate::core::tools::resolved::EffectiveCall;
 use crate::core::tools::result::{
     approval_failed_result, approval_rejected_result, invalid_tool_call_result,
     model_tool_result_message,
@@ -57,7 +59,10 @@ pub(crate) fn start_tool_batch(
     let mut effects = Vec::new();
     let mut observations = calls
         .iter()
-        .map(|call| tool_execution_started(tools.turn_id, &call.id))
+        .map(|call| {
+            let executed_by_core = core_tool(tools, call).is_some();
+            tool_execution_started(tools.turn_id, &call.id, executed_by_core)
+        })
         .collect::<Vec<_>>();
     let mixed_batch = calls.len() > 1;
     for call in calls {
@@ -105,9 +110,8 @@ fn start_tool_execution(
         let result = invalid_tool_call_result(invalid_json_arguments_reason(error));
         return Ok(completed_execution(tools.turn_id, call, result, Vec::new()));
     }
-    // With programmatic tool calling disabled, `search_tool_functions` and
-    // `run_typescript` fall through to the direct routes and fail as unsupported.
-    if tools.programmatic_enabled()
+    let core_tool = core_tool(tools, &call);
+    if core_tool == Some(CoreTool::ToolDiscovery)
         && let Some(result) = tool_discovery::dispatch(&call, |request| tools.search(request))
     {
         let observations = result
@@ -127,7 +131,7 @@ fn start_tool_execution(
         ));
     }
     let mut accepted_results = Vec::new();
-    if tools.programmatic_enabled()
+    if core_tool == Some(CoreTool::Program)
         && let Some(result) = tools.with_program_context(|context| {
             dispatch_program(context, &call, determinism, &mut accepted_results)
         })
@@ -178,7 +182,7 @@ fn start_tool_execution(
             ));
         }
     };
-    if matches!(pending.stage, ExternalCallStage::Pending) {
+    if matches!(pending.stage, ExternalCallStage::Pending { .. }) {
         match tools.admit(&pending.call) {
             Admission::Run => {}
             Admission::Deny(result) => {
@@ -229,6 +233,7 @@ fn advance_program(
     let ProgramTransition {
         advance,
         accepted_results,
+        warning,
     } = {
         let ToolExecutionState::ProgramPending { execution: program } = &mut execution.state else {
             return Err(CoreError::invariant(
@@ -239,6 +244,7 @@ fn advance_program(
             program.advance(context, &parent_call, input, determinism)
         })?
     };
+    observations.extend(warning);
     observations.extend(accepted_program_results(tools.turn_id, accepted_results));
     match advance {
         ProgramAdvance::Pending {
@@ -413,10 +419,51 @@ fn completed_execution(
     (ToolExecution { call, state }, Vec::new(), observations)
 }
 
-fn tool_execution_started(turn_id: &str, call_id: &str) -> Observation {
+/// A tool Core runs itself, so that no tool call Action reaches the Runtime for
+/// it. Routing and the start Observation's `executed_by_core` both read it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoreTool {
+    ToolDiscovery,
+    Program,
+}
+
+/// The tool Core runs itself that this model tool call names. Without
+/// programmatic tool calling there is none: `search_tool_functions` and
+/// `run_typescript` fall through to the direct routes and fail as unsupported.
+fn core_tool(tools: ToolContext<'_>, call: &ToolCall) -> Option<CoreTool> {
+    core_tool_named(tools.programmatic_enabled(), &call.name)
+}
+
+/// Each tool Core runs itself, by model-facing name, from the names its feature
+/// offers. Routing and `core_tool_names` both read it, so a name a feature adds
+/// is routed to Core and exported alike.
+fn core_tools() -> impl Iterator<Item = (&'static str, CoreTool)> {
+    tool_discovery::direct_names()
+        .map(|name| (name, CoreTool::ToolDiscovery))
+        .chain(programmatic_tool_calling::direct_names().map(|name| (name, CoreTool::Program)))
+}
+
+fn core_tool_named(programmatic_enabled: bool, name: &str) -> Option<CoreTool> {
+    if !programmatic_enabled {
+        return None;
+    }
+    core_tools().find_map(|(core_name, tool)| (core_name == name).then_some(tool))
+}
+
+/// The model-facing names of the tools Core runs itself, so a Runtime can tell
+/// such a call from its name alone.
+pub(crate) fn core_tool_names(programmatic_enabled: bool) -> Vec<&'static str> {
+    if !programmatic_enabled {
+        return Vec::new();
+    }
+    core_tools().map(|(name, _)| name).collect()
+}
+
+fn tool_execution_started(turn_id: &str, call_id: &str, executed_by_core: bool) -> Observation {
     Observation::ToolExecutionStarted {
         turn_id: turn_id.to_string(),
         call_id: call_id.to_string(),
+        executed_by_core,
     }
 }
 
@@ -446,6 +493,10 @@ fn resolve_tool_batch(batch: ToolBatch, actions: Vec<Action>) -> ToolBatchResolu
             .collect();
         return ToolBatchResolution::ContinueTurn { messages };
     }
+    let actions = actions
+        .into_iter()
+        .map(|action| batch.with_program_parent(action))
+        .collect();
     ToolBatchResolution::AwaitingActions { batch, actions }
 }
 
@@ -481,7 +532,12 @@ pub(crate) fn finish_tool_batch_action(
             let post_hook_binding_ids = tools
                 .hook_binding_ids(HookPoint::PostToolCall, Some(&pending.call.hook_tool_key()));
             if !post_hook_binding_ids.is_empty() {
-                effects.push(pending.await_post_hook(post_hook_binding_ids, result, tools.turn_id));
+                effects.push(pending.await_post_hook(
+                    post_hook_binding_ids,
+                    result,
+                    determinism.time_unix_ms,
+                    tools.turn_id,
+                ));
             } else {
                 let finalized = finalize_tool_result(
                     tools,
@@ -645,7 +701,11 @@ pub(crate) fn finish_tool_batch_approval(
 
     let result = match resolution {
         Ok(ApprovalOutcome::Approve) => {
-            let action = pending.send(pending.call.clone(), tools.turn_id);
+            let action = pending.send(
+                pending.call.clone(),
+                determinism.time_unix_ms,
+                tools.turn_id,
+            );
 
             return Ok(ToolBatchTransition {
                 resolution: resolve_tool_batch(batch, vec![action]),
@@ -742,40 +802,51 @@ pub(crate) fn finish_tool_batch_hook(
                     HookResult::PreToolCall(PreToolCallOutput::Continue {
                         effective_arguments,
                     }),
-                ) => {
-                    let effective_call =
-                        tools.effective_call(&pending.call, effective_arguments)?;
-                    match tools.admit(&effective_call) {
-                        Admission::Run => {
-                            effects.push(pending.send(effective_call, tools.turn_id));
-                        }
-                        Admission::Deny(result) => {
-                            let completed = completed_top_level_result(
-                                tools,
-                                &execution.call,
-                                LargeOutputSource::Direct {
-                                    call: effective_call,
-                                },
-                                result,
-                            );
-                            execution.state = completed.state;
-                            observations.extend(completed.observations);
-                        }
-                        Admission::Ask(grant_key) => {
-                            effects.push(pending.await_approval(
-                                effective_call,
-                                grant_key,
-                                ApprovalName::Direct,
-                                tools.turn_id,
-                            ));
-                        }
+                ) => match tools.effective_call(&pending.call, effective_arguments)? {
+                    EffectiveCall::Invalid { detail } => {
+                        let (result, warning) =
+                            pending.invalid_pre_hook_arguments(&detail, tools.turn_id)?;
+                        observations.push(warning);
+                        Some((result, pending.call.clone()))
                     }
-                    None
-                }
+                    EffectiveCall::Valid(effective_call) => {
+                        match tools.admit(&effective_call) {
+                            Admission::Run => {
+                                effects.push(pending.send(
+                                    effective_call,
+                                    determinism.time_unix_ms,
+                                    tools.turn_id,
+                                ));
+                            }
+                            Admission::Deny(result) => {
+                                let completed = completed_top_level_result(
+                                    tools,
+                                    &execution.call,
+                                    LargeOutputSource::Direct {
+                                        call: effective_call,
+                                    },
+                                    result,
+                                );
+                                execution.state = completed.state;
+                                observations.extend(completed.observations);
+                            }
+                            Admission::Ask(grant_key) => {
+                                effects.push(pending.await_approval(
+                                    effective_call,
+                                    grant_key,
+                                    ApprovalName::Direct,
+                                    tools.turn_id,
+                                ));
+                            }
+                        }
+                        None
+                    }
+                },
                 (HookSide::Pre, HookResult::PreToolCall(PreToolCallOutput::Skip { reason })) => {
                     Some((skipped_tool_result(reason)?, pending.call.clone()))
                 }
                 (HookSide::Post, HookResult::PostToolCall { tool_result }) => {
+                    observations.extend(pending.post_hook_warning(&tool_result, tools.turn_id));
                     Some((tool_result, pending.call.clone()))
                 }
                 (HookSide::Pre, _) => {
@@ -805,6 +876,17 @@ pub(crate) fn finish_tool_batch_hook(
             execution_index,
             hook_action_id,
         } => {
+            if let (
+                ToolExecutionState::ProgramPending { execution: program },
+                HookResult::PostToolCall { tool_result },
+            ) = (&batch.executions[execution_index].state, &result)
+            {
+                observations.extend(program.post_hook_warning(
+                    &hook_action_id,
+                    tool_result,
+                    tools.turn_id,
+                ));
+            }
             advance_program(
                 tools,
                 &mut batch.executions[execution_index],
@@ -886,6 +968,7 @@ pub(crate) fn fail_tool_batch_hook(
 mod tests {
     use super::*;
     use crate::core::testing::*;
+
     #[test]
     fn multiple_model_tool_calls_are_preserved_and_executed_in_order() {
         let mut config = config();

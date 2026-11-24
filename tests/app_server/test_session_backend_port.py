@@ -1,24 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from typing import cast
 
 import pytest
 
-from vibe.app_server._dispatch import RequestFailure
+from vibe.app_server import server as server_module
+from vibe.app_server._dispatch import DispatchResult, RequestFailure
 from vibe.app_server._host import HostRequestHandler
 from vibe.app_server._process_services import ProcessServices
 from vibe.app_server._session_backend_port import (
     SessionBackend,
     SessionBackendError,
+    SessionBackendEvent,
     SessionBackendHost,
     SessionBackendQueuedTurnEditing,
     SessionBackendQueuedTurnSteering,
+    SessionEventSubscription,
 )
+from vibe.app_server.models import IdleSessionStatus, PublicSession, PublicSessionState
 from vibe.app_server.protocol import (
     EmptyResponse,
     ProtocolErrorCode,
+    ServerRequest,
     SessionMarkAsSeenParams,
+    SessionMarkAsUnseenParams,
+    SessionReadResponse,
 )
 from vibe.app_server.server import _SESSION_BACKEND_METHODS, AppServer
 from vibe.app_server.transport import memory_transport_pair
@@ -41,12 +49,14 @@ def test_session_backend_contract_covers_the_complete_session_lifecycle() -> Non
         "replace_queued_turn",
         "respond_to_callback",
         "resume_turn_queue",
+        "retry_turn",
         "session_id",
         "shutdown",
         "start_turn",
         "steer_turn",
         "subscribe",
         "switch_agent",
+        "switch_approval_policy",
         "uninstall_agent",
         "update_settings",
         "write_config",
@@ -62,6 +72,7 @@ def test_session_backend_contract_covers_the_complete_session_lifecycle() -> Non
         "config/write",
         "models/refresh",
         "session/agent/update",
+        "session/approvalPolicy/update",
         "session/compact",
         "session/context/inject",
         "session/settings/update",
@@ -76,6 +87,7 @@ def test_session_backend_contract_covers_the_complete_session_lifecycle() -> Non
         "session/turn/queue/steer",
         "session/turn/queue/resume",
         "turn/interrupt",
+        "turn/retry",
         "turn/start",
         "turn/steer",
     }
@@ -130,14 +142,20 @@ def test_app_server_passes_services_to_session_backend_host_factory(
     _, server_transport = memory_transport_pair()
     server = AppServer(
         server_transport,
+        oidc_tenants=process_services.oidc_tenants,
+        platform_credential_lenders=process_services.platform_credential_lenders,
         session_backend_host_factory=factory,
         host_handler=HostRequestHandler(
             HarnessFilesManager(sources=("user", "project")),
             org_config=process_services.org_config,
+            worktrees=process_services.worktrees,
+            experiments=process_services.experiments,
+            model_catalog=process_services.model_catalog,
         ),
     )
 
-    assert captured_services is server
+    assert captured_services is server.session_link
+    assert server.session_link.server is server
     assert server._session_backend_host is expected_host
 
 
@@ -152,10 +170,15 @@ def test_app_server_rejects_empty_session_backend_host_factory_result(
     with pytest.raises(TypeError, match="must return a SessionBackendHost"):
         AppServer(
             server_transport,
+            oidc_tenants=process_services.oidc_tenants,
+            platform_credential_lenders=process_services.platform_credential_lenders,
             session_backend_host_factory=empty_factory,
             host_handler=HostRequestHandler(
                 HarnessFilesManager(sources=("user", "project")),
                 org_config=process_services.org_config,
+                worktrees=process_services.worktrees,
+                experiments=process_services.experiments,
+                model_catalog=process_services.model_catalog,
             ),
         )
 
@@ -167,10 +190,15 @@ async def test_pin_requires_the_optional_host_capability(
     _, server_transport = memory_transport_pair()
     server = AppServer(
         server_transport,
+        oidc_tenants=process_services.oidc_tenants,
+        platform_credential_lenders=process_services.platform_credential_lenders,
         session_backend_host_factory=lambda _: cast(SessionBackendHost, object()),
         host_handler=HostRequestHandler(
             HarnessFilesManager(sources=("user", "project")),
             org_config=process_services.org_config,
+            worktrees=process_services.worktrees,
+            experiments=process_services.experiments,
+            model_catalog=process_services.model_catalog,
         ),
     )
 
@@ -189,10 +217,15 @@ async def test_mark_as_seen_requires_the_optional_host_capability(
     _, server_transport = memory_transport_pair()
     server = AppServer(
         server_transport,
+        oidc_tenants=process_services.oidc_tenants,
+        platform_credential_lenders=process_services.platform_credential_lenders,
         session_backend_host_factory=lambda _: cast(SessionBackendHost, object()),
         host_handler=HostRequestHandler(
             HarnessFilesManager(sources=("user", "project")),
             org_config=process_services.org_config,
+            worktrees=process_services.worktrees,
+            experiments=process_services.experiments,
+            model_catalog=process_services.model_catalog,
         ),
     )
 
@@ -216,15 +249,25 @@ async def test_mark_as_seen_routes_to_the_selected_backend_host(
             received = params
             return EmptyResponse()
 
+        async def mark_as_unseen(
+            self, params: SessionMarkAsUnseenParams
+        ) -> EmptyResponse:
+            return EmptyResponse()
+
     _, server_transport = memory_transport_pair()
     server = AppServer(
         server_transport,
+        oidc_tenants=process_services.oidc_tenants,
+        platform_credential_lenders=process_services.platform_credential_lenders,
         session_backend_host_factory=lambda _: cast(
             SessionBackendHost, SeenStateHost()
         ),
         host_handler=HostRequestHandler(
             HarnessFilesManager(sources=("user", "project")),
             org_config=process_services.org_config,
+            worktrees=process_services.worktrees,
+            experiments=process_services.experiments,
+            model_catalog=process_services.model_catalog,
         ),
     )
 
@@ -233,6 +276,49 @@ async def test_mark_as_seen_routes_to_the_selected_backend_host(
     )
 
     assert received == SessionMarkAsSeenParams(session_id="saved-session")
+    assert result is not None
+    assert result.response == EmptyResponse()
+
+
+@pytest.mark.asyncio
+async def test_mark_as_unseen_routes_to_the_selected_backend_host(
+    process_services: ProcessServices,
+) -> None:
+    received: SessionMarkAsUnseenParams | None = None
+
+    class SeenStateHost:
+        async def mark_as_seen(self, params: SessionMarkAsSeenParams) -> EmptyResponse:
+            return EmptyResponse()
+
+        async def mark_as_unseen(
+            self, params: SessionMarkAsUnseenParams
+        ) -> EmptyResponse:
+            nonlocal received
+            received = params
+            return EmptyResponse()
+
+    _, server_transport = memory_transport_pair()
+    server = AppServer(
+        server_transport,
+        oidc_tenants=process_services.oidc_tenants,
+        platform_credential_lenders=process_services.platform_credential_lenders,
+        session_backend_host_factory=lambda _: cast(
+            SessionBackendHost, SeenStateHost()
+        ),
+        host_handler=HostRequestHandler(
+            HarnessFilesManager(sources=("user", "project")),
+            org_config=process_services.org_config,
+            worktrees=process_services.worktrees,
+            experiments=process_services.experiments,
+            model_catalog=process_services.model_catalog,
+        ),
+    )
+
+    result = await server._dispatch_backend_host_operation(
+        "session/markAsUnseen", {"sessionId": "saved-session"}
+    )
+
+    assert received == SessionMarkAsUnseenParams(session_id="saved-session")
     assert result is not None
     assert result.response == EmptyResponse()
 
@@ -260,10 +346,15 @@ async def test_app_server_shutdown_waits_for_host_cleanup(
     host = SlowShutdownHost()
     server = AppServer(
         server_transport,
+        oidc_tenants=process_services.oidc_tenants,
+        platform_credential_lenders=process_services.platform_credential_lenders,
         session_backend_host_factory=lambda _services: cast(SessionBackendHost, host),
         host_handler=HostRequestHandler(
             HarnessFilesManager(sources=("user", "project")),
             org_config=process_services.org_config,
+            worktrees=process_services.worktrees,
+            experiments=process_services.experiments,
+            model_catalog=process_services.model_catalog,
         ),
     )
 
@@ -280,6 +371,84 @@ async def test_app_server_shutdown_waits_for_host_cleanup(
     assert finished.is_set()
 
 
+@pytest.mark.parametrize(
+    ("method", "announced"),
+    [("session/resume", 1), ("session/continue", 1), ("session/start", 0)],
+)
+@pytest.mark.asyncio
+async def test_only_a_reopened_session_announces_its_running_turn(
+    method: str, announced: int, process_services: ProcessServices
+) -> None:
+    """*Prepare*: A root that can announce its running turn.
+    *Do*: Attach it the way each lifecycle request does.
+    *Assert*: Only resume and continue announce it, and they do so before the
+      event forwarder starts. A new session's first turn announces itself.
+    """
+    # Prepare
+    order: list[str] = []
+
+    class RunningTurnRoot:
+        session_id = "session-1"
+
+        async def announce_running_turn(self) -> None:
+            order.append("announce")
+            await asyncio.sleep(0)
+
+        async def subscribe(self, params: object) -> SessionEventSubscription:
+            async def events() -> AsyncIterator[SessionBackendEvent]:
+                order.append("forward")
+                if False:
+                    yield cast(SessionBackendEvent, None)
+
+            return SessionEventSubscription(
+                snapshot=SessionReadResponse(
+                    state=PublicSessionState(
+                        event_id=0,
+                        session=PublicSession(
+                            id=self.session_id,
+                            status=IdleSessionStatus(),
+                            created_at=1,
+                            updated_at=1,
+                        ),
+                    ),
+                    last_event_id=0,
+                ),
+                events=events(),
+            )
+
+        async def flush_events(self) -> None:
+            await asyncio.sleep(0)
+
+    _, server_transport = memory_transport_pair()
+    server = AppServer(
+        server_transport,
+        oidc_tenants=process_services.oidc_tenants,
+        platform_credential_lenders=process_services.platform_credential_lenders,
+        session_backend_host_factory=lambda _: cast(SessionBackendHost, object()),
+        host_handler=HostRequestHandler(
+            HarnessFilesManager(sources=("user", "project")),
+            org_config=process_services.org_config,
+            worktrees=process_services.worktrees,
+            experiments=process_services.experiments,
+            model_catalog=process_services.model_catalog,
+        ),
+    )
+
+    # Do
+    await server._activate_lifecycle_backend(
+        method, cast(SessionBackend, RunningTurnRoot()), 1
+    )
+    forwarder = server._backend_event_task
+    if forwarder is not None:
+        await asyncio.wait_for(forwarder, timeout=1)
+
+    # Assert
+    assert order.count("announce") == announced
+    assert "forward" in order
+    if announced:
+        assert order.index("announce") < order.index("forward")
+
+
 def _accept_session_backend(backend: SessionBackend) -> None:
     pass
 
@@ -290,3 +459,67 @@ def _accept_session_backend_host(backend: SessionBackendHost) -> None:
 
 def _protocol_members(protocol: type[object]) -> set[str]:
     return {name for name in protocol.__dict__ if not name.startswith("_")}
+
+
+@pytest.mark.parametrize("stream", ["delivers", "is_stuck"])
+@pytest.mark.asyncio
+async def test_resume_sends_open_callbacks_after_the_held_turn_announcement(
+    stream: str, monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
+) -> None:
+    """*Prepare*: A resumed root holding its turn announcement for its event
+        stream, which either delivers it or never does.
+    *Do*: Finish the `session/resume` request.
+    *Assert*: Open callbacks go out once the announcement was delivered; a stuck
+        stream delays them only until the timeout, then they go out anyway.
+    """
+    # Prepare
+    order: list[str] = []
+    held = asyncio.Event()
+
+    class ResumedRoot:
+        session_id = "session-1"
+
+        async def wait_for_held_events(self) -> None:
+            await held.wait()
+            order.append("announced")
+
+    _, server_transport = memory_transport_pair()
+    server = AppServer(
+        server_transport,
+        oidc_tenants=process_services.oidc_tenants,
+        platform_credential_lenders=process_services.platform_credential_lenders,
+        session_backend_host_factory=lambda _: cast(SessionBackendHost, object()),
+        host_handler=HostRequestHandler(
+            HarnessFilesManager(sources=("user", "project")),
+            org_config=process_services.org_config,
+            worktrees=process_services.worktrees,
+            experiments=process_services.experiments,
+            model_catalog=process_services.model_catalog,
+        ),
+    )
+    server._root = cast(SessionBackend, ResumedRoot())
+
+    async def redeliver(_attach_method: str) -> None:
+        order.append("callbacks")
+
+    monkeypatch.setattr(server, "_redeliver_open_callbacks", redeliver)
+    monkeypatch.setattr(
+        server_module, "_RUNNING_TURN_ANNOUNCEMENT_TIMEOUT_SECONDS", 0.05
+    )
+    request = ServerRequest(
+        id=1, method="session/resume", params={"sessionId": "session-1"}
+    )
+
+    # Do
+    finishing = asyncio.create_task(
+        server._after_response(
+            request, DispatchResult(EmptyResponse(), session_attached=True)
+        )
+    )
+    if stream == "delivers":
+        held.set()
+    await asyncio.wait_for(finishing, timeout=1)
+
+    # Assert
+    expected = ["announced", "callbacks"] if stream == "delivers" else ["callbacks"]
+    assert order == expected

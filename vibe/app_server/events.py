@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from itertools import compress, count
+from operator import is_not
 
 from vibe.app_server._model import validate_wire
 from vibe.app_server._patch import apply_json_patch, make_json_patch
@@ -172,6 +174,8 @@ type AppServerEvent = (
 )
 
 _STREAMING_TEXT_PATHS = {"/content/0/text", "/text", "/state/outputText"}
+# Session keys clients follow as a whole list: a change travels as one `replace`.
+SESSION_WHOLE_KEYS = ("loops",)
 # Keep retired IDs for as long as the server keeps retired enqueue retries.
 _RETIRED_QUEUE_ITEM_HISTORY_SIZE = 256
 
@@ -209,6 +213,19 @@ def _merge_snapshot_suffix[ItemT](
     return [*previous[:overlap_start], *current], overlap_start > 0
 
 
+def unchanged_prefix(before: Sequence[object], after: Sequence[object]) -> int:
+    """How many leading items of ``after`` are the very objects ``before`` has there.
+
+    An update keeps each entry it did not change as the same object, so a step
+    that saw ``before`` can skip that prefix of ``after``. The comparison runs
+    in C and never calls ``__eq__``: on a long Session, an update then costs
+    what it changed, not the length of the history.
+    """
+    return next(
+        compress(count(), map(is_not, before, after)), min(len(before), len(after))
+    )
+
+
 def reconcile_snapshot(
     previous: PublicSessionState, current: PublicSessionState
 ) -> list[AppServerEvent]:
@@ -221,12 +238,17 @@ def reconcile_snapshot(
                 patch=make_json_patch(
                     previous.session.model_dump(mode="json", by_alias=True),
                     current.session.model_dump(mode="json", by_alias=True),
+                    whole_keys=SESSION_WHOLE_KEYS,
                 ),
             )
         )
 
-    previous_entries = {entry.id: entry for entry in previous.history or []}
-    for entry in current.history or []:
+    previous_history = previous.history or []
+    current_history = current.history or []
+    # The shared prefix holds the same objects in both states: nothing changed.
+    start = unchanged_prefix(previous_history, current_history)
+    previous_entries = {entry.id: entry for entry in previous_history[start:]}
+    for entry in current_history[start:]:
         prior = previous_entries.get(entry.id)
         if prior is None:
             events.append(HistoryEntryAdded(entry))
@@ -417,6 +439,10 @@ class ClientProjection:
                 f"Turn belongs to session {turn.session_id!r}, "
                 f"expected {self.state.session.id!r}"
             )
+        # The turn/start response can land after notifications already moved
+        # this turn on (e.g. to interrupted); never roll it back to its start.
+        if any(existing.id == turn.id for existing in self.state.turns or []):
+            return
         self._replace_turn(turn)
 
     def consume(self, notification: Notification) -> AppServerEvent | None:

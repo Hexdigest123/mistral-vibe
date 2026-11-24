@@ -6,13 +6,15 @@ from typing import Any
 import pytest
 
 from tests.conftest import ConfigBuilder, OrchestratorLoader
-from vibe.core.agents.manager import AgentManager, resolve_default_agent
+from vibe.core.agents.manager import AgentManager, AgentSelectionError
 from vibe.core.agents.models import (
     BUILTIN_AGENTS,
+    BUILTIN_APPROVAL_POLICIES,
     EXPLORE,
     AgentProfile,
     AgentSafety,
     AgentType,
+    ApprovalPolicyName,
     BuiltinAgentName,
 )
 from vibe.core.config import VibeConfigSchema
@@ -67,6 +69,16 @@ class TestAgentProfile:
         assert BUILTIN_AGENTS["explore"] is EXPLORE
 
 
+def _agents_dir(tmp_path: Path, **files: str) -> Path:
+    directory = tmp_path / "agents"
+    directory.mkdir(exist_ok=True)
+    for stem, body in files.items():
+        (directory / f"{stem.replace('_', '-')}.toml").write_text(
+            body, encoding="utf-8"
+        )
+    return directory
+
+
 class TestAgentManager:
     @pytest.fixture
     def manager(
@@ -91,15 +103,13 @@ class TestAgentManager:
 
         assert "explore" in names
 
-    def test_get_subagents_excludes_agents(self, manager: AgentManager) -> None:
-        """Test that AGENT type agents are not returned."""
-        subagents = manager.get_subagents()
-        names = [a.name for a in subagents]
+    def test_get_subagents_excludes_agents_and_policies(
+        self, manager: AgentManager
+    ) -> None:
+        names = {a.name for a in manager.get_subagents()}
 
-        # These are AGENT type
-        assert "ask" not in names
-        assert "accept-edits" not in names
-        assert "auto-approve" not in names
+        assert BuiltinAgentName.DEFAULT not in names
+        assert not names & set(BUILTIN_APPROVAL_POLICIES)
 
     def test_get_builtin_agent(self, manager: AgentManager) -> None:
         """Test getting a builtin agent by name."""
@@ -113,49 +123,23 @@ class TestAgentManager:
         with pytest.raises(ValueError, match="not found"):
             manager.get_agent("nonexistent-agent")
 
-    def test_get_ask_agent(self, manager: AgentManager) -> None:
-        agent = manager.get_agent("ask")
+    def test_ask_is_a_policy_not_an_agent(self, manager: AgentManager) -> None:
+        policy = manager.get_policy("ask")
 
-        assert agent.name == "ask"
-        assert agent.agent_type == AgentType.AGENT
+        assert policy.name == "ask"
+        with pytest.raises(ValueError, match="Agent 'ask' not found"):
+            manager.get_agent("ask")
 
-    def test_smart_approve_hidden_from_the_picker_by_default(
+    def test_smart_approve_as_default_policy_is_offered_without_the_flag(
         self,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        """Smart approve ships dark: without the flag it is not in the picker/cycle."""
-        manager = AgentManager(load_orchestrator(build_config()))
-
-        assert "smart-approve" not in manager.available_agents
-        assert "smart-approve" not in manager.get_agent_order()
-
-    def test_smart_approve_available_flag_exposes_it_in_the_picker(
-        self,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
-    ) -> None:
-        """The availability flag adds smart approve to the picker/cycle."""
-        config = build_config(smart_approve_available=True)
+        config = build_config(default_approval_policy="smart-approve")
         manager = AgentManager(load_orchestrator(config))
 
-        assert "smart-approve" in manager.available_agents
-        assert "smart-approve" in manager.get_agent_order()
-
-    def test_smart_approve_default_flag_offers_and_defaults(
-        self,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
-    ) -> None:
-        """The default flag both exposes smart approve and makes it the resolved default."""
-        config = build_config(smart_approve_default=True)
-        orchestrator = load_orchestrator(config)
-        manager = AgentManager(
-            orchestrator, initial_agent=resolve_default_agent(orchestrator)
-        )
-
-        assert "smart-approve" in manager.available_agents
-        assert manager.active_profile.name == "smart-approve"
+        assert manager.active_policy.name == "smart-approve"
+        assert "smart-approve" in manager.available_policies
 
     def test_explicit_smart_approve_selection_bypasses_the_gate(
         self,
@@ -164,34 +148,33 @@ class TestAgentManager:
     ) -> None:
         """Explicitly selecting smart approve works even when the picker gate is off."""
         manager = AgentManager(
-            load_orchestrator(build_config()), initial_agent="smart-approve"
+            load_orchestrator(build_config()), initial_policy="smart-approve"
         )
 
-        assert manager.active_profile.name == "smart-approve"
+        assert manager.active_policy.name == "smart-approve"
 
     def test_explicit_smart_approve_stays_in_the_cycle(
         self,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        """A --smart-approve start keeps the mode in the cycle after switching away.
+        """A --smart-approve start keeps the policy in the cycle after switching away.
 
         Regression: the mode was active at startup but dropped out of the picker
         once the user cycled off it, because it was hidden by the rollout gate.
         """
         manager = AgentManager(
-            load_orchestrator(build_config()), initial_agent="smart-approve"
+            load_orchestrator(build_config()), initial_policy="smart-approve"
         )
 
-        assert "smart-approve" in manager.available_agents
-        assert "smart-approve" in manager.get_agent_order()
+        assert "smart-approve" in manager.available_policies
+        assert "smart-approve" in manager.get_policy_order()
 
-        # Cycle a full loop; smart-approve must be reachable again, not skipped.
-        order = manager.get_agent_order()
-        current = manager.active_profile
+        order = manager.get_policy_order()
+        current = manager.active_policy
         seen = [current.name]
         for _ in range(len(order)):
-            current = manager.next_agent(current)
+            current = manager.next_policy(current)
             seen.append(current.name)
 
         assert seen.count("smart-approve") >= 2
@@ -217,41 +200,113 @@ class TestAgentManager:
         manager = AgentManager(
             load_orchestrator(config), initial_agent="explore", allow_subagent=True
         )
-        assert manager.active_profile.name == "explore"
+        assert manager.active_agent.name == "explore"
 
     def test_initial_agent_accepts_agent_type(
         self,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        """Test that creating AgentManager with an agent-type agent works."""
         config = build_config()
-        manager = AgentManager(load_orchestrator(config), initial_agent="ask")
-        assert manager.active_profile.name == "ask"
+        manager = AgentManager(
+            load_orchestrator(config), initial_agent=BuiltinAgentName.DEFAULT
+        )
+        assert manager.active_agent.name == BuiltinAgentName.DEFAULT
 
     def test_initial_agent_raises_when_agent_is_disabled(
         self,
+        tmp_path: Path,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        config = build_config(disabled_agents=["ask"])
+        config = build_config(
+            agent_paths=[_agents_dir(tmp_path, reviewer="")],
+            disabled_agents=["reviewer"],
+        )
         with pytest.raises(ValueError, match="disabled_agents") as exc_info:
-            AgentManager(load_orchestrator(config), initial_agent="ask")
+            AgentManager(load_orchestrator(config), initial_agent="reviewer")
         message = str(exc_info.value)
         assert "default_agent" not in message
-        assert message.startswith("Agent 'ask'")
+        assert message.startswith("Agent 'reviewer'")
 
     def test_explicit_agent_excluded_by_enabled_agents_does_not_blame_default(
         self,
+        tmp_path: Path,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        config = build_config(enabled_agents=["ask"])
+        config = build_config(
+            agent_paths=[_agents_dir(tmp_path, reviewer="", writer="")],
+            enabled_agents=["reviewer"],
+        )
         with pytest.raises(ValueError, match="enabled_agents") as exc_info:
-            AgentManager(load_orchestrator(config), initial_agent="auto-approve")
+            AgentManager(load_orchestrator(config), initial_agent="writer")
         message = str(exc_info.value)
         assert "default_agent" not in message
-        assert message.startswith("Agent 'auto-approve'")
+        assert message.startswith("Agent 'writer'")
+
+    @pytest.mark.parametrize(
+        ("settings", "requested", "error"),
+        [
+            ({"disabled_agents": ["ask"]}, "ask", "disabled_agents"),
+            ({"enabled_agents": ["ask"]}, "auto-approve", "enabled_agents"),
+            (
+                {"enable_auto_approve": False},
+                "auto-approve",
+                "auto-approve mode is disabled",
+            ),
+        ],
+    )
+    def test_a_requested_policy_the_users_config_excludes_stays_loud(
+        self,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
+        settings: dict[str, Any],
+        requested: str,
+        error: str,
+    ) -> None:
+        config = build_config(**settings)
+        with pytest.raises(ValueError, match=error) as exc_info:
+            AgentManager(load_orchestrator(config), initial_policy=requested)
+        message = str(exc_info.value)
+        assert "default_" not in message
+        assert "admin-managed" not in message
+
+    @pytest.mark.parametrize(
+        ("settings", "requested", "error"),
+        [
+            (
+                {"disabled_agents": ["ask"]},
+                "ask",
+                "Agent 'ask' is in 'disabled_agents'",
+            ),
+            (
+                {"enabled_agents": ["ask", "accept-edits"]},
+                "auto-approve",
+                "Agent 'auto-approve' is not in 'enabled_agents'",
+            ),
+            (
+                {"enable_auto_approve": False},
+                "auto-approve",
+                "auto-approve mode is disabled",
+            ),
+        ],
+    )
+    def test_switching_to_a_policy_the_users_config_excludes_explains_why(
+        self,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
+        settings: dict[str, Any],
+        requested: str,
+        error: str,
+    ) -> None:
+        manager = AgentManager(load_orchestrator(build_config(**settings)))
+
+        with pytest.raises(ValueError, match=error) as exc_info:
+            manager.switch_policy(requested)
+
+        assert "admin-managed" not in str(exc_info.value)
+        assert manager.active_policy.name == ApprovalPolicyName.ACCEPT_EDITS
 
     def test_initial_agent_raises_when_agent_does_not_exist(
         self,
@@ -262,27 +317,27 @@ class TestAgentManager:
         with pytest.raises(ValueError, match="not found"):
             AgentManager(load_orchestrator(config), initial_agent="nonexistent-agent")
 
-    def test_default_agent_excluded_by_enabled_agents_raises_config_contradiction(
+    def test_default_policy_excluded_by_enabled_agents_raises_config_contradiction(
         self,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
         config = build_config(enabled_agents=["ask"])
-        with pytest.raises(ValueError, match="enabled_agents") as exc_info:
+        with pytest.raises(InvalidConfigError, match="enabled_agents") as exc_info:
             AgentManager(load_orchestrator(config))
         message = str(exc_info.value)
         assert "accept-edits" in message
-        assert "default_agent" in message
+        assert "default_approval_policy" in message
 
-    def test_default_agent_excluded_by_disabled_agents_raises_config_contradiction(
+    def test_default_policy_excluded_by_disabled_agents_raises_config_contradiction(
         self,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
         config = build_config(disabled_agents=["accept-edits"])
-        with pytest.raises(ValueError, match="disabled_agents") as exc_info:
+        with pytest.raises(InvalidConfigError, match="disabled_agents") as exc_info:
             AgentManager(load_orchestrator(config))
-        assert "default_agent" in str(exc_info.value)
+        assert "default_approval_policy" in str(exc_info.value)
 
     def test_disabled_agents_ignored_entirely_when_enabled_agents_set(
         self,
@@ -292,31 +347,21 @@ class TestAgentManager:
     ) -> None:
         config = build_config(enabled_agents=["ask"], disabled_agents=["ask"])
         with caplog.at_level("WARNING"):
-            manager = AgentManager(load_orchestrator(config), initial_agent="ask")
-        assert manager.active_profile.name == "ask"
+            manager = AgentManager(load_orchestrator(config), initial_policy="ask")
+        assert manager.active_policy.name == "ask"
         assert caplog.text == ""
 
-    def test_auto_approve_agent_available_by_default(
+    def test_disabling_auto_approve_mode_hides_the_policy(
         self,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        manager = AgentManager(load_orchestrator(build_config()))
-
-        assert "auto-approve" in manager.available_agents
-        assert "auto-approve" in manager.get_agent_order()
-
-    def test_disabling_auto_approve_mode_hides_the_agent(
-        self,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
-    ) -> None:
-        """enable_auto_approve = false removes the yolo agent from the picker/cycle."""
+        """enable_auto_approve = false removes the yolo policy from the picker/cycle."""
         config = build_config(enable_auto_approve=False)
         manager = AgentManager(load_orchestrator(config))
 
-        assert "auto-approve" not in manager.available_agents
-        assert "auto-approve" not in manager.get_agent_order()
+        assert "auto-approve" not in manager.available_policies
+        assert "auto-approve" not in manager.get_policy_order()
 
     def test_disabling_auto_approve_mode_wins_over_enabled_agents(
         self,
@@ -330,52 +375,28 @@ class TestAgentManager:
         )
         manager = AgentManager(load_orchestrator(config))
 
-        assert "auto-approve" not in manager.available_agents
-        assert "ask" in manager.available_agents
+        assert "auto-approve" not in manager.available_policies
+        assert "ask" in manager.available_policies
 
-    def test_initial_agent_auto_approve_rejected_when_mode_disabled(
-        self,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
-    ) -> None:
-        config = build_config(enable_auto_approve=False)
-        with pytest.raises(
-            ValueError, match="auto-approve mode is disabled"
-        ) as exc_info:
-            AgentManager(load_orchestrator(config), initial_agent="auto-approve")
-
-        assert "admin-managed" not in str(exc_info.value)
-
-    def test_switching_to_auto_approve_rejected_when_mode_disabled(
-        self,
-        build_config: ConfigBuilder,
-        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
-    ) -> None:
-        config = build_config(enable_auto_approve=False)
-        manager = AgentManager(load_orchestrator(config), initial_agent="ask")
-
-        with pytest.raises(ValueError, match="auto-approve mode is disabled"):
-            manager.switch_profile("auto-approve")
-
-    def test_custom_yolo_agent_hidden_when_mode_disabled(
+    def test_a_custom_yolo_agent_runs_without_auto_approve_when_mode_disabled(
         self,
         tmp_path: Path,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        """The mode gate keys on the safety level, so custom yolo agents are covered."""
-        agents_dir = tmp_path / "agents"
-        agents_dir.mkdir()
-        (agents_dir / "reckless.toml").write_text('safety = "yolo"\n', encoding="utf-8")
-
-        enabled_manager = AgentManager(
-            load_orchestrator(build_config(agent_paths=[agents_dir]))
+        """The mode gate keys on the policy, so a yolo agent stays but never bypasses."""
+        config = build_config(
+            enable_auto_approve=False,
+            agent_paths=[_agents_dir(tmp_path, reckless='safety = "yolo"\n')],
         )
-        assert "reckless" in enabled_manager.available_agents
 
-        config = build_config(enable_auto_approve=False, agent_paths=[agents_dir])
-        manager = AgentManager(load_orchestrator(config))
-        assert "reckless" not in manager.available_agents
+        manager = AgentManager(load_orchestrator(config), initial_agent="reckless")
+
+        assert "reckless" in manager.available_agents
+        assert manager.active_agent.name == "reckless"
+        assert manager.active_policy.name == ApprovalPolicyName.ACCEPT_EDITS
+        assert manager.config.bypass_tool_permissions is False
+        assert manager.excluded_agent is None
 
     @pytest.mark.parametrize(
         ("bash", "message"),
@@ -417,43 +438,82 @@ class TestAgentManager:
             AgentManager(load_orchestrator(config), initial_agent="slow")
         assert str(started.value) == expected
 
-        manager = AgentManager(load_orchestrator(config), initial_agent="ask")
+        manager = AgentManager(load_orchestrator(config))
         assert "slow" in manager.available_agents
         with pytest.raises(InvalidConfigError) as switched:
-            manager.switch_profile("slow")
+            manager.switch_agent("slow")
         assert str(switched.value) == expected
-        assert manager.active_profile.name == "ask"
+        assert manager.active_agent.name == BuiltinAgentName.DEFAULT
         assert "default_timeout" not in manager.config.tools.get("bash", {})
 
-    def test_a_broken_override_of_a_builtin_agent_keeps_the_builtin(
+    @pytest.mark.parametrize(
+        ("stem", "kind"),
+        [("default", "builtin agent"), ("accept-edits", "approval policy")],
+    )
+    def test_a_broken_override_of_a_builtin_keeps_the_builtin(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
+        stem: str,
+        kind: str,
+    ) -> None:
+        """*Prepare*: agents/<builtin>.toml sets only a bash default above
+        Vibe's maximum.
+        *Do*: Start a session on the default agent and policy.
+        *Assert*: The session starts on the builtins, and the ignored file is
+        logged with its config error.
+        """
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        path = agents_dir / f"{stem}.toml"
+        path.write_text("[tools.bash]\ndefault_timeout = 600\n", encoding="utf-8")
+        config = build_config(agent_paths=[agents_dir])
+
+        with caplog.at_level("WARNING"):
+            manager = AgentManager(load_orchestrator(config))
+
+        assert manager.active_agent is BUILTIN_AGENTS[BuiltinAgentName.DEFAULT]
+        assert (
+            manager.active_policy
+            is BUILTIN_APPROVAL_POLICIES[ApprovalPolicyName.ACCEPT_EDITS]
+        )
+        assert any(
+            f"override of {kind} '{stem}'" in record.getMessage()
+            and str(path) in record.getMessage()
+            and "default_timeout is set without max_timeout_seconds"
+            in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_an_unknown_tool_permission_is_ignored_in_an_agent_and_breaks_a_policy(
         self,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        """*Prepare*: agents/accept-edits.toml sets only a bash default above
-        Vibe's maximum.
-        *Do*: Start in accept-edits, the default mode.
-        *Assert*: The session starts on the builtin, and the ignored file is
-        logged with its config error.
-        """
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
-        path = agents_dir / "accept-edits.toml"
-        path.write_text("[tools.bash]\ndefault_timeout = 600\n", encoding="utf-8")
+        for stem in ("custom", "accept-edits"):
+            (agents_dir / f"{stem}.toml").write_text(
+                '[tools.bash]\npermission = "auto"\n', encoding="utf-8"
+            )
         config = build_config(agent_paths=[agents_dir])
 
         with caplog.at_level("WARNING"):
-            manager = AgentManager(
-                load_orchestrator(config), initial_agent=BuiltinAgentName.ACCEPT_EDITS
-            )
+            manager = AgentManager(load_orchestrator(config), initial_agent="custom")
 
-        assert manager.active_profile is BUILTIN_AGENTS[BuiltinAgentName.ACCEPT_EDITS]
+        assert manager.active_agent.name == "custom"
+        assert "permission" not in manager.config.tools.get("bash", {})
+        assert (
+            manager.active_policy
+            is BUILTIN_APPROVAL_POLICIES[ApprovalPolicyName.ACCEPT_EDITS]
+        )
         assert any(
-            str(path) in record.getMessage()
-            and "default_timeout is set without max_timeout_seconds"
-            in record.getMessage()
+            "override of approval policy 'accept-edits'" in record.getMessage()
+            and "permission 'auto' is not one of" in record.getMessage()
             for record in caplog.records
         )
 
@@ -466,21 +526,35 @@ class TestAgentManager:
         config = build_config(default_agent="plan")
         with caplog.at_level("WARNING"):
             orchestrator = load_orchestrator(config)
-            manager = AgentManager(
-                orchestrator, initial_agent=resolve_default_agent(orchestrator)
-            )
+            manager = AgentManager(orchestrator, initial_agent=None)
 
-        assert manager.active_profile.name == "ask"
+        assert manager.active_agent.name == BuiltinAgentName.DEFAULT
+        assert manager.active_policy.name == ApprovalPolicyName.ASK
         assert "plan" not in manager.available_agents
+        assert "plan" not in manager.available_policies
         assert "default_agent 'plan' is no longer a builtin agent" in caplog.text
 
-    def test_explicit_plan_agent_is_rejected_like_any_unknown_agent(
+    def test_explicit_plan_agent_is_rejected_with_its_replacement(
         self,
         build_config: ConfigBuilder,
         load_orchestrator: OrchestratorLoader[VibeConfigSchema],
     ) -> None:
-        with pytest.raises(ValueError, match="Agent 'plan' not found"):
+        with pytest.raises(
+            AgentSelectionError, match="Agent 'plan' was removed in Vibe 3.0. Use 'ask'"
+        ):
             AgentManager(load_orchestrator(build_config()), initial_agent="plan")
+
+    def test_switching_to_plan_is_rejected_with_its_replacement(
+        self,
+        build_config: ConfigBuilder,
+        load_orchestrator: OrchestratorLoader[VibeConfigSchema],
+    ) -> None:
+        manager = AgentManager(load_orchestrator(build_config()))
+
+        with pytest.raises(
+            AgentSelectionError, match="Agent 'plan' was removed in Vibe 3.0. Use 'ask'"
+        ):
+            manager.switch_policy("plan")
 
     def test_custom_plan_agent_keeps_serving_as_default_agent(
         self,
@@ -496,12 +570,10 @@ class TestAgentManager:
         config = build_config(default_agent="plan", agent_paths=[agents_dir])
 
         orchestrator = load_orchestrator(config)
-        manager = AgentManager(
-            orchestrator, initial_agent=resolve_default_agent(orchestrator)
-        )
+        manager = AgentManager(orchestrator, initial_agent=None)
 
-        assert manager.active_profile.name == "plan"
-        assert manager.active_profile.display_name == "My Plan"
+        assert manager.active_agent.name == "plan"
+        assert manager.active_agent.display_name == "My Plan"
 
     def test_an_agent_file_named_main_is_skipped(
         self,
@@ -522,7 +594,7 @@ class TestAgentManager:
         with pytest.raises(ValueError, match="Agent 'main' not found"):
             AgentManager(load_orchestrator(config), initial_agent="main")
         manager = AgentManager(load_orchestrator(config), initial_agent="reviewer")
-        assert manager.active_profile.name == "reviewer"
+        assert manager.active_agent.name == "reviewer"
 
     def test_custom_agent_listing_exit_plan_mode_still_loads(
         self,
@@ -541,7 +613,7 @@ class TestAgentManager:
 
         manager = AgentManager(load_orchestrator(config), initial_agent="legacy")
 
-        assert manager.active_profile.name == "legacy"
+        assert manager.active_agent.name == "legacy"
 
     def test_install_required_agent_reports_install_not_disabled_agents(
         self,
@@ -557,10 +629,11 @@ class TestAgentManager:
 
 
 async def _org_orchestrator(
-    *, local: dict[str, Any] | None = None, policy: str = "", cohort: bool = False
+    *, local: dict[str, Any] | None = None, policy: str = "", rollout: str | None = None
 ) -> ConfigOrchestrator[VibeConfigSchema]:
     growthbook = GrowthbookLayer()
-    growthbook.set_variants({"vibe_cli_smart_approve_default": cohort})
+    if rollout is not None:
+        growthbook.set_variants({"vibe_cli_default_agent": rollout})
     admin = AdminConfigLayer()
     admin.load_managed_toml(policy)
     return await ConfigOrchestrator.create(
@@ -572,89 +645,129 @@ async def _org_orchestrator(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("local", "policy", "cohort", "expected"),
+    ("local", "policy", "rollout", "expected"),
     [
-        ({}, "", False, BuiltinAgentName.ACCEPT_EDITS),
-        ({"default_agent": "ask"}, "", False, BuiltinAgentName.ASK),
-        # The smart-approve experiment's cohort default beats the local one.
-        ({"default_agent": "ask"}, "", True, BuiltinAgentName.SMART_APPROVE),
-        # An org-enforced default beats the experiment.
-        ({}, 'default_agent = "ask"\n', True, BuiltinAgentName.ASK),
-        # Even when the org also enforces the experiment's flag: an org that
-        # wants smart-approve as the default enforces it as default_agent.
+        ({}, "", None, ApprovalPolicyName.ACCEPT_EDITS),
+        ({"default_approval_policy": "ask"}, "", None, ApprovalPolicyName.ASK),
+        # The rollout only replaces the built-in default.
+        ({}, "", "smart-approve", ApprovalPolicyName.SMART_APPROVE),
+        ({}, "", "ask", ApprovalPolicyName.ASK),
+        (
+            {"default_approval_policy": "ask"},
+            "",
+            "smart-approve",
+            ApprovalPolicyName.ASK,
+        ),
+        (
+            {"default_approval_policy": "auto-approve"},
+            "",
+            "smart-approve",
+            ApprovalPolicyName.AUTO_APPROVE,
+        ),
+        # The org's default beats both.
         (
             {},
-            'default_agent = "ask"\nsmart_approve_default = true\n',
-            True,
-            BuiltinAgentName.ASK,
+            'default_approval_policy = "ask"\n',
+            "smart-approve",
+            ApprovalPolicyName.ASK,
         ),
-        # An org config without default_agent leaves the experiment alone.
-        ({}, 'theme = "nord"\n', True, BuiltinAgentName.SMART_APPROVE),
+        ({}, 'theme = "nord"\n', "smart-approve", ApprovalPolicyName.SMART_APPROVE),
     ],
 )
-async def test_resolve_default_agent(
-    local: dict[str, Any], policy: str, cohort: bool, expected: str
+async def test_a_new_session_starts_in_the_default_policy(
+    local: dict[str, Any], policy: str, rollout: str | None, expected: str
 ) -> None:
-    orchestrator = await _org_orchestrator(local=local, policy=policy, cohort=cohort)
+    local = {**local, "smart_approve_available": True}
+    orchestrator = await _org_orchestrator(local=local, policy=policy, rollout=rollout)
 
-    assert resolve_default_agent(orchestrator) == expected
+    agents = AgentManager(orchestrator)
+
+    assert agents.active_agent.name == BuiltinAgentName.DEFAULT
+    assert agents.active_policy.name == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("local", "rollout"),
+    [
+        ({"disabled_agents": ["ask"]}, "ask"),
+        # The experiment does not opt a user into smart-approve: the policy
+        # still needs the vibe_cli_smart_approve rollout, and the user's lists.
+        ({}, "smart-approve"),
+        (
+            {"smart_approve_available": True, "disabled_agents": ["smart-approve"]},
+            "smart-approve",
+        ),
+    ],
+)
+async def test_a_rollout_default_the_session_cannot_start_starts_another_policy(
+    local: dict[str, Any], rollout: str
+) -> None:
+    # The user did not choose the rollout's policy, so it must not stop the
+    # session from starting.
+    orchestrator = await _org_orchestrator(local=local, rollout=rollout)
+
+    agents = AgentManager(orchestrator)
+
+    assert agents.active_policy.name == ApprovalPolicyName.ACCEPT_EDITS
+    assert agents.excluded_agent is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("policy", "requested", "started"),
     [
-        # The user's own default, excluded by the org: a builtin mode.
+        # The user's own default, excluded by the org: a builtin policy.
         ('disabled_agents = ["auto-approve"]\n', None, "accept-edits"),
-        # An --agent choice the org excludes: a builtin mode.
+        # A requested policy the org excludes: a builtin policy.
         ('disabled_agents = ["auto-approve"]\n', "auto-approve", "accept-edits"),
         # ... or the org's own default, when it enforces one.
         (
-            'default_agent = "ask"\ndisabled_agents = ["auto-approve"]\n',
+            'default_approval_policy = "ask"\ndisabled_agents = ["auto-approve"]\n',
             "auto-approve",
             "ask",
         ),
         (
-            'default_agent = "ask"\nenabled_agents = ["ask", "accept-edits"]\n',
+            'default_approval_policy = "ask"\nenabled_agents = ["ask", "accept-edits"]\n',
             "auto-approve",
             "ask",
         ),
     ],
 )
-async def test_an_agent_the_org_excludes_starts_another_mode(
+async def test_a_policy_the_org_excludes_starts_another_policy(
     policy: str, requested: str | None, started: str
 ) -> None:
     orchestrator = await _org_orchestrator(
-        local={"default_agent": "auto-approve"}, policy=policy
+        local={"default_approval_policy": "auto-approve"}, policy=policy
     )
 
-    agents = AgentManager(orchestrator, requested)
+    agents = AgentManager(orchestrator, initial_policy=requested)
 
-    assert agents.active_profile.name == started
+    assert agents.active_policy.name == started
     assert agents.excluded_agent == requested
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("requested", [None, "auto-approve"])
+@pytest.mark.parametrize("requested", [None, pytest.param("auto-approve")])
 async def test_an_enforced_plan_default_runs_as_ask_under_agent_lists(
     requested: str | None,
 ) -> None:
     # "plan" starts as ask, which the org's list allows, whether it is the
-    # starting mode or the fallback for an excluded --agent choice.
+    # starting policy or the fallback for an excluded policy request.
     orchestrator = await _org_orchestrator(
         policy='default_agent = "plan"\nenabled_agents = ["ask", "accept-edits"]\n'
     )
 
-    agents = AgentManager(orchestrator, requested)
+    agents = AgentManager(orchestrator, initial_policy=requested)
 
-    assert agents.active_profile.name == BuiltinAgentName.ASK
+    assert agents.active_policy.name == ApprovalPolicyName.ASK
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "policy", ['disabled_agents = ["ask"]\n', 'enabled_agents = ["accept-edits"]\n']
 )
-async def test_a_saved_plan_default_the_org_excludes_as_ask_starts_another_mode(
+async def test_a_saved_plan_default_the_org_excludes_as_ask_starts_another_policy(
     policy: str,
 ) -> None:
     # A pre-3.0 saved "plan" starts as ask: the org's lists are checked on ask.
@@ -662,53 +775,32 @@ async def test_a_saved_plan_default_the_org_excludes_as_ask_starts_another_mode(
         local={"default_agent": "plan"}, policy=policy
     )
 
-    agents = AgentManager(orchestrator, None)
+    agents = AgentManager(orchestrator)
 
-    assert agents.active_profile.name == BuiltinAgentName.ACCEPT_EDITS
+    assert agents.active_policy.name == ApprovalPolicyName.ACCEPT_EDITS
     assert agents.excluded_agent is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("local", "requested"),
-    [({"default_agent": "auto-approve"}, None), ({}, "auto-approve")],
+    [({"default_approval_policy": "auto-approve"}, None), ({}, "auto-approve")],
 )
-async def test_an_org_that_forbids_auto_approve_starts_another_mode(
+async def test_an_org_that_forbids_auto_approve_starts_another_policy(
     local: dict[str, Any], requested: str | None
 ) -> None:
-    # The org's enable_auto_approve = false excludes the yolo mode like its
-    # agent lists do: the session starts another mode under the org config,
+    # The org's enable_auto_approve = false excludes the yolo policy like its
+    # lists do: the session starts another policy under the org config,
     # instead of failing and falling back to local config, where YOLO is on.
     orchestrator = await _org_orchestrator(
         local=local, policy="enable_auto_approve = false\n"
     )
 
-    agents = AgentManager(orchestrator, requested)
+    agents = AgentManager(orchestrator, initial_policy=requested)
 
-    assert agents.active_profile.name == BuiltinAgentName.ACCEPT_EDITS
+    assert agents.active_policy.name == ApprovalPolicyName.ACCEPT_EDITS
     assert agents.excluded_agent == requested
     assert orchestrator.config.enable_auto_approve is False
-
-
-@pytest.mark.asyncio
-async def test_an_org_that_forbids_auto_approve_excludes_custom_yolo_agents(
-    tmp_path: Path,
-) -> None:
-    agents_dir = tmp_path / "agents"
-    agents_dir.mkdir()
-    (agents_dir / "reckless.toml").write_text('safety = "yolo"\n', encoding="utf-8")
-    orchestrator = await _org_orchestrator(
-        local={"agent_paths": [str(agents_dir)]}, policy="enable_auto_approve = false\n"
-    )
-
-    agents = AgentManager(orchestrator, "reckless")
-
-    assert agents.active_profile.name == BuiltinAgentName.ACCEPT_EDITS
-    assert agents.excluded_agent == "reckless"
-    with pytest.raises(
-        ValueError, match="Agent 'reckless' is disabled by your organization."
-    ):
-        agents.switch_profile("reckless")
 
 
 @pytest.mark.asyncio
@@ -718,104 +810,120 @@ async def test_a_local_enabled_agents_does_not_widen_the_orgs() -> None:
         local={"enabled_agents": ["auto-approve"]}, policy='enabled_agents = ["ask"]\n'
     )
 
-    agents = AgentManager(orchestrator, "auto-approve")
+    agents = AgentManager(orchestrator, initial_policy="auto-approve")
 
-    assert agents.active_profile.name == BuiltinAgentName.ASK
+    assert agents.active_policy.name == ApprovalPolicyName.ASK
     assert agents.excluded_agent == "auto-approve"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("policy", "requested", "cohort"),
+    ("policy", "requested", "rollout"),
     [
         # Asking for smart-approve opts in past the rollout gate, not past the
-        # org's agent lists.
-        ('disabled_agents = ["smart-approve"]\n', "smart-approve", False),
-        # Nor does the experiment's cohort default.
-        ('disabled_agents = ["smart-approve"]\n', None, True),
-        ('enabled_agents = ["ask", "accept-edits"]\n', None, True),
+        # org's lists.
+        ('disabled_agents = ["smart-approve"]\n', "smart-approve", None),
+        # Nor does the rollout's default.
+        ('disabled_agents = ["smart-approve"]\n', None, "smart-approve"),
+        ('enabled_agents = ["ask", "accept-edits"]\n', None, "smart-approve"),
         # A fallback the org excludes is skipped too.
-        ('disabled_agents = ["auto-approve", "smart-approve"]\n', "auto-approve", True),
+        (
+            'disabled_agents = ["auto-approve", "smart-approve"]\n',
+            "auto-approve",
+            "smart-approve",
+        ),
     ],
 )
 async def test_smart_approve_the_org_excludes_never_starts(
-    policy: str, requested: str | None, cohort: bool
+    policy: str, requested: str | None, rollout: str | None
 ) -> None:
-    orchestrator = await _org_orchestrator(policy=policy, cohort=cohort)
+    orchestrator = await _org_orchestrator(policy=policy, rollout=rollout)
 
-    agents = AgentManager(orchestrator, requested)
+    agents = AgentManager(orchestrator, initial_policy=requested)
 
-    assert agents.active_profile.name == BuiltinAgentName.ACCEPT_EDITS
+    assert agents.active_policy.name == ApprovalPolicyName.ACCEPT_EDITS
     assert agents.excluded_agent == requested
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("policy", "requested", "error"),
+    ("policy", "selection", "error"),
     [
         # A typo is not the org's doing.
         (
-            'default_agent = "ask"\ndisabled_agents = ["auto-approve"]\n',
-            "auto-aprove",  # typos:disable-line
+            'default_approval_policy = "ask"\ndisabled_agents = ["auto-approve"]\n',
+            {"initial_policy": "auto-aprove"},  # typos:disable-line
             "not found",
         ),
         # Nor is asking for a subagent as the primary agent.
         (
-            'default_agent = "ask"\ndisabled_agents = ["auto-approve"]\n',
-            "explore",
+            'default_approval_policy = "ask"\ndisabled_agents = ["auto-approve"]\n',
+            {"initial_agent": "explore"},
             "cannot be used as the primary agent",
         ),
-        # Even when the org's mode list leaves the subagent out.
-        (
+        # Even when the org's list leaves the subagent out.
+        pytest.param(
             'enabled_agents = ["ask", "accept-edits"]\n',
+            {"initial_agent": "explore"},
             "explore",
-            "'explore' is disabled by your organization",
         ),
     ],
 )
 async def test_a_failure_the_org_did_not_cause_stays_loud(
-    policy: str, requested: str, error: str
+    policy: str, selection: dict[str, str], error: str
 ) -> None:
     orchestrator = await _org_orchestrator(policy=policy)
 
     with pytest.raises(ValueError, match=error):
-        AgentManager(orchestrator, requested)
+        AgentManager(
+            orchestrator,
+            selection.get("initial_agent"),
+            initial_policy=selection.get("initial_policy"),
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("default_agent", "error"),
+    ("local", "error"),
     [
-        ("acept-edits", "not found"),  # typos:disable-line
-        ("explore", "disabled by your organization"),
+        (
+            {"default_approval_policy": "acept-edits"},  # typos:disable-line
+            "not found",
+        ),
+        pytest.param(
+            {"default_agent": "acept-edits"},  # typos:disable-line
+            "not found",
+        ),
+        pytest.param({"default_agent": "explore"}, "disabled by your organization"),
     ],
 )
-async def test_a_broken_saved_default_stays_loud_under_org_agent_lists(
-    default_agent: str, error: str
+async def test_a_broken_saved_default_stays_loud_under_org_lists(
+    local: dict[str, Any], error: str
 ) -> None:
     # The org's list leaves the name out, but the user's own config is what
     # needs fixing.
     orchestrator = await _org_orchestrator(
-        local={"default_agent": default_agent},
-        policy='enabled_agents = ["ask", "accept-edits"]\n',
+        local=local, policy='enabled_agents = ["ask", "accept-edits"]\n'
     )
 
     with pytest.raises(ValueError, match=error):
-        AgentManager(orchestrator, None)
+        AgentManager(orchestrator)
 
 
 @pytest.mark.asyncio
-async def test_the_orgs_agent_lists_bound_every_mode_switch() -> None:
-    # The user's own list widens the merged one; the picker, mode cycling and
-    # a restored session mode still never reach what the org excludes.
+async def test_the_orgs_lists_bound_every_policy_switch() -> None:
+    # The user's own list widens the merged one; the picker, policy cycling and
+    # a restored session policy still never reach what the org excludes.
     orchestrator = await _org_orchestrator(
         local={"enabled_agents": ["auto-approve", "accept-edits", "ask"]},
         policy='disabled_agents = ["auto-approve"]\n',
     )
-    agents = AgentManager(orchestrator, "accept-edits")
+    agents = AgentManager(orchestrator, initial_policy="accept-edits")
 
-    assert "auto-approve" not in agents.available_agents
+    assert "auto-approve" not in agents.available_policies
+    assert "auto-approve" not in agents.get_policy_order()
     with pytest.raises(
-        ValueError, match="Agent 'auto-approve' is disabled by your organization."
+        ValueError,
+        match="Approval policy 'auto-approve' is disabled by your organization.",
     ):
-        agents.switch_profile("auto-approve")
+        agents.switch_policy("auto-approve")

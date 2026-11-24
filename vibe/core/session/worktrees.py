@@ -32,6 +32,7 @@ from vibe.core.git.worktree import (
     WorktreeRepository,
 )
 from vibe.core.git.worktree.naming_model import suggest_worktree_name
+from vibe.core.llm.utility_credentials import UtilityCredentialsFactory
 from vibe.core.telemetry.types import LaunchContext
 from vibe.core.trusted_folders import TrustedFoldersManager
 from vibe.observability.logging import logger
@@ -50,13 +51,18 @@ class CreateNamedWorktree:
 
     name: str
     branch: str | None = None
+    branch_off_in_use: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class CreateWorktreeForPrompt:
-    """Raise a worktree and let the naming model choose what to call it."""
+    """Raise a worktree and let the naming model choose what to call it.
+
+    A ``name`` the caller already has (the agent's, say) replaces the model.
+    """
 
     prompt: str | None = None
+    name: str | None = None
 
 
 type WorktreeRequest = (
@@ -82,11 +88,16 @@ class SessionWorktrees:
     """Every worktree question a session has to answer."""
 
     def __init__(
-        self, launch_context_getter: Callable[[], LaunchContext | None] | None = None
+        self,
+        launch_context_getter: Callable[[], LaunchContext | None] | None = None,
+        *,
+        naming_credentials: UtilityCredentialsFactory | None = None,
     ) -> None:
         # Read lazily: the client metadata only exists after the app-server
         # handshake, and naming runs on the session-start path.
         self._launch_context_getter = launch_context_getter
+        # The connection's credentials for the naming call; None reads the key.
+        self._naming_credentials = naming_credentials
 
     def _launch_context(self) -> LaunchContext | None:
         if self._launch_context_getter is None:
@@ -133,12 +144,18 @@ class SessionWorktrees:
                 ):
                     raise WorktreeError(f"Worktree is no longer available: {requested}")
                 return ResolvedWorktree(cwd=requested, pending_hold=pending_hold)
-            case CreateNamedWorktree(name=name, branch=branch):
+            case CreateNamedWorktree(
+                name=name, branch=branch, branch_off_in_use=branch_off
+            ):
                 with WorktreeRepository.open(
                     base_cwd, trust_store=trust_store, copy_on_write=copy_on_write
                 ) as repository:
                     created = repository.prepare(
-                        name, branch=branch, on_progress=on_progress, base=base
+                        name,
+                        branch=branch,
+                        on_progress=on_progress,
+                        base=base,
+                        branch_in_use="branch_off" if branch_off else "fail",
                     )
             case CreateWorktreeForPrompt(prompt=prompt):
                 with WorktreeRepository.open(
@@ -320,10 +337,15 @@ class SessionWorktrees:
         """
         if not isinstance(request, CreateWorktreeForPrompt):
             return None
+        if request.name is not None:
+            return request.name
         if request.prompt and on_progress is not None:
             on_progress(WorktreeCreationProgress(WorktreeCreationPhase.NAMING))
         return await suggest_worktree_name(
-            request.prompt, cwd=base_cwd, launch_context=self._launch_context()
+            request.prompt,
+            cwd=base_cwd,
+            launch_context=self._launch_context(),
+            credentials=self._naming_credentials,
         )
 
     @staticmethod

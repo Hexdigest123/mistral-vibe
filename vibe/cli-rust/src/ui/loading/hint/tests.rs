@@ -1,8 +1,6 @@
-use std::time::Instant;
-
 use serde_json::json;
 
-use super::{push, running, starting, CANCEL_LAST_QUEUED};
+use super::{push, queue, running, CANCEL_LAST_QUEUED};
 use crate::app::{App, Status};
 use crate::message_queue::QueueItem;
 
@@ -40,27 +38,36 @@ fn busy_app(status: Status) -> App {
 #[test]
 fn composer_queue_hints_need_the_composer_to_own_the_keys() {
     let mut app = busy_app(Status::Generating {
-        since: Instant::now(),
+        since: crate::clock::now(),
     });
-    assert_eq!(
-        running(&app),
-        [("Esc", "interrupt"), ("Enter", "steer"), CANCEL_LAST_QUEUED]
-    );
+    assert_eq!(running(&app), [("Esc", "interrupt")]);
+    assert_eq!(queue(&app), [("Enter", "steer"), CANCEL_LAST_QUEUED]);
 
-    app.subagents.list.focused = true;
+    app.rail.focused = true;
+    assert!(
+        running(&app).is_empty(),
+        "Ctrl+C cancels a queued prompt first"
+    );
     assert_eq!(
-        running(&app),
+        queue(&app),
         [CANCEL_LAST_QUEUED],
-        "the list takes Esc and Enter; Ctrl+C still cancels"
+        "the rail takes Esc and Enter; Ctrl+C still cancels"
     );
     app.queue.items.clear();
     assert_eq!(running(&app), [("Ctrl+C", "interrupt")]);
+    assert!(queue(&app).is_empty());
+
+    app.subagents.list.focused = true;
+    assert!(
+        running(&app).is_empty(),
+        "Ctrl+C closes the open list first"
+    );
 }
 
 #[test]
 fn the_focused_list_advertises_only_the_ctrl_c_step_that_runs() {
     let mut app = busy_app(Status::Generating {
-        since: Instant::now(),
+        since: crate::clock::now(),
     });
     app.subagents.list.focused = true;
     app.chat_input.input = "draft".into();
@@ -85,10 +92,8 @@ fn the_focused_list_advertises_only_the_ctrl_c_step_that_runs() {
 #[test]
 fn a_picker_opened_during_a_turn_hides_the_interrupt_hints() {
     let mut app = busy_app(Status::Generating {
-        since: Instant::now(),
+        since: crate::clock::now(),
     });
-    app.vibe_code_project.pending = true;
-    assert!(running(&app).is_empty(), "Esc cancels the opening picker");
     app.question_app.open = true;
     assert_eq!(
         running(&app),
@@ -96,7 +101,6 @@ fn a_picker_opened_during_a_turn_hides_the_interrupt_hints() {
         "a question keeps them"
     );
     app.question_app.open = false;
-    app.vibe_code_project.pending = false;
     app.theme_picker.open = true;
     assert!(running(&app).is_empty());
 
@@ -109,12 +113,26 @@ fn a_picker_opened_during_a_turn_hides_the_interrupt_hints() {
 }
 
 #[test]
+fn vim_insert_mode_takes_esc_so_only_ctrl_c_interrupts() {
+    let mut app = busy_app(Status::Generating {
+        since: crate::clock::now(),
+    });
+    app.vim.enabled = true;
+    assert!(running(&app).is_empty());
+    assert_eq!(queue(&app), [("Enter", "steer"), CANCEL_LAST_QUEUED]);
+    app.queue.items.clear();
+    assert_eq!(running(&app), [("Ctrl+C", "interrupt")]);
+    app.vim.mode = crate::vim::Mode::Normal;
+    assert_eq!(running(&app), [("Esc/Ctrl+C", "interrupt")]);
+}
+
+#[test]
 fn startup_cancellation_needs_the_composer_to_own_the_keys() {
     let mut app = busy_app(Status::Starting);
-    assert_eq!(starting(&app), [CANCEL_LAST_QUEUED]);
+    assert_eq!(queue(&app), [CANCEL_LAST_QUEUED]);
 
     app.model_picker.open = true;
-    assert!(starting(&app).is_empty(), "the picker owns the keys");
+    assert!(queue(&app).is_empty(), "the picker owns the keys");
 }
 
 #[test]

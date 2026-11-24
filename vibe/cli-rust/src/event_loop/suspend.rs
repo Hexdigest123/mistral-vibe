@@ -29,9 +29,7 @@ pub(super) fn suspend_once(
         let _ = out.flush();
     }
     let suspend = signal::suspend_defaults();
-    // kill returns only after SIGCONT resumes us; -1 means the signal never
-    // went out and the process never stopped.
-    let suspended = unsafe { libc::kill(0, libc::SIGTSTP) } == 0;
+    let suspended = crate::job_control::stop_job();
     // A backgrounded resume (`bg` instead of `fg`) stops us again by
     // SIGTTOU/SIGTTIN mid-call, and the next `bg` returns EINTR from the
     // interrupted terminal call; retry it like crossterm's own reader does.
@@ -48,6 +46,7 @@ pub(super) fn suspend_once(
     }
     app.terminal_notifier.invalidate_title();
     app.terminal_notifier.invalidate_program_status();
+    crate::tmux_hint::refresh(app);
     retry_eintr::<()>(|| crate::terminal::repaint(terminal).map_err(Into::into))?;
     if !suspended {
         let id = format!("rs-suspend-failed-{}", app.view.transcript.revision());

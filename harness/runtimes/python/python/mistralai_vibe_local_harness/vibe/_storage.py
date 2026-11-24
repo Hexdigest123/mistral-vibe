@@ -10,8 +10,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 import hashlib
+import io
+from itertools import compress, count, filterfalse, repeat
 import json
 import logging
+from operator import indexOf, is_not
 import os
 from pathlib import Path
 import re
@@ -19,7 +22,9 @@ import secrets
 import shutil
 from stat import S_ISREG
 from threading import RLock
-from typing import Annotated, Any, Literal, Self, cast
+import time
+from typing import Annotated, Any, Literal, Self, assert_never, cast
+import zlib
 
 from pydantic import (
     BaseModel,
@@ -29,6 +34,8 @@ from pydantic import (
     JsonValue,
     SerializerFunctionWrapHandler,
     TypeAdapter,
+    ValidationError,
+    ValidationInfo,
     WrapSerializer,
     field_validator,
     model_validator,
@@ -38,10 +45,12 @@ import rfc8785
 from mistralai_vibe_local_harness import HarnessSession
 from mistralai_vibe_local_harness.protocol import (
     RustAcceptedApplyResult,
+    RustActionDirective,
     RustActionsNextAction,
     RustAudioContentBlock,
     RustBackgroundProcessNotificationSource,
     RustCapabilitiesChange,
+    RustContentBlock,
     RustDispatchActionDirective,
     RustEmbeddedResourceContentBlock,
     RustHarnessCapabilitySet,
@@ -52,10 +61,16 @@ from mistralai_vibe_local_harness.protocol import (
     RustImageContentBlock,
     RustKeepActionDirective,
     RustLLMCallAction,
+    RustModelInputUpdate,
+    RustModelMessageReplace,
     RustModelToolCallPart,
+    RustModelToolCatalogKeep,
     RustNotificationEvent,
     RustPluginContextDefinition,
     RustPluginsChange,
+    RustPostToolCallHookAction,
+    RustPromptSettings,
+    RustProvidedToolDefinition,
     RustReasoningPart,
     RustReconfigureEvent,
     RustRefreshActionDirective,
@@ -64,6 +79,7 @@ from mistralai_vibe_local_harness.protocol import (
     RustSettingsChange,
     RustSystemInstructionsChange,
     RustTextContentBlock,
+    RustUserMessageEvent,
     parse_apply_result,
 )
 from mistralai_vibe_local_harness.session_protocol import (
@@ -79,9 +95,11 @@ from mistralai_vibe_local_harness.vibe._errors import (
     HarnessSessionBusyError,
     HarnessStoreRequiresNewerReaderError,
 )
+from mistralai_vibe_local_harness.vibe._paths import PRIVATE_DIRECTORY_MODE
 from mistralai_vibe_local_harness.vibe._process_actions import (
     process_id as expected_process_id,
 )
+from mistralai_vibe_local_harness.vibe._public_content import public_content_block
 from mistralai_vibe_local_harness.vibe._subagents import (
     ActiveSessionLifecycle,
     ForkSessionIdentity,
@@ -92,6 +110,10 @@ from mistralai_vibe_local_harness.vibe._subagents import (
     SubagentRuntimeState,
     SubagentSessionIdentity,
 )
+from mistralai_vibe_local_harness.vibe._tool_schemas import (
+    taking_objects_only,
+    type_is_not_object,
+)
 from mistralai_vibe_local_harness.vibe.completion_profile import (
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_IMAGE_TOKENS,
@@ -100,7 +122,8 @@ from mistralai_vibe_local_harness.vibe.completion_profile import (
 )
 
 STORE_FORMAT = "mistral.vibe.unified-session-store/v1"
-# Readers accept lower minor versions and reject higher ones.
+# Readers accept minor versions up to READABLE_STORE_FORMAT_MINOR and reject higher
+# ones.
 # 2: projection deltas; 3: checkpoint-derived interop exports;
 # 4: chunked transcripts; 5: checkpoint capability baselines;
 # 6: self-describing reservations and abandoned receipts;
@@ -113,8 +136,15 @@ STORE_FORMAT = "mistral.vibe.unified-session-store/v1"
 # An additive field needs no bump: an older reader keeps what it cannot
 # interpret and writes it back. Bump only for a change an older reader must not
 # attempt, which is the one thing this number is allowed to mean.
-# Downgrading after a newer build writes the store is unsupported.
+# Downgrading after a newer build writes the store is unsupported, except to a
+# build that already reads that minor (READABLE_STORE_FORMAT_MINOR).
 STORE_FORMAT_MINOR = 10
+# 11, read ahead of being written: a generation names a pooled chunk held only
+# gzip-compressed, which a reader before 11 cannot find. It means that alone, so
+# this build writes 11 exactly while its generation names such a chunk and 10
+# once none is left; a reader-breaking change other than gzip chunks takes 12.
+_GZIP_CHUNKS_MINOR = 11
+READABLE_STORE_FORMAT_MINOR = _GZIP_CHUNKS_MINOR
 # A reader before this minor replays a missing baseline under its own configuration.
 _GENERATION_BASELINE_MINOR = 10
 # Sealing a chunk once its contents pass this size makes a chunk's identity a
@@ -124,7 +154,18 @@ _CHUNK_TARGET_BYTES = 64 * 1024
 _CHUNKS_DIRNAME = "chunks"
 _QUARANTINE_DIRNAME = "quarantine"
 logger = logging.getLogger(__name__)
-_CHUNK_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}\.json$")
+# A chunk is named by the digest of its uncompressed canonical bytes whatever its
+# codec: a pooled chunk is either plain ``<digest>.json`` or gzip-compressed
+# ``<digest>.json.gz``, so reuse and collection never depend on the codec and a
+# store holding both still reads.
+_CHUNK_FILE_PATTERN = re.compile(r"^([0-9a-f]{64})\.json(?:\.gz)?$")
+_COMPRESSED_CHUNK_SUFFIX = ".json.gz"
+_PLAIN_CHUNK_SUFFIX = ".json"
+_GZIP_WBITS = 31
+# A chunk is unbounded by the document cap: it holds one item past the seal
+# target, and an item can be large. This ceiling only stops a corrupt or hostile
+# gzip file from inflating without limit; a plain chunk has no limit at all.
+_MAX_INFLATED_CHUNK_BYTES = 1024 * 1024 * 1024
 # A load re-reads most of the transcript it read last time, so without a cache
 # the pool turns one document read into one read per chunk. Chunks are named by
 # their digest, so a cached body can never be stale; overflowing the budget
@@ -152,7 +193,11 @@ _JOURNAL_SEGMENT_PATTERN = re.compile(r"^[0-9]{16}\.jsonl$")
 _RETAINED_GENERATIONS = 2
 _MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 _MAX_SAFE_JSON_INTEGER = 2**53 - 1
-_CANONICAL_INTEGER_RANGE = range(-_MAX_SAFE_JSON_INTEGER, _MAX_SAFE_JSON_INTEGER + 1)
+# ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION, raised while another process
+# holds the file open; six attempts wait about 1.5 s in total.
+_WINDOWS_TRANSIENT_ERRORS = frozenset({5, 32})
+_WINDOWS_REPLACE_ATTEMPTS = 6
+_WINDOWS_REPLACE_BASE_DELAY_SECONDS = 0.05
 
 type Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 type Generation = Annotated[str, Field(pattern=r"^[0-9]{16}$")]
@@ -256,7 +301,14 @@ def _fill_program_time_limits(value: dict[str, Any]) -> dict[str, Any]:
 def _fill_stored_settings(value: object) -> object:
     if not isinstance(value, dict):
         return value
-    return _fill_model_facts(_fill_program_time_limits(value))
+    return _fill_stock_prompts(_fill_model_facts(_fill_program_time_limits(value)))
+
+
+def _fill_stock_prompts(settings: dict[str, object]) -> dict[str, object]:
+    """Stored settings leave the stock guidance out; absent reads back as it."""
+    if "prompts" in settings:
+        return settings
+    return {**settings, "prompts": _STOCK_PROMPTS}
 
 
 def _fill_stored_input_settings(value: object) -> object:
@@ -339,14 +391,78 @@ def _drop_commits_without_call(value: object) -> object:
     return {**value, "observations": kept}
 
 
+def _without_stock_prompts(settings: object) -> object:
+    """Settings without their prompt choice while it is the stock guidance.
+
+    Absent reads back as the stock guidance, and a build whose settings predate
+    the prompt choice can then still load the document.
+    """
+    if not isinstance(settings, dict) or settings.get("prompts") != _STOCK_PROMPTS:
+        return settings
+    return {key: value for key, value in settings.items() if key != "prompts"}
+
+
+_STOCK_PROMPTS = RustPromptSettings(guidance="stock").model_dump(
+    mode="json", by_alias=True
+)
+
+
+def _dump_stored_settings(
+    settings: RustHarnessSettings, handler: SerializerFunctionWrapHandler
+) -> object:
+    return _without_stock_prompts(handler(settings))
+
+
+def _dump_stored_input(
+    value: RustHarnessInput, handler: SerializerFunctionWrapHandler
+) -> object:
+    """Store an input with each reconfigured setting's stock prompts left out."""
+    dumped = handler(value)
+    if not isinstance(dumped, dict):
+        return dumped
+    command = dumped.get("command")
+    if not isinstance(command, dict) or command.get("type") != "reconfigure":
+        return dumped
+    changes = command.get("changes")
+    if not isinstance(changes, list):
+        return dumped
+    stored = [
+        {**change, "value": _without_stock_prompts(change.get("value"))}
+        if isinstance(change, dict) and change.get("type") == "settings"
+        else change
+        for change in changes
+    ]
+    return {**dumped, "command": {**command, "changes": stored}}
+
+
 type StoredHarnessSettings = Annotated[
-    RustHarnessSettings, BeforeValidator(_fill_stored_settings)
+    RustHarnessSettings,
+    BeforeValidator(_fill_stored_settings),
+    WrapSerializer(_dump_stored_settings),
 ]
 type StoredHarnessInput = Annotated[
-    RustHarnessInput, BeforeValidator(_fill_stored_input)
+    RustHarnessInput,
+    BeforeValidator(_fill_stored_input),
+    WrapSerializer(_dump_stored_input),
 ]
+
+
+def _dump_stored_transition(
+    transition: RustSessionTransition, handler: SerializerFunctionWrapHandler
+) -> object:
+    """Store a transition without its model inputs or the fields that route a call's span.
+
+    This Runtime never reads them from a restored transition, and a build whose
+    Core predates them can then still load the document that holds it.
+    """
+    stored = _without_model_inputs(transition) or transition
+    return handler(_without_tool_call_routing(stored) or stored)
+
+
 type StoredSessionTransition = Annotated[
-    RustSessionTransition, BeforeValidator(_drop_commits_without_call)
+    RustSessionTransition,
+    BeforeValidator(_drop_commits_without_call),
+    WrapSerializer(_dump_stored_transition),
 ]
 
 
@@ -408,7 +524,7 @@ class CurrentPointerV1(_StoredModel):
         minor = document.get("store_format_minor")
         if isinstance(minor, bool) or not isinstance(minor, int):
             return None
-        return minor if minor > STORE_FORMAT_MINOR else None
+        return minor if minor > READABLE_STORE_FORMAT_MINOR else None
 
 
 class StoredFileV1(_StoredModel):
@@ -521,19 +637,28 @@ class CommandReceiptV1(_StoredModel):
         return self
 
 
-_PRUNABLE_ACTION_KINDS: frozenset[str] = frozenset({
+_RELEASABLE_ACTION_KINDS: frozenset[str] = frozenset({
     "completion",
     "tool",
     "hook",
+    "process",
     "callback",
     "child",
     "filesystem",
 })
-"""Kinds whose settled bodies no reader needs once Core has released the Action.
+"""Kinds ``_release_settled_actions`` may drop once settled and released by Core.
 
-Naming them rather than excluding ``process`` keeps this fail-closed: a kind added
-to the Literal is unprunable until someone audits its read-back paths and lists it
-here, and ``test_every_action_kind_is_classified_for_pruning`` fails until they do.
+Naming kinds keeps the release fail-closed: a kind added to the Literal is kept
+until someone audits its read-back paths and lists it here, and
+``test_every_action_kind_is_classified_for_release`` fails until they do.
+"""
+
+_BODY_PRUNABLE_ACTION_KINDS: frozenset[str] = _RELEASABLE_ACTION_KINDS - {"process"}
+"""Kinds whose entries may carry ``request_pruned`` or ``result_pruned``.
+
+Generations once kept every settled entry and dropped only its bodies, never a
+process Action's; such entries still load and are released at the next
+publication.
 """
 
 
@@ -554,16 +679,17 @@ class RuntimeActionV1(_StoredModel):
     prepared_process_start: PreparedProcessStartV1 | None = None
     result: JsonValue = None
     request_pruned: bool = False
-    """Whether a settled Action's ``request`` was dropped.
+    """Whether a settled Action's ``request`` was dropped while its entry was kept.
 
-    ``request_sha256`` still describes the original request. Generations written
-    before this field existed restore with it false and keep their request.
+    ``request_sha256`` still describes the original request. Such entries come
+    from generations that dropped bodies rather than whole settled entries; this
+    build releases them at its next publication unless recovery still needs them.
     """
     result_pruned: bool = False
     """Whether a settled Action's ``result`` was dropped.
 
     Only ``_resolve_action``'s redelivery short-circuit reads a result back, and
-    only for Actions Core still holds, which the prune excludes. The flag separates
+    only for Actions Core still holds, which were never pruned. The flag separates
     "pruned" from "never produced one" so that an unexpected read fails with an
     explanation instead of validating ``None``.
     """
@@ -573,7 +699,7 @@ class RuntimeActionV1(_StoredModel):
         if self.request_pruned:
             if self.request is not None:
                 raise ValueError("a pruned action request must be empty")
-            if self.kind not in _PRUNABLE_ACTION_KINDS:
+            if self.kind not in _BODY_PRUNABLE_ACTION_KINDS:
                 raise ValueError(f"a {self.kind} action request cannot be pruned")
             if self.state in {"pending", "running"}:
                 raise ValueError("an unsettled action request cannot be pruned")
@@ -582,7 +708,7 @@ class RuntimeActionV1(_StoredModel):
         if self.result_pruned:
             if self.result is not None:
                 raise ValueError("a pruned action result must be empty")
-            if self.kind not in _PRUNABLE_ACTION_KINDS:
+            if self.kind not in _BODY_PRUNABLE_ACTION_KINDS:
                 raise ValueError(f"a {self.kind} action result cannot be pruned")
             if self.state in {"pending", "running"}:
                 raise ValueError("an unsettled action result cannot be pruned")
@@ -757,6 +883,7 @@ class SessionPin(StrEnum):
 
     ACTIVE_MODEL = "active_model"
     AGENT_NAME = "agent_name"
+    APPROVAL_POLICY = "approval_policy"
     REASONING_EFFORT = "reasoning_effort"
     COMPLETION_CATALOGUE = "completion_catalogue"
 
@@ -776,9 +903,12 @@ class SessionMetadataV1(_StoredModel):
     origin_cwd: str | None = None
     # The concrete model alias pinned to the session; see ``SessionPin``.
     active_model: str | None = None
-    # The running mode (agent profile name) the session is in. Backward-compatible:
-    # older snapshots load as ``None`` and keep their configured default agent.
+    # The agent the session runs. Before agents and approval policies split it
+    # held the policy too, so a session with no ``approval_policy`` reads a
+    # policy name here as its policy, and one on the default agent still writes
+    # its policy here for builds that predate the split.
     agent_name: str | None = None
+    approval_policy: str | None = None
     reasoning_effort: str | None = None
     # What the provider's catalogue said about the active model, as JSON, so a
     # reopen reuses it instead of asking again.
@@ -870,28 +1000,51 @@ class _RuntimeStateBase(_StoredModel):
 
     @property
     def quiescent(self) -> bool:
-        return not (
-            any(receipt.state == "reserved" for receipt in self.command_receipts)
-            or any(action.state in {"pending", "running"} for action in self.actions)
-            or any(callback.state == "pending" for callback in self.callbacks)
-            or any(
-                operation.state in {"pending", "running"}
-                for operation in self.provider_operations
-            )
-            or any(process.status == "running" for process in self.processes)
-            or any(
-                process.status != "running"
-                and not any(
-                    submitted.process_id == process.process_id
-                    for submitted in self.submitted_process_notifications
+        return next(self._iter_unsettled_work(), None) is None
+
+    def unsettled_work(self) -> tuple[str, ...]:
+        """Describe, for a user, each piece of work that keeps the session from
+        being quiescent; the session is quiescent when there is none.
+        """
+        return tuple(dict.fromkeys(self._iter_unsettled_work()))
+
+    def _iter_unsettled_work(self) -> Iterator[str]:
+        # Lazy, so `quiescent` stops at the first piece of work it finds.
+        for receipt in self.command_receipts:
+            if receipt.state == "reserved":
+                yield _describe_reserved_command(receipt.method)
+        for action in self.actions:
+            if action.state in {"pending", "running"}:
+                yield _describe_unsettled_action(action)
+        for callback in self.callbacks:
+            if callback.state == "pending":
+                yield _describe_pending_callback(callback.kind)
+        for operation in self.provider_operations:
+            if operation.state in {"pending", "running"}:
+                yield "a model call is still running"
+        for process in self.processes:
+            if process.status == "running":
+                yield (
+                    f"the background process {_quoted_command(process.command)} "
+                    "is still running"
                 )
-                for process in self.processes
-            )
-            or any(
-                child.stateful and child.state in {"pending", "running"}
-                for child in self.children
-            )
-        )
+        submitted = {item.process_id for item in self.submitted_process_notifications}
+        for process in self.processes:
+            if process.status != "running" and process.process_id not in submitted:
+                yield (
+                    f"the background process {_quoted_command(process.command)} "
+                    "has ended, but the agent has not been told yet"
+                )
+        running_children = [
+            child
+            for child in self.children
+            if child.stateful and child.state in {"pending", "running"}
+        ]
+        if not running_children:
+            return
+        actions = {action.action_id: action for action in self.actions}
+        for child in running_children:
+            yield _describe_running_child(actions.get(child.session_id))
 
 
 class RuntimeStateV3(_RuntimeStateBase):
@@ -982,9 +1135,10 @@ class RuntimeStateV3(_RuntimeStateBase):
                 receipt.validate_child_ownership(self.identity)
         return self
 
-    @property
-    def quiescent(self) -> bool:
-        return self.pending_transition is None and super().quiescent
+    def _iter_unsettled_work(self) -> Iterator[str]:
+        if self.pending_transition is not None:
+            yield "the agent's last step is still being saved"
+        yield from super()._iter_unsettled_work()
 
 
 def _load_stored_public_state(value: object) -> object:
@@ -998,7 +1152,47 @@ def _load_stored_public_state(value: object) -> object:
                 items=[], paused=False, max_items=TURN_QUEUE_MAX_ITEMS
             ),
         }
+    if isinstance(value, dict):
+        value = _with_public_imported_blocks(value)
     return PublicSessionState.model_validate(value, extra="allow")
+
+
+def _with_public_imported_blocks(state: dict[str, Any]) -> dict[str, Any]:
+    """Repair the image and link blocks imports and forks stored as Core blocks.
+
+    Imports and forks once stored those message blocks in the Core's shape,
+    which public history readers reject: the session could be neither read
+    nor deleted. Every other block is kept as stored.
+    """
+    history = state.get("history")
+    if not isinstance(history, dict):
+        return state
+    entries = cast(dict[str, Any], history).get("entries")
+    if not isinstance(entries, list):
+        return state
+    repaired = [
+        {**entry, "content": [_public_imported_block(block) for block in content]}
+        if isinstance(entry, dict)
+        and entry.get("type") == "message"
+        and isinstance(content := entry.get("content"), list)
+        else entry
+        for entry in entries
+    ]
+    return {**state, "history": {**history, "entries": repaired}}
+
+
+_CORE_CONTENT_BLOCK: TypeAdapter[RustContentBlock] = TypeAdapter(RustContentBlock)
+
+
+def _public_imported_block(block: object) -> object:
+    if not isinstance(block, dict):
+        return block
+    stored_as_core = block.get("type") == "resource_link" or (
+        block.get("type") == "image" and "attachment" not in block
+    )
+    if not stored_as_core:
+        return block
+    return public_content_block(_CORE_CONTENT_BLOCK.validate_python(block))
 
 
 def _dump_stored_public_state(
@@ -1046,12 +1240,375 @@ StoredPublicSessionState = Annotated[
 ]
 
 
+class SparseHistoryPositionsV1(_StoredModel):
+    """Session API history positions saved without those history order gives.
+
+    Walking the saved history in order, an entry absent from ``positions``
+    takes the position right after the entry before it, and the first entry
+    takes 0. ``positions`` keeps the others, and those of entries the saved
+    history does not hold. ``next_index`` is the position of the next new
+    entry.
+    """
+
+    positions: dict[str, int] = Field(default_factory=dict)
+    next_index: int = Field(default=0, ge=0)
+    history_sha256: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """Digest of the saved history's entries, in order, when positions follow it.
+
+    A build that rewrites the history without knowing this form leaves it
+    stale; the positions are then dropped rather than read against another
+    history.
+    """
+
+
+class SessionApiFactsV1(_StoredModel):
+    """Session API facts the public snapshot cannot rebuild.
+
+    ``history_positions`` fixes each entry's Session API index; a tool entry
+    holds one for its call and one for its result. ``turn_outcomes`` keeps how
+    each Turn ended after the snapshot's latest Turn moves on. A journal record
+    carries only the facts its advance added; folding merges them.
+
+    A document saves these facts in a smaller form (``_saved_session_api``),
+    and the models that load one convert it back (``_loaded_session_api``), so
+    every instance holds every fact.
+    """
+
+    metadata_version: Literal[1] = 1
+    next_history_index: int = Field(default=0, ge=0)
+    history_positions: dict[str, int] = Field(default_factory=dict)
+    turn_outcomes: dict[str, JsonObject] = Field(default_factory=dict)
+    message_receipts: dict[str, JsonObject] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
+    """Accepted ``message/send`` results by idempotency key."""
+    agent_config: JsonObject | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """The Session configuration last written through the Session API."""
+    tool_calls: dict[str, JsonObject] = Field(
+        default_factory=dict, exclude_if=lambda value: not value
+    )
+    """Original tool call ID and arguments by public tool entry ID."""
+
+    def merged(self, added: SessionApiFactsV1) -> SessionApiFactsV1:
+        return self.model_copy(
+            update={
+                "next_history_index": max(
+                    self.next_history_index, added.next_history_index
+                ),
+                "history_positions": {
+                    **self.history_positions,
+                    **added.history_positions,
+                },
+                "turn_outcomes": {**self.turn_outcomes, **added.turn_outcomes},
+                "message_receipts": {**self.message_receipts, **added.message_receipts},
+                "agent_config": (
+                    added.agent_config
+                    if added.agent_config is not None
+                    else self.agent_config
+                ),
+                "tool_calls": {**self.tool_calls, **added.tool_calls},
+            }
+        )
+
+
+def _fold_session_api_facts(
+    current: SessionApiFactsV1 | None, added: SessionApiFactsV1 | None
+) -> SessionApiFactsV1 | None:
+    if added is None:
+        return current
+    if current is None:
+        return added
+    return current.merged(added)
+
+
+_SPARSE_HISTORY_KEY = "sparse_history"
+# The validation context key of the set a load collects, across the projection
+# state and every journal record, the error types of the sparse positions it
+# drops, so that it warns once.
+_UNREADABLE_SPARSE_HISTORY_KEY = "unreadable_sparse_history"
+"""The saved form of ``history_positions`` and ``next_history_index``.
+
+Saved documents hold positions there and leave the two fields empty, unless an
+entry of the saved history has no position. A build that does not know the key
+then numbers the whole history again in order, rather than numbering entries
+it has no position for after the ones it has.
+"""
+
+
+def _saved_session_api(
+    facts: SessionApiFactsV1, snapshot: PublicSessionState | None
+) -> JsonObject:
+    """``facts`` as a document saves them, beside ``snapshot``.
+
+    Leaves out the Turn outcomes a load gives back from the saved history
+    (``_restored_turn_outcomes``) and moves the positions to the sparse form
+    (``_sparse_positions``). A journal record has no snapshot beside it and
+    keeps every outcome and every position.
+    """
+    document = cast(JsonObject, facts.model_dump(mode="json", by_alias=True))
+    document.pop(_SPARSE_HISTORY_KEY, None)
+    entries = snapshot.history.entries if snapshot is not None else None
+    if snapshot is not None:
+        restored = _restored_turn_outcomes(snapshot)
+        document["turn_outcomes"] = {
+            turn_id: outcome
+            for turn_id, outcome in facts.turn_outcomes.items()
+            if restored.get(turn_id) != outcome
+        }
+    sparse = _sparse_positions(facts, entries)
+    if sparse is not None and (sparse.positions or sparse.next_index):
+        document |= {
+            "history_positions": {},
+            "next_history_index": 0,
+            _SPARSE_HISTORY_KEY: cast(
+                JsonValue, sparse.model_dump(mode="json", by_alias=True)
+            ),
+        }
+    return document
+
+
+def _loaded_session_api(
+    value: object, snapshot: PublicSessionState | None, unreadable: set[str]
+) -> object:
+    """The facts a document saved beside ``snapshot``, every one of them.
+
+    Undoes ``_saved_session_api``. When the history is no longer the one the
+    positions were saved against, because a build that does not know the
+    sparse form rewrote it, the positions are dropped: the Session API view
+    numbers the history again in order, as that build does. Positions saved in
+    a shape this build cannot read are dropped too, and their error types
+    added to ``unreadable``. Anything but a saved document passes through to
+    validation.
+    """
+    if not isinstance(value, dict):
+        return value
+    document = dict(cast(JsonObject, value))
+    saved_sparse = document.pop(_SPARSE_HISTORY_KEY, None)
+    facts = SessionApiFactsV1.model_validate(document)
+    entries = snapshot.history.entries if snapshot is not None else None
+    if saved_sparse is not None and not facts.history_positions:
+        # Otherwise a build that does not know the sparse form numbered the
+        # history again and saved every position it gave: those are shown.
+        sparse = _readable_sparse_positions(saved_sparse, unreadable)
+        positions = _dense_positions(sparse, entries) if sparse is not None else None
+        if sparse is not None and positions is not None:
+            facts = facts.model_copy(
+                update={
+                    "history_positions": positions,
+                    "next_history_index": max([
+                        sparse.next_index,
+                        *(position + 1 for position in positions.values()),
+                    ]),
+                }
+            )
+    if snapshot is not None:
+        facts = facts.model_copy(
+            update={
+                "turn_outcomes": {
+                    **_restored_turn_outcomes(snapshot),
+                    **facts.turn_outcomes,
+                }
+            }
+        )
+    return facts
+
+
+def _readable_sparse_positions(
+    saved: JsonValue, unreadable: set[str]
+) -> SparseHistoryPositionsV1 | None:
+    """``saved`` as sparse positions, or None if a later build gave it a shape this one cannot read.
+
+    The error types of a shape it cannot read are added to ``unreadable``.
+    """
+    try:
+        return SparseHistoryPositionsV1.model_validate(saved)
+    except ValidationError as error:
+        # Only the error types: the saved values name history entries.
+        unreadable.update(detail["type"] for detail in error.errors())
+        return None
+
+
+def _warn_unreadable_sparse_positions(session_id: str, unreadable: set[str]) -> None:
+    """Warn once that a load of ``session_id`` dropped positions it could not read."""
+    if not unreadable:
+        return
+    error_types = sorted(unreadable)
+    logger.warning(
+        "Saved Session API history positions of session %s are unreadable "
+        "(%s); dropping them",
+        session_id,
+        ", ".join(error_types),
+        extra={"session_id": session_id, "error_types": error_types},
+    )
+
+
+def _unreadable_sparse_history(info: ValidationInfo) -> set[str]:
+    """The set the running load collects dropped positions' error types in.
+
+    A validation without one (a record or document this build has just
+    written, which it can always read) gets a set nobody reads.
+    """
+    context = info.context if isinstance(info.context, dict) else {}
+    unreadable = context.get(_UNREADABLE_SPARSE_HISTORY_KEY)
+    return unreadable if isinstance(unreadable, set) else set()
+
+
+def _sparse_positions(
+    facts: SessionApiFactsV1, entries: Sequence[JsonObject] | None
+) -> SparseHistoryPositionsV1 | None:
+    """The positions of ``facts`` without those history order gives.
+
+    Keeps the positions of entries ``entries`` does not hold: one may still
+    come back, such as streamed output the saved history leaves out. None when
+    an entry of ``entries`` has no position: history order would give it one
+    the Session API never showed.
+    """
+    from mistralai_vibe_local_harness.vibe._session_api_entries import (
+        history_position_ids,
+    )
+
+    positions = facts.history_positions
+    kept: dict[str, int] = {}
+    walked: list[str] = []
+    expected = 0
+    for raw in entries or ():
+        for api_id in history_position_ids(raw):
+            position = positions.get(api_id)
+            if position is None:
+                return None
+            if position != expected:
+                kept[api_id] = position
+            expected = position + 1
+            walked.append(api_id)
+    seen = set(walked)
+    kept |= {
+        api_id: position for api_id, position in positions.items() if api_id not in seen
+    }
+    return SparseHistoryPositionsV1(
+        positions=kept,
+        next_index=facts.next_history_index,
+        history_sha256=_walk_sha256(walked) if entries is not None else None,
+    )
+
+
+def _dense_positions(
+    sparse: SparseHistoryPositionsV1, entries: Sequence[JsonObject] | None
+) -> dict[str, int] | None:
+    """Every position ``sparse`` saved beside ``entries``, or None if they are stale."""
+    from mistralai_vibe_local_harness.vibe._session_api_entries import (
+        history_position_ids,
+    )
+
+    positions = dict(sparse.positions)
+    walked: list[str] = []
+    expected = 0
+    for raw in entries or ():
+        for api_id in history_position_ids(raw):
+            position = sparse.positions.get(api_id, expected)
+            positions.setdefault(api_id, position)
+            expected = position + 1
+            walked.append(api_id)
+    if sparse.history_sha256 is not None and (
+        _walk_sha256(walked) != sparse.history_sha256
+    ):
+        return None
+    return positions
+
+
+def _restored_turn_outcomes(snapshot: PublicSessionState) -> dict[str, JsonObject]:
+    """The outcome a load gives each Turn of the saved history that has none saved.
+
+    A Turn simply completed, from its first entry's creation to its last
+    entry's update, which is also how a build that does not restore outcomes
+    reads a Turn without one. A save leaves out an outcome only when it equals
+    this one, and a load gives it back from the same history, so the outcome
+    stays fixed even if a later rewind removes some of the Turn's entries. The
+    snapshot's latest Turn is not restored: its outcome is always saved, and
+    while it runs it has none.
+    """
+    # The Session API modules load on first use, as in ``fact_recorder``: only a
+    # Session that saved facts gets here.
+    from mistralai_vibe_local_harness.session_api.app_server.session.models import (
+        CompletedTermination,
+    )
+    from mistralai_vibe_local_harness.vibe._session_api_entries import (
+        history_position_ids,
+    )
+
+    latest = snapshot.latest_turn
+    latest_id = latest.id if latest is not None else None
+    times: dict[str, tuple[int, int]] = {}
+    for raw in snapshot.history.entries:
+        turn_id = raw.get("turnId")
+        if (
+            not isinstance(turn_id, str)
+            or turn_id == latest_id
+            or not history_position_ids(raw)
+        ):
+            continue
+        created = _int_or(raw.get("createdAt"), 0)
+        updated = _int_or(raw.get("updatedAt"), created)
+        first, last = times.get(turn_id, (created, updated))
+        times[turn_id] = (min(first, created), max(last, updated))
+    completed = cast(
+        JsonValue, CompletedTermination().model_dump(mode="json", by_alias=True)
+    )
+    return {
+        turn_id: {"startedAt": first, "completedAt": last, "termination": completed}
+        for turn_id, (first, last) in times.items()
+    }
+
+
+def _int_or(value: object, default: int) -> int:
+    return value if isinstance(value, int) else default
+
+
+def _walk_sha256(api_ids: Sequence[str]) -> str:
+    return hashlib.sha256("\n".join(api_ids).encode()).hexdigest()
+
+
+def _load_journal_session_api(value: object, info: ValidationInfo) -> object:
+    return _loaded_session_api(value, None, _unreadable_sparse_history(info))
+
+
+def _dump_journal_session_api(
+    facts: SessionApiFactsV1 | None, handler: SerializerFunctionWrapHandler
+) -> object:
+    return handler(facts) if facts is None else _saved_session_api(facts, None)
+
+
+# The Session API facts a journal record carries, in the saved form on disk.
+JournalSessionApiFacts = Annotated[
+    SessionApiFactsV1 | None,
+    BeforeValidator(_load_journal_session_api),
+    WrapSerializer(_dump_journal_session_api),
+]
+
+
 class ProjectionStateV1(_StoredModel):
     projection_state_version: Literal[1] = 1
     session_id: str
     snapshot_sequence: int = Field(ge=0)
     watermark: int = Field(ge=0)
     snapshot: StoredPublicSessionState
+    session_api: SessionApiFactsV1 | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """Dumped whole; ``write_generation`` saves it with ``_saved_session_api``."""
+
+    @field_validator("session_api", mode="before")
+    @classmethod
+    def _load_session_api(cls, value: object, info: ValidationInfo) -> object:
+        snapshot = info.data.get("snapshot")
+        return _loaded_session_api(
+            value,
+            snapshot if isinstance(snapshot, PublicSessionState) else None,
+            _unreadable_sparse_history(info),
+        )
 
 
 class AppendEntryOp(_StoredModel):
@@ -1144,16 +1701,24 @@ def compute_projection_delta(
     """
     prior_entries = prior.history.entries
     new_entries = new.history.entries
-    prior_by_id = {cast(str, entry.get("id")): entry for entry in prior_entries}
-    new_ids = {cast(str, entry.get("id")) for entry in new_entries}
-    entry_ops: list[ProjectionOp] = []
-    for entry in prior_entries:
-        entry_id = cast(str, entry.get("id"))
-        if entry_id not in new_ids:
-            entry_ops.append(RemoveEntryOp(id=entry_id))
-    for entry in new_entries:
-        entry_id = cast(str, entry.get("id"))
-        existing = prior_by_id.get(entry_id)
+    # The usual passes over a whole history run in C: builders replace what
+    # they change, so most entries are the very objects prior holds, and only
+    # the others take a Python step. A removal and the fallbacks below still
+    # take a Python step per entry. The ops are the ones a step-by-step
+    # comparison of every entry gives.
+    prior_ids = cast(list[str], list(projection_entry_ids(prior_entries)))
+    new_id_list = cast(list[str], list(projection_entry_ids(new_entries)))
+    prior_by_id = dict(zip(prior_ids, prior_entries, strict=True))
+    new_ids = set(new_id_list)
+    entry_ops: list[ProjectionOp] = [
+        RemoveEntryOp(id=entry_id)
+        for entry_id in filterfalse(new_ids.__contains__, prior_ids)
+    ]
+    existing_entries = list(map(prior_by_id.get, new_id_list))
+    for index in compress(count(), map(is_not, existing_entries, new_entries)):
+        entry_id = new_id_list[index]
+        entry = new_entries[index]
+        existing = existing_entries[index]
         if existing is None:
             entry_ops.append(AppendEntryOp(entry=entry))
         elif existing != entry:
@@ -1209,7 +1774,7 @@ def apply_projection_delta(
             case AppendEntryOp(entry=entry):
                 entries.append(entry)
             case ReplaceEntryOp(id=entry_id, entry=entry):
-                if not _replace_projection_entry(entries, entry_id, entry):
+                if not replace_projection_entry(entries, entry_id, entry):
                     raise ValueError("projection delta replaces an absent entry")
             case RemoveEntryOp(id=entry_id):
                 remaining = [item for item in entries if item.get("id") != entry_id]
@@ -1225,14 +1790,21 @@ def apply_projection_delta(
     )
 
 
-def _replace_projection_entry(
+def replace_projection_entry(
     entries: list[JsonObject], entry_id: str, replacement: JsonObject
 ) -> bool:
-    for index, entry in enumerate(entries):
-        if entry.get("id") == entry_id:
-            entries[index] = replacement
-            return True
-    return False
+    """Replace the first entry with entry_id, found in C."""
+    try:
+        index = indexOf(projection_entry_ids(entries), entry_id)
+    except ValueError:
+        return False
+    entries[index] = replacement
+    return True
+
+
+def projection_entry_ids(entries: Iterable[JsonObject]) -> Iterator[JsonValue]:
+    """Each entry's id, or None, read in C."""
+    return map(dict.get, entries, repeat("id"))
 
 
 class UnifiedInteropSourceV1(_StoredModel):
@@ -1513,6 +2085,9 @@ class ProjectionAdvancedPayloadV1(_StoredModel):
 class ProjectionDeltaPayloadV1(_StoredModel):
     watermark: int = Field(ge=0)
     delta: ProjectionDelta
+    session_api: JournalSessionApiFacts = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class SessionRelocatedPayloadV1(_StoredModel):
@@ -1797,7 +2372,9 @@ class StoredSession:
         if self.runtime_state.core_task_id is not None:
             pinned["task_id"] = self.runtime_state.core_task_id
         if self.checkpoint_capabilities is not None:
-            pinned["capabilities"] = self.checkpoint_capabilities
+            pinned["capabilities"] = _with_dropped_integration_tools_restricted(
+                self.checkpoint_capabilities, config.capabilities
+            )
         if self.checkpoint_settings is not None:
             pinned["settings"] = self.checkpoint_settings
         if self.checkpoint_plugins is not None:
@@ -1840,7 +2417,11 @@ class StoredSession:
             for change in command.changes:
                 match change:
                     case RustCapabilitiesChange(value=value):
-                        updates["capabilities"] = value
+                        updates["capabilities"] = (
+                            _with_dropped_integration_tools_restricted(
+                                value, config.capabilities
+                            )
+                        )
                     case RustSettingsChange(value=value):
                         updates["settings"] = value
                     case RustPluginsChange(value=value):
@@ -1894,10 +2475,13 @@ class StoredSession:
         for record in self.journal:
             if not isinstance(record, CoreInputRecordV1):
                 continue
+            replayed_input = _with_dropped_integration_tools_restricted_in_input(
+                record.payload.input, config.capabilities
+            )
             result = parse_apply_result(
                 core.apply(
                     canonical_json(
-                        record.payload.input.model_dump(mode="json", by_alias=True)
+                        replayed_input.model_dump(mode="json", by_alias=True)
                     ).decode()
                 )
             )
@@ -1976,7 +2560,9 @@ class SessionLease:
         if self._file is not None:
             raise RuntimeError("session lease is already acquired")
         _reject_symlink_components(self._path.parents[1], self._path.parent)
-        self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._path.parent.mkdir(
+            mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True
+        )
         with _lease_directory_lock(self._path.parent):
             _sweep_once(self._path.parent)
             self._path.touch(mode=0o600, exist_ok=True)
@@ -2156,13 +2742,23 @@ class ProjectionTail:
     """The newest public history of a stored session, read without a full load.
 
     ``projection_state`` is the published projection with its history cut to
-    at most the requested number of newest entries.
+    at most the requested number of newest entries, and without Session API
+    facts: those are read against the whole history.
     """
 
     projection_state: ProjectionStateV1
     session_metadata: SessionMetadataV1
     before: str | None
     """Id of the newest entry older than the tail, or None when the tail is all of it."""
+
+
+@dataclass(frozen=True, slots=True)
+class HeldGeneration:
+    session: StoredSession
+    current_sha256: str
+    journal_path: str
+    journal_size: int
+    journal_mtime_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -2226,6 +2822,7 @@ class ChunkPublicationStats:
     reused: int = 0
     bytes_written: int = 0
     sealed: int = 0
+    reused_compressed_only: int = 0
 
     def __add__(self, other: ChunkPublicationStats) -> ChunkPublicationStats:
         return ChunkPublicationStats(
@@ -2233,6 +2830,8 @@ class ChunkPublicationStats:
             reused=self.reused + other.reused,
             bytes_written=self.bytes_written + other.bytes_written,
             sealed=self.sealed + other.sealed,
+            reused_compressed_only=self.reused_compressed_only
+            + other.reused_compressed_only,
         )
 
 
@@ -2253,7 +2852,7 @@ class _ChunkCache:
         if cached is not None:
             self._bodies.move_to_end(digest)
             return cached
-        body = _read_document_body(chunk_root / f"{digest}.json")
+        body = _read_pooled_chunk(chunk_root, digest)
         if _sha256(body) != digest:
             raise ValueError(f"stored chunk digest mismatch: {digest}")
         self._admit(digest, body)
@@ -2293,6 +2892,9 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
         # transcript being published, so a stale or empty plan costs a re-chunk
         # and never correctness.
         self._chunk_plans: dict[str, _ChunkPlan] = {}
+        self._serialized_catalog: tuple[RustHarnessCapabilitySet, JsonValue] | None = (
+            None
+        )
         self._chunk_cache = _ChunkCache()
         self.last_publication = ChunkPublicationStats()
         self.last_load_bytes = 0
@@ -2333,8 +2935,10 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
             # that introduced it, without walking the transcript every turn.
             checkpoint_messages(checkpoint)
         runtime_state = _discard_provider_operation_results(runtime_state)
+        runtime_state = _discard_model_inputs(runtime_state)
         if core_action_ids is not None:
-            runtime_state = _prune_settled_action_bodies(runtime_state, core_action_ids)
+            runtime_state = _release_settled_actions(runtime_state, core_action_ids)
+            runtime_state = _release_settled_callbacks(runtime_state)
 
         generation_root = self.session_root / "generations"
         journal_root = self.session_root / "journal"
@@ -2343,18 +2947,25 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
         generation = _next_generation(generation_root, sequence)
         final_dir = generation_root / generation
         self._invalidate_cache()
-        self.session_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        generation_root.mkdir(mode=0o700, exist_ok=True)
-        journal_root.mkdir(mode=0o700, exist_ok=True)
+        self.session_root.mkdir(
+            mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True
+        )
+        generation_root.mkdir(mode=PRIVATE_DIRECTORY_MODE, exist_ok=True)
+        journal_root.mkdir(mode=PRIVATE_DIRECTORY_MODE, exist_ok=True)
         journal_path = journal_root / f"{sequence + 1:016d}.jsonl"
         _create_empty_file(journal_path)
 
         chunk_root = self.session_root / _CHUNKS_DIRNAME
         _reject_symlink_components(self.session_root, chunk_root)
-        chunk_root.mkdir(mode=0o700, exist_ok=True)
+        chunk_root.mkdir(mode=PRIVATE_DIRECTORY_MODE, exist_ok=True)
 
+        saved_session_api = (
+            _saved_session_api(projection_state.session_api, projection_state.snapshot)
+            if projection_state.session_api is not None
+            else None
+        )
         staging = generation_root / f".staging-{generation}-{secrets.token_hex(8)}"
-        staging.mkdir(mode=0o700)
+        staging.mkdir(mode=PRIVATE_DIRECTORY_MODE)
         try:
             checkpoint_envelope, checkpoint_transcript = _detach_transcript(
                 checkpoint, _CHECKPOINT_MESSAGES_PATH
@@ -2362,12 +2973,10 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
             projection_envelope, projection_transcript = _detach_projection_history(
                 projection_state
             )
-            runtime_envelope, capability_catalog = _detach_pooled_value(
-                cast(
-                    dict[str, JsonValue],
-                    runtime_state.model_dump(mode="json", by_alias=True),
-                ),
-                _CAPABILITY_CATALOG_KEY,
+            if saved_session_api is not None:
+                projection_envelope["session_api"] = saved_session_api
+            runtime_envelope, capability_catalog = self._detach_capability_catalog(
+                runtime_state
             )
             checkpoint_plan = self._plan_transcript("checkpoint", checkpoint_transcript)
             projection_plan = self._plan_transcript("projection", projection_transcript)
@@ -2435,9 +3044,14 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
             _fsync_directory(staging)
             _durable_replace(staging, final_dir)
             _fsync_directory(generation_root)
+            written_minor = (
+                _GZIP_CHUNKS_MINOR
+                if chunk_stats.reused_compressed_only
+                else STORE_FORMAT_MINOR
+            )
             current = CurrentPointerV1(
                 session_id=self.session_id,
-                store_format_minor=STORE_FORMAT_MINOR,
+                store_format_minor=written_minor,
                 generation=generation,
                 snapshot_sequence=sequence,
                 manifest_sha256=_sha256(manifest_bytes),
@@ -2473,13 +3087,57 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
             manifest=manifest,
             checkpoint=checkpoint,
             runtime_state=runtime_state,
-            projection_state=projection_state,
+            # What a load reads back, so a warm read matches a reopen.
+            projection_state=(
+                projection_state
+                if saved_session_api is None
+                else projection_state.model_copy(
+                    update={
+                        "session_api": _loaded_session_api(
+                            saved_session_api, projection_state.snapshot, set()
+                        )
+                    }
+                )
+            ),
             generation_dir=final_dir,
             manifest_sha256=current.manifest_sha256,
             current=current_bytes,
             journal_path=journal_path,
+            store_format_minor=written_minor,
         )
         return manifest
+
+    def _detach_capability_catalog(
+        self, runtime_state: RuntimeStateV3
+    ) -> tuple[dict[str, JsonValue], list[JsonValue] | None]:
+        """The runtime document's envelope and its capability catalog, serialized.
+
+        The catalog travels to the chunk pool as a one-item list; a Session with
+        no catalog detaches nothing. The serialization is reused for as long as
+        the Runtime passes the same catalog object, so a published catalog must
+        never be mutated in place: reconfiguration replaces it.
+        """
+        envelope = cast(
+            dict[str, JsonValue],
+            runtime_state.model_dump(
+                mode="json", by_alias=True, exclude={_CAPABILITY_CATALOG_KEY}
+            ),
+        )
+        envelope[_CAPABILITY_CATALOG_KEY] = None
+        catalog = runtime_state.core_capabilities
+        if catalog is None:
+            return envelope, None
+        return envelope, [self._serialize_catalog(catalog)]
+
+    def _serialize_catalog(self, catalog: RustHarnessCapabilitySet) -> JsonValue:
+        serialized = self._serialized_catalog
+        if serialized is None or serialized[0] is not catalog:
+            serialized = (
+                catalog,
+                cast(JsonValue, catalog.model_dump(mode="json", by_alias=True)),
+            )
+            self._serialized_catalog = serialized
+        return serialized[1]
 
     def _plan_transcript(
         self, key: str, transcript: list[JsonValue] | None
@@ -2505,6 +3163,26 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
             raise HarnessInvalidSessionStoreError(
                 self.session_id, f"Invalid Unified session store: {exc}"
             ) from exc
+
+    def held_generation(self) -> HeldGeneration | None:
+        """The cached load, without reading the filesystem: while the lease is
+        held nothing else writes the store. Load and identity are read under one
+        lock, so a record on disk but not yet folded in is never claimed.
+        """
+        with self._cache_lock:
+            cached = self._cache
+            if cached is None or self._lease is None or not self._lease.held:
+                return None
+            key = cached.key
+            return HeldGeneration(
+                session=cached.session,
+                current_sha256=hashlib.sha256(
+                    key.current.removesuffix(b"\n")
+                ).hexdigest(),
+                journal_path=key.journal_path.relative_to(self.session_root).as_posix(),
+                journal_size=key.journal_size,
+                journal_mtime_ns=key.journal_mtime_ns,
+            )
 
     def _valid_cached_session(self) -> StoredSession | None:
         cached = self._cache
@@ -2615,6 +3293,10 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
             )
             _attach_transcript(projection_value, _PROJECTION_HISTORY_PATH, history)
             loaded_bytes += chunk_bytes
+        if isinstance(projection_value, dict):
+            # The tail carries no Session API facts (``_projection_tail``): they
+            # are read against the whole saved history, which a tail lacks.
+            projection_value.pop("session_api", None)
         projection = ProjectionStateV1.model_validate(projection_value)
         if projection.session_id != self.session_id:
             raise ValueError("projection state belongs to another session")
@@ -2677,6 +3359,7 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
         manifest_sha256: str,
         current: bytes,
         journal_path: Path,
+        store_format_minor: int,
     ) -> None:
         # Reading the documents back to digest them keeps what the post-publication
         # `load` did for the writer -- proving the bytes landed -- without the parse.
@@ -2709,7 +3392,7 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
                     runtime_state=runtime_state,
                     projection_state=projection_state,
                     journal=(),
-                    store_format_minor=STORE_FORMAT_MINOR,
+                    store_format_minor=store_format_minor,
                     published_runtime_state=runtime_state,
                     published_projection_state=projection_state,
                 ),
@@ -2798,7 +3481,12 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
             )
             _attach_transcript(projection_value, _PROJECTION_HISTORY_PATH, history)
             loaded_bytes += chunk_bytes
-        projection_state = ProjectionStateV1.model_validate(projection_value)
+        # One warning per load, however many records dropped their positions.
+        unreadable_sparse_history: set[str] = set()
+        projection_state = ProjectionStateV1.model_validate(
+            projection_value,
+            context={_UNREADABLE_SPARSE_HISTORY_KEY: unreadable_sparse_history},
+        )
         runtime_state = _load_runtime_state(runtime_state_value, projection_state)
         # No read of interop-export.json: a generation written before minor 3 still
         # carries one, and `StoredSession.interop_export` derives the same value from
@@ -2821,8 +3509,11 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
         # record a size that already covers records this load never saw.
         journal_stat = os.lstat(journal_path)
         journal = _read_journal(
-            journal_path, manifest.recovery_journal_segment.first_sequence
+            journal_path,
+            manifest.recovery_journal_segment.first_sequence,
+            unreadable_sparse_history,
         )
+        _warn_unreadable_sparse_positions(self.session_id, unreadable_sparse_history)
         effective_runtime, effective_projection = _apply_journal(
             runtime_state, projection_state, journal
         )
@@ -2942,7 +3633,7 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
         quarantine = self.session_root / _QUARANTINE_DIRNAME
         try:
             _reject_symlink_components(self.session_root, quarantine)
-            quarantine.mkdir(mode=0o700, exist_ok=True)
+            quarantine.mkdir(mode=PRIVATE_DIRECTORY_MODE, exist_ok=True)
             copy = quarantine / f"{generation}.jsonl"
             copy.write_bytes(segment.read_bytes())
             copy.chmod(0o600)
@@ -3243,6 +3934,44 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
             if receipt.state == "reserved" and receipt.abandon_on_restart
         )
 
+    def reserved_turn_starts_core_took(self) -> tuple[str, ...]:
+        """Open ``turn/start`` reservations whose user message Core already took.
+
+        The Runtime reserves and applies a command under one lock, and every user
+        message reaches Core through a command of its own. So a reservation the
+        journal still holds took the first user message recorded after it and
+        before the next reservation, if any. One the journal no longer holds was
+        folded after it was made: by its own command, right before Core took its
+        input, or later in the turn it started. Either way Core took it, unless
+        a process stopped between that fold and the input and a later process
+        folded the reservation again; that start is taken for one Core took.
+        """
+        stored = self.load()
+        reserved = [
+            receipt.client_command_id
+            for receipt in stored.runtime_state.command_receipts
+            if receipt.state == "reserved" and receipt.method == "turn/start"
+        ]
+        journalled = {
+            record.payload.client_command_id
+            for record in stored.journal
+            if isinstance(record, CommandReservedRecordV1)
+        }
+        taken = [command_id for command_id in reserved if command_id not in journalled]
+        candidate: str | None = None
+        for record in stored.journal:
+            if isinstance(record, CommandReservedRecordV1):
+                command_id = record.payload.client_command_id
+                candidate = command_id if command_id in reserved else None
+            elif (
+                candidate is not None
+                and isinstance(record, CoreInputRecordV1)
+                and isinstance(record.payload.input.command, RustUserMessageEvent)
+            ):
+                taken.append(candidate)
+                candidate = None
+        return tuple(taken)
+
     def resolve_internal_command_id(self, namespace: str) -> str:
         """Reuse an interrupted operation or allocate its next durable sequence ID."""
         pending = self.pending_internal_command(namespace)
@@ -3373,6 +4102,8 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
         ],
         lease_id: str | None = None,
     ) -> ActionIntentRecordV1:
+        if kind == "completion":
+            request = _without_model_input(request)
         record = self.append_record(
             "action_intent",
             ActionIntentPayloadV1(
@@ -3705,16 +4436,22 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
         return record
 
     def advance_projection_delta(
-        self, watermark: int, delta: ProjectionDelta
+        self,
+        watermark: int,
+        delta: ProjectionDelta,
+        session_api: SessionApiFactsV1 | None = None,
     ) -> ProjectionDeltaRecordV1:
         """Journal a projection advance as a structured delta.
 
         The delta carries only what changed, so journal growth is linear in
         session length instead of re-serializing the full history each advance.
+        ``session_api`` carries only the Session API facts this advance added.
         """
         record = self.append_record(
             "projection_delta",
-            ProjectionDeltaPayloadV1(watermark=watermark, delta=delta),
+            ProjectionDeltaPayloadV1(
+                watermark=watermark, delta=delta, session_api=session_api
+            ),
         )
         if not isinstance(record, ProjectionDeltaRecordV1):
             raise TypeError("journal record parser returned the wrong type")
@@ -3901,25 +4638,55 @@ def committed_history_from_checkpoint(
 
 
 def canonical_json(value: JsonValue) -> bytes:
+    # RFC 8785, except that integers of any magnitude are written exactly.
     standard = _standard_encoder_form(value)
-    if standard is not _RFC8785_ONLY:
+    if standard is not _FALLBACK_ONLY:
         try:
             return json.dumps(
                 standard, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             ).encode()
         except UnicodeEncodeError:
             pass
-    return rfc8785.dumps(value)
+    sink = io.BytesIO()
+    _dump_with_exact_integers(value, sink)
+    return sink.getvalue()
 
 
-_RFC8785_ONLY: Any = object()
+def _dump_with_exact_integers(value: JsonValue, sink: io.BytesIO) -> None:
+    match value:
+        case bool():
+            rfc8785.dump(value, sink)
+        case int():
+            sink.write(str(int(value)).encode())
+        case list():
+            sink.write(b"[")
+            for index, item in enumerate(value):
+                if index:
+                    sink.write(b",")
+                _dump_with_exact_integers(item, sink)
+            sink.write(b"]")
+        case dict():
+            sink.write(b"{")
+            members = sorted(value.items(), key=lambda item: item[0].encode("utf-16be"))
+            for index, (key, nested) in enumerate(members):
+                if index:
+                    sink.write(b",")
+                rfc8785.dump(key, sink)
+                sink.write(b":")
+                _dump_with_exact_integers(nested, sink)
+            sink.write(b"}")
+        case _:
+            rfc8785.dump(value, sink)
+
+
+_FALLBACK_ONLY: Any = object()
 # Python's `repr` switches to exponent notation below this magnitude; ES6 only
 # does below 1e-6, so smaller fractions take the fallback.
 _MIN_FIXED_NOTATION_FLOAT = 1e-4
 
 
 def _standard_encoder_form(value: JsonValue) -> JsonValue:
-    """What `json.dumps` must encode to emit exactly what RFC 8785 asks for.
+    """What `json.dumps` must encode to emit exactly the canonical form.
 
     Everything the store persists is digested, and the documents being digested
     hold whole conversations, so canonicalization is most of what a load costs.
@@ -3929,10 +4696,9 @@ def _standard_encoder_form(value: JsonValue) -> JsonValue:
     digits, but ES6 prints an integral float without ``.0`` and switches to
     exponent notation at other magnitudes than `repr`, so integral floats are
     encoded as the integers they equal and fractions below
-    ``_MIN_FIXED_NOTATION_FLOAT`` fall back. Integers outside the range RFC 8785
-    admits and object keys past ASCII (RFC 8785 orders them by UTF-16 code unit,
-    Python by code point) fall back too, as do non-finite floats, which RFC 8785
-    rejects.
+    ``_MIN_FIXED_NOTATION_FLOAT`` fall back. Object keys past ASCII (RFC 8785
+    orders them by UTF-16 code unit, Python by code point) fall back too, as do
+    non-finite floats, which RFC 8785 rejects.
 
     Exact type checks rather than `isinstance`, so that an exotic subclass takes
     the fallback instead of an encoder that may not agree about it.
@@ -3942,31 +4708,27 @@ def _standard_encoder_form(value: JsonValue) -> JsonValue:
     while pending:
         item = pending.pop()
         item_type = type(item)
-        if item_type is str or item is None or item_type is bool:
+        if item_type is str or item_type is int or item is None or item_type is bool:
             continue
         if item_type is dict:
             for key, nested in cast(dict[str, JsonValue], item).items():
                 if type(key) is not str or not key.isascii():
-                    return _RFC8785_ONLY
+                    return _FALLBACK_ONLY
                 pending.append(nested)
             continue
         if item_type is list:
             pending.extend(cast(list[JsonValue], item))
             continue
-        if item_type is int:
-            if item not in _CANONICAL_INTEGER_RANGE:
-                return _RFC8785_ONLY
-            continue
         if item_type is float:
             number = cast(float, item)
             if number.is_integer():
                 if abs(number) > _MAX_SAFE_JSON_INTEGER:
-                    return _RFC8785_ONLY
+                    return _FALLBACK_ONLY
                 integral_floats = True
                 continue
             if _MIN_FIXED_NOTATION_FLOAT <= abs(number) < float("inf"):
                 continue
-        return _RFC8785_ONLY
+        return _FALLBACK_ONLY
     return _integral_floats_as_ints(value) if integral_floats else value
 
 
@@ -4004,7 +4766,26 @@ def sha256_json(value: JsonValue) -> str:
 
 
 def transition_sha256(transition: RustSessionTransition) -> str:
-    return sha256_json(transition.model_dump(mode="json", by_alias=True))
+    return sha256_json(_digest_value(transition))
+
+
+def _digest_value(transition: RustSessionTransition) -> dict[str, Any]:
+    """The transition as every digest sees it.
+
+    A post-tool hook's duration is Host time that replay measures again, and
+    journals recorded before Core measured it lack the field, so no digest
+    covers it.
+    """
+    value = cast(dict[str, Any], transition.model_dump(mode="json", by_alias=True))
+    if isinstance(transition.next, RustActionsNextAction):
+        for directive, dumped in zip(
+            transition.next.directives, value["next"]["directives"], strict=True
+        ):
+            if isinstance(directive, RustDispatchActionDirective) and isinstance(
+                directive.action, RustPostToolCallHookAction
+            ):
+                del dumped["action"]["input"]["duration_ms"]
+    return value
 
 
 def _replay_transition_sha256(
@@ -4033,9 +4814,7 @@ def _digest_with_llm_actions_normalized(
     *,
     include_committed_calls: bool = True,
 ) -> str:
-    value = cast(
-        dict[str, JsonValue], transition.model_dump(mode="json", by_alias=True)
-    )
+    value = _digest_value(transition)
     if not include_committed_calls:
         observations = value.get("observations")
         if isinstance(observations, list):
@@ -4072,9 +4851,17 @@ def _transition_matches_recorded_digest(
     # Journals recorded before replies required token usage: the reply read
     # back with the zero usage, which the transition now carries wherever the
     # reply's usage is copied.
-    recorded_shape = _without_zero_reply_usage(transition)
-    return recorded_shape is not None and _transition_matches_digest(
-        recorded_shape, payload, durable_actions
+    without_zero_usage = _without_zero_reply_usage(transition)
+    # Journals recorded before Core flagged the calls it runs and named a
+    # program's call as the parent of the calls it makes.
+    without_call_routing = _without_tool_call_routing(transition)
+    older_shapes = [without_zero_usage, without_call_routing]
+    if without_zero_usage is not None:
+        older_shapes.append(_without_tool_call_routing(without_zero_usage))
+    return any(
+        shape is not None
+        and _transition_matches_digest(shape, payload, durable_actions)
+        for shape in older_shapes
     )
 
 
@@ -4114,6 +4901,41 @@ def _without_zero_reply_usage(
     for holder in holders:
         if holder.get("usage") == _ZERO_USAGE:
             holder["usage"] = None
+            changed = True
+    return RustSessionTransition.model_validate(value) if changed else None
+
+
+_TOOL_CALL_ROUTING_FIELDS = {
+    "runtime_builtin_tool_call": "parent_call_id",
+    "provided_tool_call": "parent_call_id",
+    "tool_execution_started": "executed_by_core",
+}
+
+
+def _without_tool_call_routing(
+    transition: RustSessionTransition,
+) -> RustSessionTransition | None:
+    """The transition without the fields that say which call Core runs or made it.
+
+    They only place a call's span, so a journal recorded without them holds the
+    same decision.
+    """
+    value = cast(
+        dict[str, JsonValue], transition.model_dump(mode="json", by_alias=True)
+    )
+    holders = [
+        cast(dict[str, JsonValue], observation)
+        for observation in cast(list[JsonValue], value["observations"])
+    ]
+    next_action = cast(dict[str, JsonValue], value["next"])
+    for directive in cast(list[JsonValue], next_action.get("directives", [])):
+        action = cast(dict[str, JsonValue], directive).get("action")
+        if isinstance(action, dict):
+            holders.append(action)
+    changed = False
+    for holder in holders:
+        field = _TOOL_CALL_ROUTING_FIELDS.get(str(holder.get("type")))
+        if field is not None and holder.pop(field, None) is not None:
             changed = True
     return RustSessionTransition.model_validate(value) if changed else None
 
@@ -4189,6 +5011,99 @@ def _transition_matches_recorded_decision(
     return True
 
 
+# TODO: find the integration groups from a structured source, not a name
+# prefix. Nothing stored marks a group as an MCP server's or a connector's. A
+# connector group could carry Core's connector tool-group metadata, which the
+# Runtime does not set yet; an MCP group needs a tool-group metadata kind Core
+# does not define, or a Runtime state field listing the groups it owns. Either
+# would mark sessions stored from then on only, so this prefix stays for
+# sessions stored before.
+_INTEGRATION_GROUP_PREFIXES = ("mcp_", "connector_")
+
+
+def _with_dropped_integration_tools_restricted(
+    capabilities: RustHarnessCapabilitySet, current: RustHarnessCapabilitySet
+) -> RustHarnessCapabilitySet:
+    """``capabilities`` with the tools Core now refuses restricted to objects.
+
+    An earlier release could store a tool an MCP server or a connector listed
+    with an input schema whose type is not ``object``, which the Runtime now
+    leaves out and Core refuses to restore. Those tools sit in the groups the
+    Runtime names ``mcp_`` and ``connector_``. One that ``current`` still
+    registers with such a schema is a direct registration and keeps Core's
+    error.
+
+    Replay keeps the tool rather than leaving it out: the journal may hold a
+    call to it. A tool call's arguments are an object, and the restricted
+    schema accepts the same objects, so the call replays as it ran, where a
+    tool left out would fail the program differently and the replay would
+    diverge. Recovery then applies ``current``, which no longer lists the
+    tool.
+    """
+    registered = {
+        (group.name, tool.name)
+        for group in current.tool_groups
+        for tool in group.tools
+        if type_is_not_object(tool.input_schema)
+    }
+
+    def dropped(group_name: str, tool: RustProvidedToolDefinition) -> bool:
+        return (
+            group_name.startswith(_INTEGRATION_GROUP_PREFIXES)
+            and type_is_not_object(tool.input_schema)
+            and (group_name, tool.name) not in registered
+        )
+
+    if not any(
+        dropped(group.name, tool)
+        for group in capabilities.tool_groups
+        for tool in group.tools
+    ):
+        return capabilities
+    groups = [
+        group.model_copy(
+            update={
+                "tools": [
+                    tool.model_copy(
+                        update={"input_schema": taking_objects_only(tool.input_schema)}
+                    )
+                    if dropped(group.name, tool)
+                    else tool
+                    for tool in group.tools
+                ]
+            }
+        )
+        for group in capabilities.tool_groups
+    ]
+    return capabilities.model_copy(update={"tool_groups": groups})
+
+
+def _with_dropped_integration_tools_restricted_in_input(
+    harness_input: RustHarnessInput, current: RustHarnessCapabilitySet
+) -> RustHarnessInput:
+    """A journalled reconfigure as replay applies it: see ``_with_dropped_integration_tools_restricted``."""
+    command = harness_input.command
+    if not isinstance(command, RustReconfigureEvent):
+        return harness_input
+    changes = [
+        change.model_copy(
+            update={
+                "value": _with_dropped_integration_tools_restricted(
+                    change.value, current
+                )
+            }
+        )
+        if isinstance(change, RustCapabilitiesChange)
+        else change
+        for change in command.changes
+    ]
+    if changes == command.changes:
+        return harness_input
+    return harness_input.model_copy(
+        update={"command": command.model_copy(update={"changes": changes})}
+    )
+
+
 def _actions_performed_after_each_core_input(
     journal: Sequence[JournalRecordV1],
 ) -> dict[int, tuple[str, ...]]:
@@ -4221,9 +5136,7 @@ def _kept_action_ids(transition: RustSessionTransition) -> set[str]:
 def _legacy_transition_sha256(  # noqa: PLR0911 - one return per legacy transition shape
     transition: RustSessionTransition, durable_actions: list[RuntimeActionV1]
 ) -> str | None:
-    value = cast(
-        dict[str, JsonValue], transition.model_dump(mode="json", by_alias=True)
-    )
+    value = _digest_value(transition)
     next_action = value.get("next")
     if not isinstance(next_action, dict) or next_action.get("type") != "actions":
         return None
@@ -4270,6 +5183,19 @@ def _action_replay_identity(action: dict[str, JsonValue]) -> dict[str, JsonValue
     value = dict(action)
     if value.get("type") == "llm_call":
         _normalize_llm_action_for_replay(value)
+    # The Runtime journals a request without the program call that made it, as
+    # did builds whose Core predates the field. The parent only places the call's
+    # span, so the same call with or without it is the same request.
+    value.pop("parent_call_id", None)
+    # Journals recorded before Core measured a tool call hold its post-tool
+    # hook request without the duration. Replay measures it again from the
+    # recorded Host times, so the request is the same with or without it.
+    if value.get("hook") == "post_tool_call" and isinstance(
+        hook_input := value.get("input"), dict
+    ):
+        value["input"] = {
+            key: item for key, item in hook_input.items() if key != "duration_ms"
+        }
     return value
 
 
@@ -4313,106 +5239,98 @@ def _normalize_llm_action_for_replay_with_model_input(
         tool_catalog.pop("tools", None)
 
 
-def _prune_settled_action_bodies(
+def _release_settled_actions(
     runtime: RuntimeStateV3, core_action_ids: frozenset[str]
 ) -> RuntimeStateV3:
-    """Drop the request and result bodies of settled Actions Core no longer holds.
+    """Drop the settled Actions recovery can no longer reach, with their provider operations.
 
-    The ledger holds every Action for the life of the Session, so whatever each
-    one retains is reparsed by every load from here on. A completion request
-    embeds the whole transcript, so retaining one per turn grows the ledger with
-    the square of the session's length: on a real session six of them were
-    2.16 MB of a 2.27 MB snapshot. Results are smaller individually but there is
-    one per turn for the life of the session — 2.18 MB across 90 turns of 24 KB
-    replies.
+    Every publication serializes the whole ledger, so an entry kept per Action
+    ever run makes each publication cost more than the last for the life of the
+    Session, and the cost lands at every idle point. An entry is kept while some
+    reader can still name it:
 
-    Every other kind grows linearly rather than quadratically, which bounds
-    nothing: a tool entry holds the arguments and complete output of every call
-    ever made, and a ``filesystem`` request holds a whole offloaded large output
-    a second time, after the write that put that payload on disk.
+    - An Action still pending or running is unfinished work.
+    - An Action Core holds (``core_action_ids``) can still be named by Core.
+      Recovery rehydrates every ``RustKeepActionDirective`` from its stored
+      request (``_start_transition_actions``), and ``_resolve_action`` answers a
+      redelivered Action from its stored result instead of running it again.
+      After this generation the journal restarts empty, so the only Actions a
+      replayed Core can name are the ones it holds now plus ones dispatched
+      later, whose intents are journalled afresh.
+    - A dispatched process start (``prepared_process_start``). A start settles
+      as soon as its process runs, but a terminal snapshot for a process not yet
+      recorded is resolved from this descriptor (``_commit_terminal_snapshot``).
+      These are kept for the life of the Session: one per background process,
+      bounded by the processes the Session starts, not by its turns.
+    - A kind outside ``_RELEASABLE_ACTION_KINDS``, which no one has audited for
+      read-back yet.
 
-    Recovery rehydrates a request whenever Core retains an Action across a
-    restart: ``_start_transition_actions`` calls ``action_from_recovery_state``
-    for every ``RustKeepActionDirective`` before it filters by pending id, so a
-    pruned request there strands the session for good. Only Core can name such a
-    directive, and after this generation the journal restarts empty, so the only
-    Actions a replayed Core can keep are the ones it holds right now
-    (``core_action_ids``) plus ones dispatched later, whose intents are journalled
-    afresh. Excluding the ids Core holds is therefore what makes this safe.
+    Ledger settlement alone is not enough, and quiescence does not imply Core is
+    idle. ``_record_action_result`` journals a result and releases the lock
+    before ``_drive`` hands it to Core, and on the notification path
+    (``deliver_notification``) no command receipt is reserved across the turn,
+    so in that gap the ledger is quiescent while Core still holds the Action. A
+    capacity-triggered ``_compact_store_sync(allow_recoverable=True)`` publishes
+    a generation in exactly that window; the Action is named in
+    ``core_action_ids`` throughout, so it is kept. The same holds for a process
+    result whose write ``_retry_process_action_result`` is retrying: Core has not
+    seen that result yet.
 
-    A result is read back in one place, ``_resolve_action``'s redelivery
-    short-circuit, and that has the same shape: Core only asks again for an Action
-    it still holds, so ``core_action_ids`` covers it. The exception used to be
-    rewind, which re-mints an ``action_id`` because Core derives identity from
-    content — the settled entry from the discarded timeline was still in the ledger
-    and was replayed. ``_runtime_state_for_replaced_context`` now empties the
-    ledgers at the rewind itself, so every settled Action here belongs to the live
-    timeline, where ids do not repeat. ``result_pruned`` records the distinction
-    anyway so a mistake surfaces as a diagnosable error rather than a validation
-    failure on ``None``.
+    Core names a tool Action after the model's call ID, which a provider can
+    reuse in a later turn. A later Action whose ID was released runs as new work;
+    one whose ID is still in the ledger, because no publication came between the
+    two or because the entry is kept, is answered from the stored outcome.
+    Nothing the Runtime derives from that ID can collide with a later call:
+    callback IDs carry a random suffix, a child session is named after its
+    spawn's admission, a saved output's file after its content, and a public
+    history effect entry is suffixed once an earlier run has settled under it.
+    Nothing else reads a settled entry back:
+    ``_validate_process_relationships`` skips a process whose start Action is
+    absent, the Host's process maintenance reads only unsettled Actions, and a
+    provider operation is read only by ``quiescent``.
 
-    Ledger settlement is *not* sufficient on its own, and quiescence does not
-    imply Core is idle. ``_record_action_result`` journals a result and releases
-    the lock before ``_drive`` hands it to Core, and on the notification path
-    (``deliver_notification``) no command receipt is reserved across the turn, so
-    in that gap the ledger is quiescent while Core still calls the Action live. A
-    capacity-triggered ``_compact_store_sync(allow_recoverable=True)`` publishes a
-    generation in exactly that window. Core still holds the Action throughout, so
-    it is named in ``core_action_ids`` and neither body is touched.
-
-    Quiescence is not part of the predicate either. One receipt left reserved
-    holds a Session away from it for good, and every publication until then adds
-    another transcript, so waiting for rest is how a ledger reaches the size
-    where nothing can load it. Settlement, which quiescence used to imply, is
-    now checked per Action: the stored model rejects a pruned body on an Action
-    still pending or running, and ``model_copy`` does not revalidate, so pruning
-    one publishes a generation that only fails on the way back in.
-
-    Exclude ``process``, the one kind read outside that guard, on both fields.
-    Its start request outlives its settlement: a start Action succeeds as soon as
-    the process is running, while ``_validate_process_relationships`` resolves
-    that request's operation name on every load for as long as the process is in
-    the ledger, so dropping it turns a surviving process into a load failure. Its
-    result is read back too — ``record_action_result`` treats a repeat call as a
-    no-op when the stored state and result already match, and the one caller that
-    can re-enter it across a generation boundary is
-    ``_retry_process_action_result``, gated on ``_process_action_reservations`` —
-    so pruning that would turn the idempotent retry into a spurious mismatch.
-
-    A ``child`` Action outlives its settlement the same way — a stateful subagent
-    runs on after its spawn Action succeeds — but is prunable, because the
-    dependency is materialized into ``children`` when the intent is folded.
-    Nothing reads the spawn request back off the snapshot to rebuild it.
+    A spawned child outlives its settled spawn Action, but its dependency is
+    materialized into ``children`` when the intent is folded, and nothing reads
+    the spawn Action back.
     """
     actions = [
-        _prune_settled_action_body(action, core_action_ids)
+        action
         for action in runtime.actions
-    ]
-    if all(
-        pruned is original
-        for pruned, original in zip(actions, runtime.actions, strict=True)
-    ):
-        return runtime
-    return runtime.model_copy(update={"actions": actions})
-
-
-def _prune_settled_action_body(
-    action: RuntimeActionV1, core_action_ids: frozenset[str]
-) -> RuntimeActionV1:
-    if (
-        action.kind not in _PRUNABLE_ACTION_KINDS
-        or action.state in {"pending", "running"}
+        if action.state in {"pending", "running"}
         or action.action_id in core_action_ids
-    ):
-        return action
-    update: dict[str, JsonValue | bool] = {}
-    if not action.request_pruned and action.request is not None:
-        update |= {"request": None, "request_pruned": True}
-    if not action.result_pruned and action.result is not None:
-        update |= {"result": None, "result_pruned": True}
-    if not update:
-        return action
-    return action.model_copy(update=update)
+        or action.prepared_process_start is not None
+        or action.kind not in _RELEASABLE_ACTION_KINDS
+    ]
+    if len(actions) == len(runtime.actions):
+        return runtime
+    retained = {action.action_id for action in actions}
+    return runtime.model_copy(
+        update={
+            "actions": actions,
+            "provider_operations": [
+                operation
+                for operation in runtime.provider_operations
+                if operation.operation_id in retained
+                or operation.state in {"pending", "running"}
+            ],
+        }
+    )
+
+
+def _release_settled_callbacks(runtime: RuntimeStateV3) -> RuntimeStateV3:
+    """Drop resolved and failed callbacks, keeping the ones still waiting.
+
+    Every reader of the stored callbacks looks at pending ones only: a restart
+    closes them, process reservations are restored from them, and
+    ``resolve_callback`` accepts a result for a pending one alone, so a settled
+    one would only grow the ledger with the Session's length.
+    """
+    callbacks = [
+        callback for callback in runtime.callbacks if callback.state == "pending"
+    ]
+    if len(callbacks) == len(runtime.callbacks):
+        return runtime
+    return runtime.model_copy(update={"callbacks": callbacks})
 
 
 def _discard_provider_operation_results(runtime: RuntimeStateV3) -> RuntimeStateV3:
@@ -4422,8 +5340,8 @@ def _discard_provider_operation_results(runtime: RuntimeStateV3) -> RuntimeState
     its provider operation, so the two hold the same payload; at 24 KB replies that
     second copy was 2.15 MB of a 4.44 MB runtime state, and every ``load`` reparses
     all of it. Nothing reads it back — ``quiescent`` consults ``state`` and no other
-    caller in the workspace touches a provider operation — so unlike the request
-    prune this needs no reachability guard.
+    caller touches a provider operation — so unlike releasing the operation itself
+    this needs no reachability guard.
 
     The field stays on the model rather than being removed: ``_StoredModel`` forbids
     extras, so generations already carrying a result must still validate.
@@ -4442,6 +5360,93 @@ def _discard_provider_operation_results(runtime: RuntimeStateV3) -> RuntimeState
     ):
         return runtime
     return runtime.model_copy(update={"provider_operations": operations})
+
+
+def _discard_model_inputs(runtime: RuntimeStateV3) -> RuntimeStateV3:
+    """Drop model inputs from the ledger, including ones an earlier build journalled."""
+    actions = [_action_without_model_input(action) for action in runtime.actions]
+    if all(
+        stripped is original
+        for stripped, original in zip(actions, runtime.actions, strict=True)
+    ):
+        return runtime
+    return runtime.model_copy(update={"actions": actions})
+
+
+def _action_without_model_input(action: RuntimeActionV1) -> RuntimeActionV1:
+    if action.kind != "completion" or action.request_pruned:
+        return action
+    request = _without_model_input(action.request)
+    if request is action.request:
+        return action
+    return action.model_copy(
+        update={"request": request, "request_sha256": sha256_json(request)}
+    )
+
+
+# No model cache holds this tool revision, so running a stripped call fails loudly.
+_OMITTED_MODEL_INPUT = RustModelInputUpdate(
+    messages=RustModelMessageReplace(messages=[]),
+    tool_catalog=RustModelToolCatalogKeep(revision=_MAX_SAFE_JSON_INTEGER),
+)
+_OMITTED_MODEL_INPUT_JSON = cast(
+    JsonValue, _OMITTED_MODEL_INPUT.model_dump(mode="json", by_alias=True)
+)
+
+
+def _without_model_input(request: JsonValue) -> JsonValue:
+    """A model call's request with an empty model input; other requests unchanged.
+
+    The input copies the whole conversation, which can outgrow the document cap.
+    Nothing reads it back: recovery fails an interrupted call, replay ignores it,
+    and a restored Runtime resyncs it from Core. Empty, it still loads in older builds.
+    """
+    if not isinstance(request, dict) or request.get("type") != "llm_call":
+        return request
+    model_input = request.get("model_input")
+    if model_input is None or model_input == _OMITTED_MODEL_INPUT_JSON:
+        return request
+    return {**request, "model_input": _OMITTED_MODEL_INPUT_JSON}
+
+
+def _without_model_inputs(
+    transition: RustSessionTransition,
+) -> RustSessionTransition | None:
+    """The transition stripped as ``_without_model_input`` does, or ``None`` if unchanged."""
+    if not isinstance(transition.next, RustActionsNextAction):
+        return None
+    directives = [
+        _directive_without_model_input(directive)
+        for directive in transition.next.directives
+    ]
+    if all(
+        stripped is original
+        for stripped, original in zip(
+            directives, transition.next.directives, strict=True
+        )
+    ):
+        return None
+    return transition.model_copy(
+        update={"next": RustActionsNextAction(directives=directives)}
+    )
+
+
+def _directive_without_model_input(
+    directive: RustActionDirective,
+) -> RustActionDirective:
+    if isinstance(directive, RustKeepActionDirective):
+        return directive
+    action = directive.action
+    if (
+        not isinstance(action, RustLLMCallAction)
+        or action.model_input == _OMITTED_MODEL_INPUT
+    ):
+        return directive
+    return directive.model_copy(
+        update={
+            "action": action.model_copy(update={"model_input": _OMITTED_MODEL_INPUT})
+        }
+    )
 
 
 def _apply_journal(  # noqa: PLR0912, PLR0914, PLR0915 - one branch per journal record
@@ -4642,12 +5647,26 @@ def _apply_journal(  # noqa: PLR0912, PLR0914, PLR0915 - one branch per journal 
             case ProjectionDeltaRecordV1(payload=payload):
                 if payload.watermark < current_projection.watermark:
                     raise ValueError("projection watermark moved backwards")
+                if not payload.delta:
+                    # A facts-only record. Advancing the sequence past Core
+                    # inputs not yet projected would hide them from catch-up.
+                    current_projection = current_projection.model_copy(
+                        update={
+                            "session_api": _fold_session_api_facts(
+                                current_projection.session_api, payload.session_api
+                            )
+                        }
+                    )
+                    continue
                 current_projection = current_projection.model_copy(
                     update={
                         "snapshot_sequence": record.sequence,
                         "watermark": payload.watermark,
                         "snapshot": apply_projection_delta(
                             current_projection.snapshot, payload.delta
+                        ),
+                        "session_api": _fold_session_api_facts(
+                            current_projection.session_api, payload.session_api
                         ),
                     }
                 )
@@ -4738,6 +5757,111 @@ def _action_name(request: JsonValue) -> str | None:
         return None
     name = call.get("name")
     return name if isinstance(name, str) else None
+
+
+_UNSETTLED_COMMAND_DESCRIPTIONS = {
+    "turn/start": "a turn is still running",
+    "parent/turn/start": "a turn is still running",
+    "turn/steer": "a message sent during the turn is still being delivered",
+    "turn/queue/steer": "a message sent during the turn is still being delivered",
+    "turn/context": "context added to the turn is still being delivered",
+    "session/context/inject": "context added to the session is still being delivered",
+    "app_server/session/compact": "the conversation is still being compacted",
+}
+_UNSETTLED_TOOL_DESCRIPTIONS = {
+    "self.wait": "the agent is still waiting for a subagent or a background process",
+    "self.sleep": "the agent is still pausing between checks",
+}
+_PENDING_CALLBACK_DESCRIPTIONS = {
+    "approval": "a tool call is waiting for approval",
+    "user_input": "a question is waiting for an answer",
+}
+_QUOTED_NAME_MAX_LENGTH = 32
+
+
+def _describe_reserved_command(method: str) -> str:
+    return _UNSETTLED_COMMAND_DESCRIPTIONS.get(method, "a request is still running")
+
+
+def _describe_unsettled_action(action: RuntimeActionV1) -> str:  # noqa: PLR0911 - one return per Action kind
+    match action.kind:
+        case "child":
+            return _describe_subagent_call(action.request)
+        case "tool":
+            name = _action_name(action.request)
+            if name is None:
+                return "a tool call is still running"
+            return _UNSETTLED_TOOL_DESCRIPTIONS.get(
+                name, f"the tool {_shortened(name)} is still running"
+            )
+        case "completion":
+            return "a model call is still running"
+        case "hook":
+            return "a hook is still running"
+        case "filesystem":
+            return "a file operation is still running"
+        case "callback":
+            return "a callback is still running"
+        case "process":
+            return "a background process operation is still running"
+        case _:
+            assert_never(action.kind)
+
+
+def _describe_pending_callback(kind: str) -> str:
+    return _PENDING_CALLBACK_DESCRIPTIONS.get(
+        kind, "a request is waiting for an answer"
+    )
+
+
+def _describe_running_child(spawn: RuntimeActionV1 | None) -> str:
+    if spawn is None:
+        return "a subagent is still starting"
+    return _describe_subagent_call(spawn.request)
+
+
+def _describe_subagent_call(request: JsonValue) -> str:
+    """Name the subagent a call addresses, as the agent passed it to the tool."""
+    agent = _subagent_argument(request)
+    subagent = (
+        f"the subagent {_shortened(agent)}" if agent is not None else "a subagent"
+    )
+    match _action_name(request):
+        case "agents.spawn" | "subagent.spawn":
+            return f"{subagent} is still starting"
+        case "agents.send_message":
+            return f"a message to {subagent} is still being delivered"
+        case "agents.interrupt":
+            return f"{subagent} is still being interrupted"
+        case _:
+            return "a subagent operation is still running"
+
+
+def _subagent_argument(request: JsonValue) -> str | None:
+    if not isinstance(request, dict):
+        return None
+    call = request.get("call")
+    if not isinstance(call, dict):
+        return None
+    arguments = call.get("arguments")
+    if not isinstance(arguments, dict):
+        return None
+    for key in ("name", "agent_path"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _quoted_command(command: str) -> str:
+    first_line = command.strip().splitlines()[0] if command.strip() else command
+    return f"`{_shortened(first_line)}`"
+
+
+def _shortened(text: str) -> str:
+    if len(text) <= _QUOTED_NAME_MAX_LENGTH:
+        return text
+    return f"{text[: _QUOTED_NAME_MAX_LENGTH - 3]}..."
 
 
 def _action_call_id(request: JsonValue) -> str | None:
@@ -4838,7 +5962,9 @@ def _process_notification_id(process_id: str) -> str:
     return f"background-process:{process_id}:terminal"
 
 
-def _read_journal(path: Path, first_sequence: int) -> tuple[JournalRecordV1, ...]:
+def _read_journal(
+    path: Path, first_sequence: int, unreadable_sparse_history: set[str]
+) -> tuple[JournalRecordV1, ...]:
     _reject_symlink(path)
     data = path.read_bytes()
     if len(data) > _MAX_DOCUMENT_BYTES:
@@ -4854,7 +5980,9 @@ def _read_journal(path: Path, first_sequence: int) -> tuple[JournalRecordV1, ...
             raise ValueError("recovery journal has an unterminated interior record")
         raw = line[:-1]
         try:
-            record = _JOURNAL_RECORD_ADAPTER.validate_json(raw)
+            record = _JOURNAL_RECORD_ADAPTER.validate_json(
+                raw, context={_UNREADABLE_SPARSE_HISTORY_KEY: unreadable_sparse_history}
+            )
         except Exception as exc:
             raise ValueError(
                 f"invalid recovery journal record {expected_sequence}"
@@ -4906,12 +6034,28 @@ def _append_journal_record(path: Path, data: bytes, *, protected_bytes: int = 0)
                 file.seek(0)
                 valid_size = file.read().rfind(b"\n") + 1
                 file.truncate(valid_size)
-        file.seek(0, os.SEEK_END)
-        if file.tell() + len(data) + protected_bytes > _MAX_DOCUMENT_BYTES:
+        start = file.seek(0, os.SEEK_END)
+        if start + len(data) + protected_bytes > _MAX_DOCUMENT_BYTES:
             raise HarnessStoreCapacityError("recovery journal is at capacity")
-        file.write(data)
-        os.fsync(file.fileno())
+        try:
+            _write_all(file, data)
+            os.fsync(file.fileno())
+        except OSError:
+            # Drop the failed record so a later append rewrites and syncs those
+            # bytes itself: a later fsync says nothing about this one's data.
+            with suppress(OSError):
+                file.truncate(start)
+            raise
     return len(data)
+
+
+def _write_all(file: io.FileIO, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = file.write(view)
+        if not written:
+            raise OSError("recovery journal write made no progress")
+        view = view[written:]
 
 
 def _unrecorded_baselines(
@@ -4956,30 +6100,6 @@ def _write_generation_record(
 ) -> StoredFileV1:
     data = _write_document(directory / name, value)
     return StoredFileV1(path=name, sha256=_sha256(data), chunks=chunks)
-
-
-def _detach_pooled_value(
-    document: dict[str, JsonValue], key: str
-) -> tuple[dict[str, JsonValue], list[JsonValue] | None]:
-    """Split one whole field out of a document so the chunk pool can hold it.
-
-    A transcript is pooled because it grows by a tail; the capability catalog is
-    pooled for the opposite reason. It does not grow at all -- every publication
-    of a Session repeats the same catalog byte for byte -- so holding it by
-    digest means the second and every later generation add nothing, where
-    inlining rewrites it whole each time.
-
-    It is a single value rather than a list, so it travels as a one-item list
-    and the pool needs no special case. A Session with no catalog detaches
-    nothing and stores its document monolithically, which is also how a
-    generation written before this existed reads back.
-    """
-    value = document.get(key)
-    if value is None:
-        return document, None
-    envelope = dict(document)
-    envelope[key] = None
-    return envelope, [value]
 
 
 def _attach_pooled_value(document: JsonValue, key: str, items: list[JsonValue]) -> None:
@@ -5114,9 +6234,12 @@ def _write_chunks(chunk_root: Path, plan: _ChunkPlan | None) -> ChunkPublication
         return ChunkPublicationStats()
     stats = ChunkPublicationStats()
     for chunk in plan.chunks:
-        path = chunk_root / f"{chunk.sha256}.json"
+        path = chunk_root / f"{chunk.sha256}{_PLAIN_CHUNK_SUFFIX}"
         if path.exists():
             stats += ChunkPublicationStats(reused=1)
+            continue
+        if (chunk_root / f"{chunk.sha256}{_COMPRESSED_CHUNK_SUFFIX}").exists():
+            stats += ChunkPublicationStats(reused=1, reused_compressed_only=1)
             continue
         body = chunk.body
         if body is None:
@@ -5147,6 +6270,25 @@ def _write_pooled_chunk(path: Path, body: bytes) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _read_pooled_chunk(chunk_root: Path, digest: str) -> bytes:
+    compressed = chunk_root / f"{digest}{_COMPRESSED_CHUNK_SUFFIX}"
+    _reject_symlink(compressed)
+    try:
+        data = compressed.read_bytes()
+    except FileNotFoundError:
+        return _read_document_body(chunk_root / f"{digest}{_PLAIN_CHUNK_SUFFIX}")
+    inflater = zlib.decompressobj(wbits=_GZIP_WBITS)
+    try:
+        body = inflater.decompress(data, _MAX_INFLATED_CHUNK_BYTES + 1)
+    except zlib.error as exc:
+        raise ValueError(f"stored chunk is not valid gzip: {digest}") from exc
+    if inflater.unconsumed_tail:
+        raise ValueError(f"stored chunk inflates past its size limit: {digest}")
+    if not inflater.eof or inflater.unused_data:
+        raise ValueError(f"stored chunk is not valid gzip: {digest}")
+    return _strip_document_newline(body, compressed.name)
 
 
 def _read_chunked_transcript(
@@ -5204,7 +6346,8 @@ def _projection_tail(
                             update={"entries": list(kept)}
                         )
                     }
-                )
+                ),
+                "session_api": None,
             }
         ),
         session_metadata=session_metadata,
@@ -5221,9 +6364,9 @@ def _collect_chunks(session_root: Path, generation_root: Path) -> None:
     chunk_root = session_root / _CHUNKS_DIRNAME
     try:
         pooled = [
-            path
+            (path, match.group(1))
             for path in chunk_root.iterdir()
-            if _CHUNK_FILE_PATTERN.fullmatch(path.name) is not None
+            if (match := _CHUNK_FILE_PATTERN.fullmatch(path.name)) is not None
         ]
         generations = [
             path
@@ -5245,10 +6388,10 @@ def _collect_chunks(session_root: Path, generation_root: Path) -> None:
         referenced.update(manifest.checkpoint.chunks or ())
         referenced.update(manifest.projection_state.chunks or ())
         referenced.update(manifest.runtime_state.chunks or ())
-    for path in pooled:
+    for path, digest in pooled:
         # The generation is already published, so nothing here may fail the
         # commit. What survives stays unreachable and the next sweep collects it.
-        if path.stem in referenced or path.is_symlink():
+        if digest in referenced or path.is_symlink():
             continue
         try:
             path.unlink()
@@ -5336,9 +6479,12 @@ def _read_document_body(path: Path) -> bytes:
     # No size limit: publication enforces the cap, and a generation an earlier
     # build grew past it is recovered or deleted only by reading it.
     _reject_symlink(path)
-    data = path.read_bytes()
+    return _strip_document_newline(path.read_bytes(), path.name)
+
+
+def _strip_document_newline(data: bytes, name: str) -> bytes:
     if not data.endswith(b"\n"):
-        raise ValueError(f"stored JSON document is not newline terminated: {path.name}")
+        raise ValueError(f"stored JSON document is not newline terminated: {name}")
     return data[:-1]
 
 
@@ -5552,6 +6698,11 @@ def _release_file_lock(file: Any) -> None:
     fcntl.flock(file.fileno(), fcntl.LOCK_UN)
 
 
+def durable_replace(source: Path, target: Path) -> None:
+    """Move ``source`` over ``target``, retrying Windows sharing violations."""
+    _durable_replace(source, target)
+
+
 def _durable_replace(source: Path, target: Path) -> None:
     if not _is_windows():
         os.replace(source, target)
@@ -5560,6 +6711,19 @@ def _durable_replace(source: Path, target: Path) -> None:
 
 
 def _windows_replace(source: Path, target: Path) -> None:
+    # Antivirus scanners and indexers briefly hold freshly written files open.
+    for attempt in range(_WINDOWS_REPLACE_ATTEMPTS):
+        try:
+            _move_file_ex(source, target)
+            return
+        except OSError as exc:
+            transient = getattr(exc, "winerror", None) in _WINDOWS_TRANSIENT_ERRORS
+            if not transient or attempt == _WINDOWS_REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_WINDOWS_REPLACE_BASE_DELAY_SECONDS * 2**attempt)
+
+
+def _move_file_ex(source: Path, target: Path) -> None:
     import ctypes
     from ctypes import wintypes
 
@@ -5617,6 +6781,7 @@ __all__ = [
     "ExternalImportMetadataV1",
     "GenerationManifestV1",
     "HarnessStoreCapacityError",
+    "HeldGeneration",
     "ImportProvenanceV1",
     "InteropAssistantContentPartV1",
     "InteropAssistantMessageV1",
@@ -5647,11 +6812,13 @@ __all__ = [
     "ReplaceEntryOp",
     "RuntimeActionV1",
     "RuntimeStateV3",
+    "SessionApiFactsV1",
     "SessionLease",
     "SessionMetadataV1",
     "SessionPin",
     "SetEnvelopeOp",
     "SetHistoryEntriesOp",
+    "SparseHistoryPositionsV1",
     "StoredSession",
     "SubmittedProcessNotificationV1",
     "UnifiedInteropSourceV1",
@@ -5660,6 +6827,7 @@ __all__ = [
     "canonical_json",
     "committed_history",
     "compute_projection_delta",
+    "durable_replace",
     "empty_runtime_state",
     "parse_stored_settings",
     "sha256_json",

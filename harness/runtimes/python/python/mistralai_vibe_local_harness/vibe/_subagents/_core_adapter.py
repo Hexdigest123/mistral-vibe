@@ -43,6 +43,9 @@ class CoreSpawnInput(SubagentModel):
     name: str = Field(min_length=1)
     message: str = Field(min_length=1)
     config_name: str | None = Field(default=None, min_length=1)
+    # Core requires these for a child without ``config_name`` and refuses them
+    # for a named one: a generic child does not get its parent's instructions.
+    instructions: str | None = Field(default=None, min_length=1)
 
     @field_validator("name")
     @classmethod
@@ -98,6 +101,8 @@ def controller_action(
                 "message": spawn.message,
                 "agentType": spawn.config_name,
             }
+            if spawn.instructions is not None:
+                arguments["instructions"] = spawn.instructions
         case "agents.send_message":
             message = CoreMessageInput.model_validate(action.call.arguments)
             arguments = {
@@ -125,7 +130,10 @@ def core_list_output(state: SubagentRuntimeState) -> dict[str, JsonValue]:
         error: str | None = None
         match child.state:
             case (
-                ReservedChild() | CreationFailedChild() | CreationCleanupPendingChild()
+                ReservedChild()
+                | CreationFailedChild()
+                | CreationCleanupPendingChild()
+                | ChildTombstone()
             ):
                 continue
             case RunningChild():
@@ -134,8 +142,6 @@ def core_list_output(state: SubagentRuntimeState) -> dict[str, JsonValue]:
                 status = "idle"
             case TurnFailedChild(outcome=outcome):
                 status, error = "failed", outcome.failure.message
-            case ChildTombstone():
-                status, error = "failed", "Child Session is closed and unavailable"
             case DeletingIdleChild() | DeletingRunningChild():
                 status, error = "failed", "Child Session is closing"
         item: dict[str, JsonValue] = {

@@ -8,6 +8,7 @@ use serde_json::Value;
 use super::connector_web;
 use super::effect_output::*;
 use crate::utils::clean::clean_output;
+use crate::utils::text::bounded_message;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,6 +19,8 @@ pub struct EffectEntry {
     pub detail: Option<EffectSide>,
     #[serde(default)]
     pub state: Option<EffectState>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
     #[serde(skip)]
     connector_header: OnceLock<Option<connector_web::Header>>,
 }
@@ -77,7 +80,7 @@ impl EffectEntry {
             return None;
         }
         let call = connector_web::Call {
-            tool_name: self.tool_name(),
+            tool_name: self.connector_tool(),
             input: self.input(),
             output: self.output(),
             completed,
@@ -108,18 +111,21 @@ impl EffectEntry {
     /// Result body lines shown on expand.
     pub fn body(&self) -> Vec<BodyLine> {
         let lines = match self.status() {
-            Some("failed") => format!("Error: {}", clean_output(self.error_message()))
-                .lines()
-                .map(str::to_owned)
-                .collect(),
+            Some("failed") => {
+                let error = clean_output(&bounded_message(self.error_message()));
+                format!("Error: {error}")
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            }
             Some("cancelled" | "skipped") => vec![format!("Skipped: {}", self.reason())],
             Some("completed") if self.output().is_some() && self.is_subagent() => {
                 python_json_lines(self.output())
             }
             Some("completed") if self.output().is_some() => {
-                let web = self
-                    .output()
-                    .and_then(|out| connector_web::output(self.tool_name(), self.input(), out));
+                let web = self.output().and_then(|out| {
+                    connector_web::output(self.connector_tool(), self.input(), out)
+                });
                 return match web {
                     Some(web) => format_effect_output(self.kind(), Some(&web)),
                     None => format_effect_output(self.detail_kind(), self.output()),
@@ -142,6 +148,12 @@ impl EffectEntry {
     /// Whether the result folds under a disclosure header; answers always render in full.
     pub fn is_collapsible(&self) -> bool {
         self.kind() != Some("user_question")
+    }
+
+    /// The standalone `wait` the model calls for its background work. A program
+    /// `sleep` is not one: its program still runs around it.
+    pub fn is_model_wait(&self) -> bool {
+        self.tool_name() == Some("self.wait")
     }
 
     /// The state carries a settled verdict.
@@ -196,7 +208,7 @@ impl EffectEntry {
 
     /// The call display's `statusText`, which steers the loading label.
     pub fn status_text(&self) -> &str {
-        if let Some(text) = connector_web::status_text(self.tool_name()) {
+        if let Some(text) = connector_web::status_text(self.connector_tool()) {
             return text;
         }
         self.detail
@@ -223,7 +235,7 @@ impl EffectEntry {
 
     /// The effect's call category (the server's `ToolEffectKind`); web connectors read as built-ins.
     pub fn kind(&self) -> Option<&str> {
-        connector_web::kind(self.tool_name()).or(self.detail_kind())
+        connector_web::kind(self.connector_tool()).or(self.detail_kind())
     }
 
     /// The category the server sent, before any connector reinterpretation.
@@ -231,6 +243,11 @@ impl EffectEntry {
         self.detail
             .as_ref()
             .and_then(|detail| detail.kind.as_deref())
+    }
+
+    fn connector_tool(&self) -> Option<&str> {
+        self.tool_name()
+            .filter(|_| self.detail_kind() == Some("tool"))
     }
 
     fn tool_name(&self) -> Option<&str> {

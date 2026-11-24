@@ -316,11 +316,16 @@ class ProtocolError(SessionProtocolModel):
 
 
 class PublicError(SessionProtocolModel):
-    """Client-facing error details; retry policy remains runtime-private."""
+    """Client-facing error details."""
 
     message: str
     code: str | None = None
     details: JsonValue = None
+    # Set only on a failed Turn's error: whether the same request may succeed
+    # if sent again, as the Runtime decided. Absent means false or not
+    # recorded (older errors). Omitted while false, so older readers still
+    # read an error that is not retryable.
+    retryable: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 class TokenUsage(SessionProtocolModel):
@@ -441,10 +446,26 @@ class CompletedPublicTurn(SessionProtocolModel):
     # ``limit``: the Turn hit its iteration limit. ``length``: its last answer
     # was cut off at the output-token cap.
     stop_reason: Literal["limit", "length"] | None = None
-    # Set only when a ``pre_agent_turn`` hook skipped the Turn: the text of the
-    # hook's reason, which is the Turn's whole output. Omitted when unset so a
-    # Turn that was not skipped stays readable by a reader without this field.
+    # Set only when a ``pre_agent_turn`` hook skipped the Turn, or a
+    # ``pre_llm_call`` hook skipped one of its model calls: the text of the
+    # hook's reason, which is the Turn's whole output; empty when a
+    # ``pre_llm_call`` hook gave none. Omitted when unset so a Turn that was not
+    # skipped stays readable by a reader without this field.
     skip_reason: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # Set only when a ``post_llm_call`` or ``post_agent_turn`` hook rejected the
+    # Turn's answer: the text of the hook's reason, which is the Turn's whole
+    # output. Omitted when unset so a Turn that was not rejected stays readable by
+    # a reader without this field.
+    reject_reason: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # Set only when Core stopped the Turn because the same tool call failed
+    # repeatedly: the text it ended the Turn with, which is the Turn's whole
+    # output. A field of its own, not a ``stop_reason`` value, so a reader that
+    # predates it still loads the Turn. Omitted when unset.
+    repeated_tool_failure: str | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 

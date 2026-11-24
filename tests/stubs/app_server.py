@@ -25,8 +25,14 @@ from vibe.app_server.protocol import (
     SessionPeerArchiveResponse,
     SessionPeerListParams,
     SessionPeerListResponse,
+    SessionPeerMarkSeenParams,
+    SessionPeerMarkSeenResponse,
     SessionPeerReadParams,
     SessionPeerReadResponse,
+    SessionPeerRenameParams,
+    SessionPeerRenameResponse,
+    SessionPeerRestoreParams,
+    SessionPeerRestoreResponse,
     SessionPeerSendParams,
     SessionPeerSendResponse,
     SessionSpawnParams,
@@ -88,6 +94,21 @@ class FakeSessionBackendServices:
     async def archive_peer_sessions(
         self, params: SessionPeerArchiveParams
     ) -> SessionPeerArchiveResponse:
+        raise SessionPeerError("This client cannot reach other sessions")
+
+    async def restore_peer_sessions(
+        self, params: SessionPeerRestoreParams
+    ) -> SessionPeerRestoreResponse:
+        raise SessionPeerError("This client cannot reach other sessions")
+
+    async def rename_peer_session(
+        self, params: SessionPeerRenameParams
+    ) -> SessionPeerRenameResponse:
+        raise SessionPeerError("This client cannot reach other sessions")
+
+    async def mark_peer_sessions_seen(
+        self, params: SessionPeerMarkSeenParams
+    ) -> SessionPeerMarkSeenResponse:
         raise SessionPeerError("This client cannot reach other sessions")
 
 

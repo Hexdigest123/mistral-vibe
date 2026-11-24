@@ -72,16 +72,45 @@ fn input_classification_distinguishes_bash_skill_and_prompt() {
 }
 
 #[test]
-fn teleport_commands_are_classified_as_commands_without_configuration() {
-    for command in ["/teleport", "/remote-project"] {
+fn removed_commands_are_reported_instead_of_sent() {
+    for (value, name) in [
+        ("/teleport", "/teleport"),
+        ("/Teleport fix the tests", "/teleport"),
+        ("/remote-project", "/remote-project"),
+    ] {
         assert_eq!(
-            classify(command, &[]),
-            ClassifiedInput::SlashCommand { command }
+            classify(value, &[]),
+            ClassifiedInput::RemovedCommand {
+                command: name,
+                version: "3.1.1"
+            },
+            "{value:?}"
         );
     }
-    assert!(!vibe_rs::commands::is_side_channel("/teleport"));
-    assert!(vibe_rs::commands::is_side_channel("/remote-project"));
-    assert!(vibe_rs::commands::waits_for_jobs("/remote-project"));
+    assert_eq!(
+        classify("&deploy", &[]),
+        ClassifiedInput::Prompt {
+            text: "&deploy".to_owned()
+        }
+    );
+    assert_eq!(
+        classify_submitted(InputMode::Prompt, " /teleport", &[]),
+        ClassifiedInput::Prompt {
+            text: " /teleport".to_owned()
+        }
+    );
+}
+
+#[test]
+fn a_skill_named_like_a_removed_command_still_runs() {
+    let skills = vec![Skill::new("teleport", "Custom teleport")];
+    assert_eq!(
+        classify("/teleport", &skills),
+        ClassifiedInput::Skill {
+            command: "/teleport".to_owned(),
+            name: "teleport".to_owned(),
+        }
+    );
 }
 
 #[test]
@@ -152,7 +181,7 @@ fn a_mode_character_opens_its_mode_only_over_empty_or_fully_selected_text() {
 
 #[test]
 fn backspace_at_the_start_leaves_the_mode_and_keeps_the_text() {
-    for mode in [InputMode::Slash, InputMode::Bash, InputMode::Teleport] {
+    for mode in [InputMode::Slash, InputMode::Bash] {
         let mut input = prompt("config", 0, None);
         input.mode = mode;
         assert!(input.apply_mode_key(&key(KeyCode::Backspace)));

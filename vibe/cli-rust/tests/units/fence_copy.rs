@@ -35,7 +35,7 @@ fn fenced_app(code: &str) -> App {
     let height = markdown::render(&text, WIDTH).len() as u16;
     app.view
         .transcript_cache
-        .ensure_context(WIDTH, WIDTH, 0, false);
+        .ensure_context(WIDTH, WIDTH, 0, false, false);
     app.view.transcript_cache.store_layout(
         app.view.transcript.revision(),
         WIDTH,
@@ -47,11 +47,15 @@ fn fenced_app(code: &str) -> App {
             prewrapped: true,
         }],
         None,
+        Vec::new(),
     );
     app.view.selection_region.area = Rect::new(0, 0, WIDTH, 40);
     app.view.selection_region.document = true;
     // The copy selects the message only: the banner sits above it.
-    let banner = app.view.banner.view(&app.session.startup_config, WIDTH);
+    let banner = app
+        .view
+        .banner
+        .view(&app.session.startup_config, None, WIDTH);
     let top = i32::from(banner.lines().len() as u16 + 1);
     app.view.selection_region.end_exclusive = true;
     app.selection.region = Some(Selection {
@@ -137,6 +141,76 @@ fn copying_keeps_rail_colored_content_inside_a_fence() {
     // The content rail copies; the box's rails do not.
     assert_eq!(copied.matches('│').count(), 1);
     assert!(copied.contains("fn main() {"));
+}
+
+#[test]
+fn copying_the_warnings_box_skips_its_warning_colored_frame() {
+    use ratatui::prelude::Widget;
+    use ratatui::widgets::Paragraph;
+    use vibe_rs::ui::theme;
+
+    let text = "- first warning\n- second warning";
+    let lines = markdown::framed(text, 40, "Warnings", theme::warning(), |_| false);
+    let area = Rect::new(0, 0, 40, lines.len() as u16);
+    let mut buf = Buffer::empty(area);
+    for (y, line) in lines.lines().iter().enumerate() {
+        let row = Rect {
+            y: y as u16,
+            height: 1,
+            ..area
+        };
+        Paragraph::new(line.clone()).render(row, &mut buf);
+    }
+    let mut app = App::default();
+    app.view.selection_region.area = area;
+    app.selection.region = Some(Selection {
+        owner: RegionId::Main,
+        anchor: (0, 0),
+        head: (area.right() - 1, i32::from(area.bottom() - 1)),
+        pending_copy: false,
+        edge_scroll: 0,
+        scroll_target: ScrollTarget::Transcript,
+        table_cell: None,
+        text: String::new(),
+    });
+    let spans = region::spans(&app, &buf, area);
+    assert!(
+        spans.iter().all(|&(_, x0, x1)| x0 >= 2 && x1 < 38),
+        "{spans:?}"
+    );
+    assert_eq!(
+        region::extract(&buf, &spans),
+        "• first warning\n• second warning"
+    );
+}
+
+#[test]
+fn copying_a_warning_row_keeps_its_box_glyphs() {
+    use ratatui::prelude::Widget;
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use vibe_rs::ui::theme;
+
+    let style = Style::default().fg(theme::warning());
+    let row = Line::from(vec![Span::styled("⚠ tree │ a │", style)]);
+    let area = Rect::new(0, 0, 40, 1);
+    let mut buf = Buffer::empty(area);
+    Paragraph::new(row).render(area, &mut buf);
+    let mut app = App::default();
+    app.view.selection_region.area = area;
+    app.selection.region = Some(Selection {
+        owner: RegionId::Main,
+        anchor: (0, 0),
+        head: (area.right() - 1, 0),
+        pending_copy: false,
+        edge_scroll: 0,
+        scroll_target: ScrollTarget::Transcript,
+        table_cell: None,
+        text: String::new(),
+    });
+    let copied = region::extract(&buf, &region::spans(&app, &buf, area));
+    assert_eq!(copied, "⚠ tree │ a │");
 }
 
 #[test]

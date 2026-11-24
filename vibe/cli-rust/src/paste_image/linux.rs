@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -155,14 +155,16 @@ pub fn capture_with_timeout(command: &mut Command) -> Option<Vec<u8>> {
         stdout.read_to_end(&mut data).ok()?;
         Some(data)
     });
-    let deadline = Instant::now() + READ_TIMEOUT;
+    let deadline = crate::clock::real_now() + READ_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => {
                 return reader.join().ok().flatten().filter(|data| !data.is_empty());
             }
             Ok(Some(_)) => return None,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) if crate::clock::real_now() < deadline => {
+                thread::sleep(Duration::from_millis(10))
+            }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();

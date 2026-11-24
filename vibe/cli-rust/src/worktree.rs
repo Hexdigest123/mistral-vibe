@@ -91,39 +91,39 @@ pub fn track_entry(app: &mut App, params: &Value) {
     }
 }
 
+/// Track a snapshot's worktree.
+pub fn adopt_state(app: &mut App, state: &PublicSessionState) {
+    track_state(app, state);
+}
+
 /// Track the session's worktree from a snapshot's history page, falling back
 /// to the session state's reported worktree when the page misses the effect.
 /// A page miss never drops a tracked worktree (the server keeps the last
 /// `HISTORY_LIMIT` entries and the start-of-session effect is the first, so
 /// long sessions legitimately lose it) and never moves the cwd backwards:
 /// the session's own cwd is the move's authoritative value, applied after the
-/// worktree so a root-only worktree path cannot shadow it.
-pub fn track_state(app: &mut App, state: &PublicSessionState) {
+/// worktree so a root-only worktree path cannot shadow it. True when the
+/// tracked worktree changed.
+pub fn track_state(app: &mut App, state: &PublicSessionState) -> bool {
     let info =
         WorktreeInfo::from_state(state).or_else(|| WorktreeInfo::from_session(&state.session));
-    if let Some(info) = info {
-        track(app, info);
-        // Applied inside the worktree arm only, never on its own: a snapshot
-        // from before the move (session still in the checkout, no worktree
-        // in the history page) must not drag the footer back.
-        if let Some(cwd) = &state.session.cwd {
-            app.session.cwd = Some(cwd.clone());
-        }
+    let Some(info) = info else {
+        return false;
+    };
+    // A session that `/cd` took out of its worktree keeps the effect in its
+    // history: the worktree is left behind, not the session's any more.
+    let left = |cwd: &String| !std::path::Path::new(cwd).starts_with(&info.path);
+    if state.session.cwd.as_ref().is_some_and(left) {
+        return false;
     }
-}
-
-/// A `session/updated` JSON patch's `replace` ops as (path, value): the shape
-/// every worktree move arrives in, with a missing value read as null.
-pub fn replace_ops(ops: &Value) -> impl Iterator<Item = (&str, &Value)> {
-    ops.as_array()
-        .into_iter()
-        .flatten()
-        .filter(|op| op.get("op") == Some(&Value::String("replace".into())))
-        .filter_map(|op| {
-            op.get("path")
-                .and_then(Value::as_str)
-                .map(|path| (path, op.get("value").unwrap_or(&Value::Null)))
-        })
+    let moved = track(app, info);
+    // Applied inside the worktree arm only, never on its own: a snapshot
+    // from before the move (session still in the checkout, no worktree
+    // in the history page) must not drag the footer back.
+    if let Some(cwd) = &state.session.cwd {
+        set_cwd(app, cwd.clone());
+    }
+    moved
 }
 
 /// Apply a `session/updated` patch: the move to the worktree arrives as
@@ -136,7 +136,7 @@ pub fn replace_ops(ops: &Value) -> impl Iterator<Item = (&str, &Value)> {
 /// tracking rather than being clobbered by it.
 pub fn track_patch(app: &mut App, patch: &Value) {
     let mut cwd: Option<String> = None;
-    for (path, value) in replace_ops(patch) {
+    for (path, value) in crate::utils::json::replace_ops(patch) {
         match path {
             "/cwd" => {
                 if let Some(value) = value.as_str() {
@@ -160,23 +160,33 @@ pub fn track_patch(app: &mut App, patch: &Value) {
         }
     }
     if let Some(cwd) = cwd {
-        app.session.cwd = Some(cwd);
+        set_cwd(app, cwd);
     }
 }
 
 /// Follow the server-side move: the session now runs in the worktree, so the
 /// client's notion of its cwd follows. The worktree's path is the root, so
 /// this is the fallback; a snapshot's session cwd or the announce's `/cwd`
-/// value refines it to the subdirectory the session actually runs in.
-pub fn track(app: &mut App, info: WorktreeInfo) {
+/// value refines it to the subdirectory the session actually runs in. True
+/// when the tracked worktree changed.
+pub fn track(app: &mut App, info: WorktreeInfo) -> bool {
     if app.session.worktree.as_ref() == Some(&info) {
-        return;
+        return false;
     }
     tracing::info!(
         worktree = info.name,
         branch = info.branch,
         "session worktree tracked"
     );
-    app.session.cwd = Some(info.path.clone());
+    set_cwd(app, info.path.clone());
     app.session.worktree = Some(info);
+    true
+}
+
+/// The session runs in `cwd` now: the footer and the config a later resume or
+/// `/cd` sends move together, or `/cd` back to the checkout would find nothing
+/// to move.
+fn set_cwd(app: &mut App, cwd: String) {
+    app.session.agent_config.cwd = Some(cwd.clone());
+    app.session.cwd = Some(cwd);
 }

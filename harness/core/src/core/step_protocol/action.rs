@@ -10,6 +10,7 @@ use crate::core::tools::external::{
     ExternalTool, ExternalToolCall, ProvidedToolCall, RuntimeBuiltinToolCall,
 };
 use crate::core::wire::message::Message;
+use crate::core::wire::user_message::OutputType;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -114,6 +115,10 @@ pub(crate) enum Action {
         iteration: u32,
         max_iterations: Option<u32>,
         model_input: ModelInputUpdate,
+        /// The Turn's output type, on its agent completions only. Omitted when
+        /// the Turn has none, so actions recorded before the field match.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_type: Option<OutputType>,
     },
     #[serde(rename = "runtime_builtin_tool_call")]
     RuntimeBuiltinTool {
@@ -123,6 +128,10 @@ pub(crate) enum Action {
         #[serde(rename = "call_id")]
         operation_id: String,
         call: RuntimeBuiltinToolCall,
+        /// The `run_typescript` call whose program made this call. Omitted for a
+        /// call the model made directly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_call_id: Option<String>,
     },
     #[serde(rename = "provided_tool_call")]
     ProvidedTool {
@@ -132,6 +141,10 @@ pub(crate) enum Action {
         #[serde(rename = "call_id")]
         operation_id: String,
         call: ProvidedToolCall,
+        /// The `run_typescript` call whose program made this call. Omitted for a
+        /// call the model made directly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_call_id: Option<String>,
     },
     #[serde(rename = "hook_call")]
     Hook {
@@ -190,14 +203,27 @@ impl Action {
                     .call
                     .runtime_builtin_call()
                     .expect("matched Runtime built-in call"),
+                parent_call_id: None,
             },
             ExternalTool::Provided { .. } => Self::ProvidedTool {
                 effect_id: call.action_id.clone(),
                 turn_id: turn_id.to_string(),
                 operation_id: call.call_id.clone(),
                 call: call.call.provided_call().expect("matched provided call"),
+                parent_call_id: None,
             },
         }
+    }
+
+    /// Names `program_call_id`, the `run_typescript` call, as the parent of a
+    /// tool call Action that its program made. Other Actions are unchanged.
+    pub(crate) fn issued_by_program(mut self, program_call_id: &str) -> Self {
+        if let Self::RuntimeBuiltinTool { parent_call_id, .. }
+        | Self::ProvidedTool { parent_call_id, .. } = &mut self
+        {
+            *parent_call_id = Some(program_call_id.to_string());
+        }
+        self
     }
 
     pub(crate) fn filesystem_write(

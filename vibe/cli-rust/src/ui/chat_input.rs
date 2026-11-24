@@ -3,31 +3,37 @@
 use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::composer_layout::{ComposerLayout, Row};
+use super::composer_title;
 use super::tab_cells::{cells, cells_width};
 use super::theme;
 use crate::agents;
 use crate::app::{App, Status};
 use crate::mentions::Mention;
-use crate::server::AgentSafety;
 
-/// Border and border-title colors per agent safety.
-fn safety_colors(safety: AgentSafety) -> (Color, Color) {
-    match safety {
-        AgentSafety::Safe => (theme::success(), theme::success()),
-        AgentSafety::Neutral => (theme::popup_border(), theme::muted()),
-        AgentSafety::Destructive => (theme::warning(), theme::warning()),
-        AgentSafety::Smart => (theme::warning(), theme::warning()),
-        AgentSafety::Yolo => (theme::error(), theme::error()),
-    }
-}
+/// The empty composer's placeholder while a message would steer an agent that only waits.
+const STEER_PLACEHOLDER: &str = "Send a message to steer";
 
 /// Draw the chat input, returning the caret's screen cell while it is in view and takes keys.
-pub fn draw(app: &App, f: &mut Frame, area: Rect) -> Option<Position> {
+pub fn draw(app: &mut App, f: &mut Frame, area: Rect) -> Option<Position> {
+    let title = composer_title::title(app, area.width);
+    composer_title::place_model(app, area, &title);
+    let caret = draw_box(app, f, area, title.line);
+    if app
+        .view
+        .mouse_position
+        .is_some_and(|at| composer_title::model_at(app, at))
+    {
+        super::list_hover::paint_button(f.buffer_mut(), app.view.model_area);
+    }
+    caret
+}
+
+fn draw_box(app: &App, f: &mut Frame, area: Rect, title: Line<'static>) -> Option<Position> {
     // The chat input is usable as soon as the cached startup config is shown; it
     // buffers input locally while the app server is still loading (`Starting`),
     // so the caret and normal text show throughout. Only a failed start stays inert.
@@ -35,29 +41,26 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) -> Option<Position> {
     // Queue selection locks the input read-only and hides the caret (ADR 0013),
     // but leaves the draft it holds styled like ordinary input.
     let selecting = app.queue.selected.is_some() && !app.queue.editing;
-    let profile = agents::displayed(app);
-    let bypass = agents::bypass_tool_permissions(app);
-    let (border, title_color) = safety_colors(agents::indicator_safety(profile, bypass));
-    let title = Line::from(vec![
-        Span::styled(
-            format!(" {} ", agents::indicator_agent_name(profile, bypass)),
-            Style::default().fg(title_color),
-        ),
-        Span::styled("─", Style::default().fg(border)),
-    ]);
-    // Reserve one column on the right for the chat input content: a 1-cell
-    // scrollbar gutter (bar hidden), so text wraps and ends one column before
-    // the edge. The top/bottom borders still
-    // span the full width; only the inner content is inset.
+    let border = theme::border_style();
+    // Like vim, only Insert mode is labelled, mirroring the agent title's corner.
+    let inserting = crate::vim::inserting(app);
+    let vim_mode = match inserting {
+        true => Line::from(vec![
+            Span::styled("─", border),
+            Span::styled(" INSERT ", theme::text(theme::foreground())),
+        ]),
+        false => Line::default(),
+    };
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(border))
-        .padding(Padding::right(1))
+        .border_style(border)
         .title(title)
+        .title_bottom(vim_mode.left_aligned())
+        .title_bottom(composer_title::stash_hint(app))
         .title_alignment(Alignment::Right);
 
     // A slow agent switch, then recording, replace the prompt marker with their own glyph.
-    let cursor = crate::chat_input::clamp_offset(&app.chat_input.input, app.chat_input.cursor);
+    let cursor = crate::vim::caret(app);
     let marker = match agents::spinner_glyph(app).or_else(|| super::recording_indicator::glyph(app))
     {
         Some(glyph) => format!("{glyph} "),
@@ -71,23 +74,50 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) -> Option<Position> {
     } else {
         theme::muted_style()
     };
-    let owns_keys = editable && !selecting && !app.subagents.list.focused;
-    let caret = (owns_keys && app.main_input_cursor_on()).then_some(body_off);
+    // While searching, the bottom bar owns the caret and the composer previews the match.
+    let owns_keys = editable
+        && !selecting
+        && !app.subagents.list.focused
+        && !app.rail.focused
+        && app.reverse_search.is_none();
+    let caret_on = owns_keys && app.main_input_cursor_on();
+    // Vim Insert mode shows the terminal's bar cursor instead of a painted block.
+    let bar = inserting && crate::input::composer_owns_key(app);
+    let caret = caret_on.then_some(body_off).filter(|_| !bar);
     let sel =
         crate::chat_input::selection_range(&app.chat_input.input, cursor, app.chat_input.anchor);
-    let hint = crate::commands::argument_hint(app.chat_input.mode.prefix(), body);
+    let prefix = app.chat_input.mode.prefix();
+    // Only an empty composer taking keys, without a command prefix, sends a steer.
+    let steer =
+        owns_keys && prefix.is_none() && body.is_empty() && crate::background_work::steerable(app);
+    let hint = crate::commands::argument_hint(prefix, body)
+        .map(|h| (h, theme::muted_style()))
+        .or(steer.then(|| (STEER_PLACEHOLDER, theme::placeholder_style())));
     let mentions = app.chat_input.mentions.spans(body);
     let mention_style = if editable {
         theme::text(theme::text_primary())
     } else {
         input_style
     };
+    let found = super::reverse_search::found(app);
 
     // A pasted block keeps its line breaks: the marker leads the first row and
     // continuation rows align under the text with a two-space gutter.
     let layout = ComposerLayout::new(body, &marker, body_off, area.width);
+    // When the chat input has grown to its cap and the caret is below the visible
+    // content rows, scroll so the caret line stays in view at the bottom.
+    let content_h = area.height.saturating_sub(2) as usize;
+    let max_scroll = layout.height().saturating_sub(content_h as u16);
+    let scroll = app
+        .chat_input
+        .scroll
+        .unwrap_or_else(|| layout.scroll(content_h))
+        .min(max_scroll);
+    // Only the rows in view are styled: a long draft costs no more than a short one.
     let lines: Vec<Line> = layout
         .rows()
+        .skip(scroll as usize)
+        .take(content_h)
         .map(|row| {
             let gutter = if row.index == 0 {
                 Span::styled(marker.clone(), prompt_style)
@@ -107,20 +137,12 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) -> Option<Position> {
                 input: input_style,
                 mention: mention_style,
                 mentions: row_mentions(mentions, row),
+                found: row_mentions(&found, row),
             };
             let row_hint = hint.filter(|_| row.end() == body.len());
             render_body_line(gutter, row, line_sel, caret_col, &styles, row_hint)
         })
         .collect();
-    // When the chat input has grown to its cap and the caret is below the visible
-    // content rows, scroll so the caret line stays in view at the bottom.
-    let content_h = area.height.saturating_sub(2) as usize;
-    let max_scroll = layout.height().saturating_sub(content_h as u16);
-    let scroll = app
-        .chat_input
-        .scroll
-        .unwrap_or_else(|| layout.scroll(content_h))
-        .min(max_scroll);
     let cursor_line_bg = theme::input_cursor_line_bg();
     let cursor_row = layout.caret_row();
     let caret_y = (cursor_row >= scroll as usize && cursor_row < scroll as usize + content_h)
@@ -135,8 +157,11 @@ pub fn draw(app: &App, f: &mut Frame, area: Rect) -> Option<Position> {
         );
     }
     let caret_cell = caret_y.and_then(|y| caret_position(&layout, cursor_row, &marker, area.x, y));
-    let para = Paragraph::new(lines).scroll((scroll, 0)).block(block);
+    let para = Paragraph::new(lines).block(block);
     f.render_widget(para, area);
+    if let Some(cell) = caret_cell.filter(|_| bar && caret_on) {
+        f.set_cursor_position(cell);
+    }
     if scroll > 0 && area.height > 2 {
         f.buffer_mut()
             .set_string(area.x, area.y + 1, marker, prompt_style);
@@ -159,18 +184,13 @@ fn caret_position(
 }
 
 fn composer_layout(app: &App, width: u16) -> ComposerLayout<'_> {
-    let cursor = crate::chat_input::clamp_offset(&app.chat_input.input, app.chat_input.cursor);
+    let cursor = crate::vim::caret(app);
     ComposerLayout::new(
         &app.chat_input.input,
         app.chat_input.mode.marker(),
         cursor,
         width,
     )
-}
-
-/// Count composer rows at `width`, including soft wraps.
-pub fn content_height(app: &App, width: u16) -> u16 {
-    composer_layout(app, width).height()
 }
 
 /// Current hidden composer viewport top row, clamped to the rendered content.
@@ -200,18 +220,14 @@ struct BodyStyles {
     input: Style,
     mention: Style,
     mentions: Vec<(usize, usize)>,
+    found: Vec<(usize, usize)>,
 }
 
 impl BodyStyles {
     fn at(&self, byte: usize) -> Style {
-        match self
-            .mentions
-            .iter()
-            .any(|&(lo, hi)| lo <= byte && byte < hi)
-        {
-            true => self.mention,
-            false => self.input,
-        }
+        let inside = |ranges: &[_]| ranges.iter().any(|&(lo, hi)| lo <= byte && byte < hi);
+        let base = [self.input, self.mention][usize::from(inside(&self.mentions))];
+        super::reverse_search::style(base, inside(&self.found))
     }
 }
 
@@ -232,14 +248,14 @@ fn row_mentions(mentions: &[Mention], row: Row<'_>) -> Vec<(usize, usize)> {
 /// Build one chat input row: base text, the selection range reversed, and the caret
 /// cell as a solid block (trailing when the caret is at the line end). `sel` and
 /// `caret` are byte columns within the row. Adjacent graphemes sharing a style are
-/// coalesced into one span; a tab draws as spaces up to its stop. `hint` trails the text muted.
+/// coalesced into one span; a tab draws as spaces up to its stop. `hint` trails the text in its style.
 fn render_body_line(
     gutter: Span<'static>,
     row: Row<'_>,
     sel: Option<(usize, usize)>,
     caret: Option<usize>,
     styles: &BodyStyles,
-    hint: Option<&'static str>,
+    hint: Option<(&'static str, Style)>,
 ) -> Line<'static> {
     let input_style = styles.input;
     // The caret block: a solid $input-cursor-background
@@ -284,7 +300,7 @@ fn render_body_line(
         spans.push(Span::styled(buf, s));
     }
     // Caret at the line end: a block on the trailing cell, or on the hint's first char.
-    let mut hint = hint.unwrap_or_default();
+    let (mut hint, hint_style) = hint.unwrap_or(("", theme::muted_style()));
     if caret.is_some_and(|c| c >= text.len()) {
         let split = hint.chars().next().map_or(0, char::len_utf8);
         let cell = if split == 0 { " " } else { &hint[..split] };
@@ -292,7 +308,7 @@ fn render_body_line(
         hint = &hint[split..];
     }
     if !hint.is_empty() {
-        spans.push(Span::styled(hint, theme::muted_style()));
+        spans.push(Span::styled(hint, hint_style));
     }
     Line::from(spans)
 }

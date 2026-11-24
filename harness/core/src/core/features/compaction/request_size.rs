@@ -18,6 +18,10 @@ use crate::core::state::{ActivePhase, TurnState};
 use crate::core::step_protocol::ToolDefinition;
 use crate::core::wire::message::{Message, StoredMessage};
 
+/// The least share of its corrected estimate a request is counted at when the
+/// provider reported the size of the context it extends.
+pub(crate) const MIN_FACTOR: f64 = 0.5;
+
 /// What a compaction works with, given the session's settings, tool
 /// catalog and estimate correction.
 pub(crate) fn compaction_inputs<'a>(
@@ -35,7 +39,7 @@ pub(crate) fn compaction_inputs<'a>(
 pub(crate) fn model_input_reaches_compaction_threshold(
     state: &HarnessState,
 ) -> Result<bool, CoreError> {
-    let Some(limits) = CompactionLimits::from_settings(&state.config.settings.context) else {
+    let Some(limits) = CompactionLimits::from_settings(&state.config().settings.context) else {
         return Ok(false);
     };
     Ok(corrected_model_input_tokens(state)? >= limits.threshold)
@@ -45,12 +49,15 @@ pub(crate) fn model_input_reaches_compaction_threshold(
 /// context made.
 ///
 /// Call it before the reply joins the context: the correction compares the
-/// reported input with the estimate of the request that was sent.
+/// reported input with the estimate of the request that was sent. Usage
+/// reporting no input measures nothing, as a reply without usage.
 pub(crate) fn record_reply_size(
     state: &mut HarnessState,
     input_tokens: Option<u64>,
     context_tokens: Option<u64>,
 ) -> Result<(), CoreError> {
+    let input_tokens = input_tokens.filter(|&tokens| tokens > 0);
+    let context_tokens = context_tokens.filter(|_| input_tokens.is_some());
     if let Some(input_tokens) = input_tokens {
         let estimate = estimate_agent_request_tokens(state)?;
         state.estimate_correction = EstimateCorrection::measured(input_tokens, estimate);
@@ -97,8 +104,8 @@ fn request_revision(state: &HarnessState) -> Option<RequestRevision> {
 /// The size of the next agent request as the check sees it.
 pub(crate) fn corrected_model_input_tokens(state: &HarnessState) -> Result<u64, CoreError> {
     corrected_request_tokens(
-        &state.config.settings,
-        state.resolved_tools.top_level_tools(),
+        &state.config().settings,
+        state.resolved_tools().top_level_tools(),
         state.context.messages(),
         RequestMeasurements::of(state),
     )
@@ -136,10 +143,12 @@ impl RequestMeasurements {
 /// sees it.
 ///
 /// An exact count of this request, when a Runtime gave one, is the size.
-/// Otherwise the byte estimate, multiplied by the session's correction `r`, is
-/// one view. The provider's last reported size plus the corrected estimate of
-/// the messages added since the reply it reported on is the other. The check
-/// trusts whichever is larger.
+/// Without a reported size, the byte estimate multiplied by the session's
+/// correction `r` is. With one, the size is the provider's last reported size
+/// plus the corrected estimate of the messages added since the reply it
+/// reported on, never less than [`MIN_FACTOR`] of the corrected estimate: a
+/// reported size below the estimate counts, but odd usage cannot shrink a
+/// request to a small share of it.
 pub(crate) fn corrected_request_tokens(
     settings: &HarnessSettings,
     tools: &[ToolDefinition],
@@ -153,10 +162,10 @@ pub(crate) fn corrected_request_tokens(
     let image_cost = settings.context.model_facts.image_cost;
     let estimate = estimate_request_tokens(settings, tools, messages)?;
     let r = measurements.correction;
-    let whole = r.apply(estimate);
     let Some(reported) = measurements.last_reported else {
-        return Ok(whole);
+        return Ok(r.apply(estimate));
     };
+    let least = r.apply((estimate as f64 * MIN_FACTOR).ceil() as u64);
     let after_last_reply = messages
         .iter()
         .rposition(|message| matches!(message.message, Message::Assistant { .. }))
@@ -171,15 +180,15 @@ pub(crate) fn corrected_request_tokens(
             image_cost,
         )?)
     };
-    Ok(whole.max(reported.saturating_add(added)))
+    Ok(least.max(reported.saturating_add(added)))
 }
 
 /// The uncorrected estimate of the agent request the current context makes,
 /// tools included.
 pub(crate) fn estimate_agent_request_tokens(state: &HarnessState) -> Result<u64, CoreError> {
     estimate_request_tokens(
-        &state.config.settings,
-        state.resolved_tools.top_level_tools(),
+        &state.config().settings,
+        state.resolved_tools().top_level_tools(),
         state.context.messages(),
     )
 }
@@ -209,8 +218,8 @@ pub(crate) fn estimate_summary_request_tokens(state: &HarnessState) -> Result<u6
         },
         _ => return Err(invalid_state()),
     };
-    let tools = state.resolved_tools.top_level_tools();
-    let inputs = compaction_inputs(&state.config.settings, tools, state.estimate_correction);
+    let tools = state.resolved_tools().top_level_tools();
+    let inputs = compaction_inputs(&state.config().settings, tools, state.estimate_correction);
     pending
         .projection()
         .request_estimate(tools, inputs.budgets.request)
@@ -239,13 +248,28 @@ mod tests {
         .state;
         let state = reply_with_input_tokens(state, 1);
         assert_eq!(state.estimate_correction, EstimateCorrection::NONE);
+        assert_eq!(state.last_reported_context_tokens, Some(8));
+
+        // Usage reporting no input measures nothing and leaves no reported size.
+        let mut state = advance(
+            state,
+            user_message_for("turn-3", "again", UserMessageMode::Queue),
+        )
+        .unwrap()
+        .state;
+        state.estimate_correction = correction(2.0);
+        let state = reply_with_input_tokens(state, 0);
+        assert_eq!(state.estimate_correction, correction(2.0));
+        assert_eq!(state.last_reported_context_tokens, None);
     }
 
     #[test]
     fn the_check_multiplies_the_estimate_by_the_correction() {
-        let mut state = started();
+        let mut state = started_with_long_request();
         let estimate = estimate_agent_request_tokens(&state).unwrap();
-        set_threshold(&mut state.config.settings, estimate + 1);
+        edit_config(&mut state, |config| {
+            set_threshold(&mut config.settings, estimate + 1)
+        });
 
         assert_eq!(corrected_model_input_tokens(&state).unwrap(), estimate);
         assert!(!model_input_reaches_compaction_threshold(&state).unwrap());
@@ -276,7 +300,7 @@ mod tests {
             &messages[last_reply + 1..],
             &[],
             ImageDeliveryMode::Native,
-            state.config.settings.context.model_facts.image_cost,
+            state.config().settings.context.model_facts.image_cost,
         )
         .unwrap();
         assert!(added > 0);
@@ -293,6 +317,22 @@ mod tests {
         assert_eq!(
             corrected_model_input_tokens(&state).unwrap(),
             500_000 + r.apply(added)
+        );
+
+        // A reported size under the estimate counts, down to MIN_FACTOR of
+        // the corrected estimate.
+        let whole = r.apply(estimate_agent_request_tokens(&state).unwrap());
+        state.last_reported_context_tokens = Some(whole * 3 / 4);
+        assert_eq!(
+            corrected_model_input_tokens(&state).unwrap(),
+            whole * 3 / 4 + r.apply(added)
+        );
+        state.last_reported_context_tokens = Some(1);
+        assert_eq!(
+            corrected_model_input_tokens(&state).unwrap(),
+            r.apply(
+                (estimate_agent_request_tokens(&state).unwrap() as f64 * MIN_FACTOR).ceil() as u64
+            )
         );
 
         // Without a reported size only the corrected whole request counts.
@@ -371,13 +411,13 @@ mod tests {
         state.estimate_correction = correction(1.5);
 
         // A change unrelated to the model keeps the correction.
-        let mut settings = state.config.settings.clone();
+        let mut settings = state.config().settings.clone();
         settings.turn.max_iterations = Some(3);
         let mut state = reconfigured(state, settings);
         assert_eq!(state.estimate_correction, correction(1.5));
 
         // A new threshold means new model facts.
-        let mut settings = state.config.settings.clone();
+        let mut settings = state.config().settings.clone();
         settings.context.model_facts.compaction_threshold = 50_000;
         state = reconfigured(state, settings);
         assert_eq!(state.estimate_correction, EstimateCorrection::NONE);

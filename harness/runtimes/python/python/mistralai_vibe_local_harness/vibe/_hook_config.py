@@ -19,14 +19,20 @@ from mistralai_vibe_local_harness.vibe._foreign_hooks import (
     HookProcess,
     HookProcessResolver,
     build_post_agent_turn_handler,
+    build_post_llm_call_handler,
     build_post_tool_call_handler,
+    build_pre_agent_turn_handler,
+    build_pre_llm_call_handler,
     build_pre_tool_call_handler,
 )
 from mistralai_vibe_local_harness.vibe._hook_matcher import binding_id, compile_selector
 from mistralai_vibe_local_harness.vibe._local_actions import (
     HookHandlers,
     PostAgentTurnHookHandler,
+    PostLlmCallHookHandler,
     PostToolCallHookHandler,
+    PreAgentTurnHookHandler,
+    PreLlmCallHookHandler,
     PreToolCallHookHandler,
 )
 
@@ -34,6 +40,9 @@ from mistralai_vibe_local_harness.vibe._local_actions import (
 _AUTHORABLE_POINTS: dict[str, RustHookPoint] = {
     "pre_tool": "pre_tool_call",
     "post_tool": "post_tool_call",
+    "pre_agent": "pre_agent_turn",
+    "pre_llm": "pre_llm_call",
+    "post_llm": "post_llm_call",
     "post_agent": "post_agent_turn",
 }
 
@@ -47,9 +56,10 @@ class ForeignHookDefinition:
     # ``point`` is an authorable name, a key of ``_AUTHORABLE_POINTS``. ``source`` labels
     # the declaring file: a project-root path, ``user`` for ``~/.vibe``, or a value
     # naming a plugin. ``match`` selects tools for ``pre_tool``/``post_tool`` and agents
-    # for ``post_agent``. ``cwd`` and ``env`` default to the session's workspace and
-    # environment; a plugin hook runs in its plugin's directory instead. ``process``,
-    # when set, picks them per run from the session the hook runs in, and wins over both.
+    # for ``pre_agent``/``post_agent``. ``cwd`` and ``env`` default to the session's
+    # workspace and environment; a plugin hook runs in its plugin's directory instead.
+    # ``process``, when set, picks them per run from the session the hook runs in,
+    # and wins over both.
     name: str
     point: str
     command: str
@@ -78,8 +88,8 @@ def compile_foreign_hooks(
 
     Every declaration produces a binding, so no hook can compile to something that never
     fires: a ``match`` binds ``always`` and is applied at call time by the executor,
-    against the called tool or, for ``post_agent``, the agent that finished its turn
-    (see :mod:`._hook_matcher`).
+    against the called tool or, for a turn hook, the agent whose turn it is (see
+    :mod:`._hook_matcher`).
 
     ``tool_catalog`` is accepted and never called. The Vibe app-server still passes the
     catalogue provider this used to need, because ``vibe/uv.lock`` can resolve a
@@ -89,9 +99,7 @@ def compile_foreign_hooks(
     """
     del tool_catalog
     bindings: list[RustHarnessHookBinding] = []
-    pre_tool: dict[str, PreToolCallHookHandler] = {}
-    post_tool: dict[str, PostToolCallHookHandler] = {}
-    post_agent: dict[str, PostAgentTurnHookHandler] = {}
+    handlers = _HandlerMaps()
     seen: set[str] = set()
 
     for definition in definitions:
@@ -112,40 +120,68 @@ def compile_foreign_hooks(
             )
         )
 
+        handlers.add(core_point, bid, definition)
+
+    return CompiledHooks(bindings=tuple(bindings), handlers=handlers.compiled())
+
+
+@dataclass(slots=True)
+class _HandlerMaps:
+    pre_tool: dict[str, PreToolCallHookHandler] = field(default_factory=dict)
+    post_tool: dict[str, PostToolCallHookHandler] = field(default_factory=dict)
+    pre_agent: dict[str, PreAgentTurnHookHandler] = field(default_factory=dict)
+    pre_llm: dict[str, PreLlmCallHookHandler] = field(default_factory=dict)
+    post_llm: dict[str, PostLlmCallHookHandler] = field(default_factory=dict)
+    post_agent: dict[str, PostAgentTurnHookHandler] = field(default_factory=dict)
+
+    def add(
+        self, point: RustHookPoint, bid: str, definition: ForeignHookDefinition
+    ) -> None:
+        name, command, match = definition.name, definition.command, definition.match
+        timeout_s, strict = definition.timeout_s, definition.strict
         process = definition.process or HookProcess(
             cwd=definition.cwd, env=definition.env
         )
-        if core_point == "pre_tool_call":
-            pre_tool[bid] = build_pre_tool_call_handler(
-                name=definition.name,
-                command=definition.command,
-                match=definition.match,
-                timeout_s=definition.timeout_s,
-                strict=definition.strict,
-                process=process,
-            )
-        elif core_point == "post_tool_call":
-            post_tool[bid] = build_post_tool_call_handler(
-                name=definition.name,
-                command=definition.command,
-                match=definition.match,
-                timeout_s=definition.timeout_s,
-                strict=definition.strict,
-                process=process,
-            )
-        else:  # post_agent_turn
-            post_agent[bid] = build_post_agent_turn_handler(
-                name=definition.name,
-                command=definition.command,
-                match=definition.match,
-                timeout_s=definition.timeout_s,
-                strict=definition.strict,
-                process=process,
-            )
+        match point:
+            case "pre_tool_call":
+                self.pre_tool[bid] = build_pre_tool_call_handler(
+                    name=name, command=command, match=match,
+                    timeout_s=timeout_s, strict=strict, process=process,
+                )  # fmt: skip
+            case "post_tool_call":
+                self.post_tool[bid] = build_post_tool_call_handler(
+                    name=name, command=command, match=match,
+                    timeout_s=timeout_s, strict=strict, process=process,
+                )  # fmt: skip
+            case "pre_agent_turn":
+                self.pre_agent[bid] = build_pre_agent_turn_handler(
+                    name=name, command=command, match=match,
+                    timeout_s=timeout_s, strict=strict, process=process,
+                )  # fmt: skip
+            case "pre_llm_call":
+                self.pre_llm[bid] = build_pre_llm_call_handler(
+                    name=name, command=command, match=match,
+                    timeout_s=timeout_s, strict=strict, process=process,
+                )  # fmt: skip
+            case "post_llm_call":
+                self.post_llm[bid] = build_post_llm_call_handler(
+                    name=name, command=command, match=match,
+                    timeout_s=timeout_s, strict=strict, process=process,
+                )  # fmt: skip
+            case "post_agent_turn":
+                self.post_agent[bid] = build_post_agent_turn_handler(
+                    name=name, command=command, match=match,
+                    timeout_s=timeout_s, strict=strict, process=process,
+                )  # fmt: skip
+            case _:
+                raise ValueError(f"hook point {point!r} has no foreign hook")
 
-    return CompiledHooks(
-        bindings=tuple(bindings),
-        handlers=HookHandlers(
-            pre_tool_call=pre_tool, post_tool_call=post_tool, post_agent_turn=post_agent
-        ),
-    )
+    def compiled(self) -> HookHandlers:
+        return HookHandlers(
+            pre_tool_call=self.pre_tool,
+            pre_agent_turn=self.pre_agent,
+            post_tool_call=self.post_tool,
+            post_agent_turn=self.post_agent,
+            pre_llm_call=self.pre_llm,
+            post_llm_call=self.post_llm,
+        )

@@ -13,9 +13,9 @@ from tests.e2e.common import (
     SpawnedVibeProcessFixture,
     poll_until,
     send_ctrl_c_until_quit_confirmation,
-    wait_for_main_screen,
     wait_for_rendered_text,
     wait_for_request_count_while_draining_child_output,
+    wait_for_session_ready,
 )
 from tests.e2e.mock_server import StreamingMockServer
 
@@ -61,7 +61,7 @@ def test_spawn_cli_runs_configured_hook_after_turn(
     _setup_recording_hook(vibe_home, invocation_path)
 
     with spawned_vibe_process(e2e_workdir) as (child, captured):
-        wait_for_main_screen(child, timeout=15)
+        wait_for_session_ready(child, captured, timeout=15)
         child.send("Run the configured hook")
         child.send("\r")
 
@@ -103,19 +103,19 @@ def test_spawn_cli_runs_post_agent_hooks_scoped_to_the_main_agent(
     e2e_workdir: Path,
     spawned_vibe_process: SpawnedVibeProcessFixture,
 ) -> None:
-    # Started without --agent, the session runs the default agent (accept-edits): the
-    # hooks scoped to `main` and to that agent run, the one scoped to a subagent does not.
+    # Started without --agent, the session runs the default agent: the hooks scoped
+    # to `main` and to that agent run, the one scoped to a subagent does not.
     vibe_home = Path(os.environ["VIBE_HOME"])
     # Hooks run in declaration order: `reviewer` goes first so that, were it wrongly
     # selected, its file would exist by the time the other two have run.
     invocation_paths = {
         name: vibe_home / f"hook-{name}.json"
-        for name in ("reviewer", "main", "accept-edits")
+        for name in ("reviewer", "main", "default")
     }
     _setup_recording_hooks(vibe_home, invocation_paths, match=True)
 
     with spawned_vibe_process(e2e_workdir) as (child, captured):
-        wait_for_main_screen(child, timeout=15)
+        wait_for_session_ready(child, captured, timeout=15)
         child.send("Run the scoped hooks")
         child.send("\r")
 
@@ -125,7 +125,7 @@ def test_spawn_cli_runs_post_agent_hooks_scoped_to_the_main_agent(
         poll_until(
             lambda: (
                 invocation_paths["main"].is_file()
-                and invocation_paths["accept-edits"].is_file()
+                and invocation_paths["default"].is_file()
             ),
             timeout=10,
             message="Timed out waiting for the scoped hooks to run",
@@ -135,7 +135,7 @@ def test_spawn_cli_runs_post_agent_hooks_scoped_to_the_main_agent(
         child.expect(pexpect.EOF, timeout=10)
 
     assert not invocation_paths["reviewer"].exists()
-    for name in ("main", "accept-edits"):
+    for name in ("main", "default"):
         invocation = json.loads(invocation_paths[name].read_text(encoding="utf-8"))
         assert invocation["hook_event_name"] == "post_agent"
-        assert invocation["agent_name"] == "accept-edits"
+        assert invocation["agent_name"] == "default"

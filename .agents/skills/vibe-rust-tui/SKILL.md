@@ -18,15 +18,19 @@ UI conventions for `vibe/cli-rust/`. Every screen follows them so the TUI reads 
 - Wording: actions are lowercase verbs (`navigate`, `select`, `close`); keys keep their canonical casing (`Enter`, `Esc`, `Ctrl+C`, `Backspace`). Combined keys use `/` (`Space/Enter`, `Esc/Ctrl+C`).
 - Vertical navigation is `key::NAV` (`↑↓/jk`) whenever j/k work; use `key::ARROWS` (`↑↓`) only where a focused text field owns the letters. Horizontal navigation is `key::LEFT_RIGHT` (`←→`).
 - Footers read `key action  key action`, ending with the Esc hint. Inline status lines (loading line, narrator) are the one exception and read `key to action`.
-- Render every footer through `ui/hint_line.rs` (`draw`, `draw_clipped`, `line`, `spans`, `styled`): they apply the shared key/action styles and clip to the box. Never place hint text with hardcoded x offsets or custom key styles. Center a hint with `hints::width`.
+- Hints are never cut: a footer too wide for its box wraps between `key action` pairs (`hints::rows`), never inside one, and the box grows by the extra rows (`hint_line::extra` for a box's height, `browser_box::chrome` for the shared browser box). Never drop hints to make a footer fit. The one exception is a footer whose `?` unfolds every key (the Sessions page): its one row keeps as many hints as fit, in priority order (`hints::fit`), with `? all keys & marks` pinned to the right edge (`hint_line::draw_pinned`).
+- Render every footer through `ui/hint_line.rs` (`draw`, `draw_footer`, `draw_above`, `lines`, `styled_rows`, `height`): they apply the shared key/action styles and wrap to the width they are given. Never place hint text with hardcoded x offsets or custom key styles. Center a hint with `hints::width`.
 - Onboarding and dialogs follow the same footer form (`Enter continue`, `Esc back`), not sentences like "Press Esc to go back".
 
 ## Keyboard navigation
 
 - Every navigable list accepts `j`/`k` alongside `↑`/`↓` when no text field is focused. Match only plain keys (no Ctrl/Alt/Super) so `Ctrl+J`/`Ctrl+K` keep their editing meaning.
 - Show the navigation keys a screen actually handles: write `↑↓/jk` only where j/k are wired.
+- Tab bars: `←`/`→` switch tabs too, unless a focused text field owns them, and the hint reads `key::TAB_LEFT_RIGHT` (`Tab/←→`).
+- Shift+↑↓ always scrolls the conversation; no screen takes it. A pane of text beside a list scrolls with PageUp/PageDown, and with the arrows only when the screen has no row to move to.
 - Edges: `↑↓`/`jk` (and `←→` across dialog options) wrap at both ends; PageUp/PageDown/Home/End clamp. Move an `OptionList` (`src/option_list.rs`) with `step(down, len, wrap, selectable)`, whose `selectable` skips rows (section headers, notes, blanks) that cannot take the cursor; `list_nav::wrap` is only for the onboarding's fixed two-choice screens. Never hand-roll `saturating_sub`/`min(len - 1)` for arrow moves. The only lists that do not wrap are the ones attached to the composer: Down past the newest queued prompt leaves queue mode, and Up at the top of the subagent list returns focus to the composer.
 - Back: Esc goes back exactly one level (field → list, detail → list, auth flow → its `/mcp` list) and closes only at the top level. Backspace edits text and is never a navigation key. A nested view's footer ends with `hints::BACK` (`Esc back`); a top-level view's footer ends with `hints::CLOSE` or `hints::CANCEL`.
+- Tab: wherever Tab moves through something (form fields, tabs, save targets), Shift+Tab moves back through it, wrapping like Tab. It is implicit: hints show only `Tab`, never `Shift+Tab`. Add the surface to `focus::tab_navigates`, so Shift+Tab reaches it instead of cycling agents, and give it a unit test.
 - Digits: a row's digit shortcut exists if and only if the row displays its number (`1. Trust folder`). Pressing it is the same as moving to the row and pressing Enter. Parse it with `list_nav::digit`; never accept digits on unnumbered rows, and never number rows that do not accept their digit.
 
 ## Scrolling
@@ -49,7 +53,8 @@ UI conventions for `vibe/cli-rust/`. Every screen follows them so the TUI reads 
 - The model: lists open with the list focused; `/` focuses the field; typing filters live (letters, including j/k, go to the field); `↑↓`, PageUp/PageDown and Enter keep acting on the list while the field is focused; Esc first leaves the field (the filter stays), then clears the filter, then closes the screen.
 - Do not add other entry points into search (Tab, Left, type-to-search on open). Do not make Enter only "apply" the filter: it acts on the highlighted item.
 - The list footer includes `hints::SEARCH`.
-- The search row sits directly under the title, followed by one blank row, and reads `/  placeholder` (`Search plugins`, `Search settings`). It is always visible in the list view and hidden in detail views. Draw it only with `ui/search_field.rs` `draw_row`, which owns the `/` and the field's indent; never put a search field at the bottom of a list or in the footer. The project picker is the one exception: its labelled `Search projects:` field shares the form `Field` of its create view.
+- The search row sits directly under the title, followed by one blank row, and reads `/  placeholder` (`Search plugins`, `Search settings`). It is always visible in the list view and hidden in detail views. Draw it only with `ui/search_field.rs` `draw_row`, which owns the `/` and the field's indent; a bottom-app box draws it with `draw_under_title`, which also registers the field's mouse region and keeps box drags from selecting it. Never put a search field at the bottom of a list or in the footer. The project picker is the one exception: its labelled `Search projects:` field shares the form `Field` of its create view.
+- Text that is read rather than picked from (a background task's output) searches like a pager instead: `/` opens a one-row search at the bottom of the text, shown only while searching, typing jumps to the latest match with every match lit, Enter keeps the search, `n`/`N` move between matches, and Esc leaves the field, then clears the search, then goes back. It never filters the text.
 
 ## Selection
 
@@ -63,6 +68,10 @@ UI conventions for `vibe/cli-rust/`. Every screen follows them so the TUI reads 
 
 - Every color value lives in `src/ui/theme/`: theme-dependent colors in the theme palettes (`theme::foreground()`, `theme::muted_style()`, ...), fixed brand and terminal colors in `ui/theme/fixed.rs` (`ORANGE`, `LOADING_GRADIENT`, onboarding colors, `sgr::*` escape codes, the Monokai/Alabaster named palette via `fixed::named`), syntax colors in `ui/theme/syntax.rs`. A fixed color such as the brand orange is fine, but it is defined once there and imported everywhere else.
 - Outside `src/ui/theme/`, never write `Color::Rgb(..)`, `Color::Indexed(..)`, a named `Color::*` variant or a raw SGR color code. When a screen needs a new color, add a named constant or theme accessor first. `tests/units/color_literals.rs` fails on any literal outside the theme module (only `update_prompt/ansi.rs`, which converts any `Color` to SGR, and test code are exempt).
+
+## Borders
+
+- Borders use ratatui's default square corners (`┌┐└┘`). Never set `BorderType::Rounded` or draw `╭╮╰╯`; `tests/units/border_corners.rs` fails on them under `src/`.
 
 ## Verification
 

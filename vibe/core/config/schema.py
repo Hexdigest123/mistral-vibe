@@ -7,6 +7,7 @@ from typing import Any, Self
 from pydantic import BaseModel, ConfigDict, PrivateAttr
 from pydantic.fields import FieldInfo
 
+from vibe.core.config.patch import PatchOp
 from vibe.core.utils.merge import MergeStrategy
 
 
@@ -49,6 +50,45 @@ class ConfigSchema(BaseModel):
         """
         return True
 
+    @classmethod
+    def prepare_layers(
+        cls, layers: list[tuple[str, dict[str, Any]]]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Rewrite each layer's data before the merge; unchanged by default.
+
+        ``layers`` are (layer name, raw data) pairs in stack order; the result
+        keeps them in that order.
+        """
+        return layers
+
+    def expand_layer_write(
+        self, op: PatchOp, layer_data: Mapping[str, Any]
+    ) -> list[PatchOp]:
+        """The ops a write takes in a layer holding ``layer_data``. One by default."""
+        del layer_data
+        return [op]
+
+    def expand_layer_writes(
+        self, operations: Sequence[PatchOp], layer_data: Mapping[str, Any]
+    ) -> list[PatchOp]:
+        """The ops a batch of writes takes in a layer holding ``layer_data``:
+        each write's, in order, by default.
+        """
+        return [
+            mapped
+            for op in operations
+            for mapped in self.expand_layer_write(op, layer_data)
+        ]
+
+    def layer_write_op(self, op: PatchOp, layer_data: Mapping[str, Any]) -> PatchOp:
+        """The op a write takes in a layer holding ``layer_data``.
+
+        Unchanged by default; a schema whose ``prepare_layers`` re-keys entries
+        maps the merged key back to the key the layer uses.
+        """
+        del layer_data
+        return op
+
     def check_layer_keys(self, layers: Sequence[tuple[str, Mapping[str, Any]]]) -> None:
         """Look at each layer's raw keys once the merged config is valid.
 
@@ -56,6 +96,9 @@ class ConfigSchema(BaseModel):
         what it makes of the rest. ``layers`` are (layer name, raw data) pairs
         in stack order.
         """
+
+    def report_load_warnings(self, warnings: Sequence[str]) -> None:
+        """Take what the layers ignored while loading; dropped by default."""
 
     @classmethod
     def validate_merged(

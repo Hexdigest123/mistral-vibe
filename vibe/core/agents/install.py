@@ -1,13 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
-from vibe.core.agents.manager import (
-    FALLBACK_AGENTS,
-    AgentManager,
-    resolve_default_agent,
-)
-from vibe.core.agents.models import REMOVED_BUILTIN_AGENTS, AgentType
+from vibe.core.agents.manager import AgentManager
+from vibe.core.agents.models import AgentType
 from vibe.core.config import VibeConfigSchema
 from vibe.core.config.orchestrator import ConfigOrchestrator
 
@@ -22,12 +19,6 @@ class AgentInstallError(Exception):
 
 @dataclass(frozen=True)
 class InstalledAgentsChange:
-    previous: list[str]
-    """The writable layer's own ``installed_agents`` before the change."""
-
-    next: list[str]
-    """The writable layer's own ``installed_agents`` after the change."""
-
     switch_to: str | None
     """A replacement agent when the active one is being uninstalled."""
 
@@ -60,21 +51,20 @@ def plan_installed_agents_change(
 ) -> InstalledAgentsChange:
     if not agents.is_known_agent(agent_name):
         raise AgentInstallError(f"Agent '{agent_name}' not found.")
-    previous = writable_installed_agents(orchestrator)
-    if previous is None:
+    if writable_installed_agents(orchestrator) is None:
         raise AgentInstallError("The writable config layer is not available.")
-    if installed:
-        next_names = list(previous)
-        if agent_name not in next_names:
-            next_names.append(agent_name)
-    else:
-        next_names = [name for name in previous if name != agent_name]
     switch_to = None
-    if not installed and agents.active_profile.name == agent_name:
+    if not installed and agents.active_agent.name == agent_name:
         switch_to = _replacement_agent(orchestrator, agents, agent_name)
-    return InstalledAgentsChange(
-        previous=previous, next=next_names, switch_to=switch_to
-    )
+    return InstalledAgentsChange(switch_to=switch_to)
+
+
+def with_agent_installed(
+    names: Sequence[str], agent_name: str, *, installed: bool
+) -> list[str]:
+    if not installed:
+        return [name for name in names if name != agent_name]
+    return list(names) if agent_name in names else [*names, agent_name]
 
 
 def verify_installed_agents_change(
@@ -106,16 +96,12 @@ def _replacement_agent(
     agents: AgentManager,
     excluded: str,
 ) -> str:
-    default = resolve_default_agent(orchestrator)
-    # A removed builtin default (``"plan"``) runs as its replacement, as at
-    # session start.
-    replacement = REMOVED_BUILTIN_AGENTS.get(default, default)
-    for name in (default, replacement, *FALLBACK_AGENTS):
-        if name != excluded and _is_selectable(agents, name):
-            return name
-    for name, profile in agents.available_agents.items():
-        if name != excluded and profile.agent_type is AgentType.AGENT:
-            return name
+    default = orchestrator.config.default_agent
+    if default != excluded and _is_selectable(agents, default):
+        return default
+    for profile in agents.primary_agents():
+        if profile.name != excluded:
+            return profile.name
     raise AgentInstallError(
         "No selectable agent is available after uninstalling the active agent."
     )

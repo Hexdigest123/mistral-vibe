@@ -1,12 +1,13 @@
 use crate::core::checkpoint::Checkpoint;
 use crate::core::config::HarnessConfig;
 use crate::core::conversation::ConversationSeed;
-use crate::core::error::CoreError;
+use crate::core::error::{CoreError, RestoreError};
 use crate::core::state::{ActivePhase, ActiveTurn, HarnessState, StateInspection, TurnState};
 use crate::core::step_protocol::Action;
 use crate::core::step_protocol::{
     HarnessApplyResult, HarnessCommand, HarnessCommandRejection, HarnessInput, Inspection,
-    STEP_PROTOCOL_VERSION, SessionTransition, invalid_command,
+    OUTPUT_TYPE_MISMATCH_CODE, STEP_PROTOCOL_VERSION, SessionTransition, coded_invalid_command,
+    invalid_command,
 };
 use crate::core::wire::message::{Message, StoredMessage};
 use crate::core::{advance_in_place, initial_state_with_history};
@@ -75,7 +76,7 @@ impl HarnessSession {
             &finished_results,
             &self
                 .state
-                .config
+                .config()
                 .settings
                 .prompts
                 .agent_messages
@@ -91,6 +92,7 @@ impl HarnessSession {
         resume_input_id: u64,
     ) -> Result<Self, String> {
         Self::restore_moved_from(config, checkpoint, resume_input_id, None)
+            .map_err(|error| error.to_string())
     }
 
     /// Restores Core continuation state and resumes the Runtime's input sequence.
@@ -109,7 +111,7 @@ impl HarnessSession {
         checkpoint: Checkpoint,
         resume_input_id: u64,
         moved_from: Option<&HarnessConfig>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, RestoreError> {
         Ok(Self {
             state: checkpoint.restore_moved_from(
                 config,
@@ -163,7 +165,7 @@ impl HarnessSession {
                 let turn = self.state.turn_view().map_err(|error| {
                     core_rejection(error, "completion_model_input_resync_requested")
                 })?;
-                let settings = &self.state.config.settings;
+                let settings = &self.state.config().settings;
                 let source = ModelInputSource {
                     context: &self.state.context,
                     compaction: self.state.pending_compaction().map(|pending| {
@@ -173,7 +175,7 @@ impl HarnessSession {
                         }
                     }),
                     image_delivery: settings.context.effective_image_delivery(),
-                    tools: self.state.resolved_tools.top_level_tools(),
+                    tools: self.state.resolved_tools().top_level_tools(),
                     tool_catalog_revision: self.state.tool_catalog.revision,
                 };
                 return self.delivery.finish_resync(receipt, action, turn, source);
@@ -192,7 +194,7 @@ impl HarnessSession {
                     .into_iter()
                     .map(|action| action.action_id().to_string())
                     .collect();
-                let settings = &self.state.config.settings;
+                let settings = &self.state.config().settings;
                 let source = ModelInputSource {
                     context: &self.state.context,
                     compaction: self.state.pending_compaction().map(|pending| {
@@ -202,7 +204,7 @@ impl HarnessSession {
                         }
                     }),
                     image_delivery: settings.context.effective_image_delivery(),
-                    tools: self.state.resolved_tools.top_level_tools(),
+                    tools: self.state.resolved_tools().top_level_tools(),
                     tool_catalog_revision: self.state.tool_catalog.revision,
                 };
                 self.delivery
@@ -267,6 +269,9 @@ fn core_rejection(error: CoreError, command_type: &'static str) -> HarnessComman
             received_action_id,
             pending_action_ids,
         },
+        CoreError::OutputTypeMismatch => {
+            coded_invalid_command(OUTPUT_TYPE_MISMATCH_CODE, error.detail())
+        }
         CoreError::InvalidCommand { detail }
         | CoreError::InvalidConfiguration { detail, .. }
         | CoreError::Invariant { detail } => invalid_command(detail),

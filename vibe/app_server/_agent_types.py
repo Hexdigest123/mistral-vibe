@@ -139,11 +139,11 @@ def workspace_agent_types(agents: AgentManager) -> tuple[AgentTypeSource, ...]:
 
     Built-in subagents are left out. ``get_subagents`` reports ``explore``
     alongside the workspace's own, and the harness already spawns a generic
-    child that inherits the parent's prompt and tools, so advertising it again
-    would put a second name on behaviour a bare spawn already has. The test is
-    on the profile rather than on its name, because a file named
-    ``explore.toml`` replaces the built-in entry and a user who writes that file
-    is asking for their version.
+    child with the parent's tools and the instructions its spawn gives, so
+    advertising it again would put a second name on behaviour a bare spawn
+    already has. The test is on the profile rather than on its name, because a
+    file named ``explore.toml`` replaces the built-in entry and a user who
+    writes that file is asking for their version.
     """
     sources: list[AgentTypeSource] = []
     for profile in agents.get_subagents():
@@ -181,6 +181,18 @@ def workspace_agent_rejections(agents: AgentManager) -> tuple[AgentTypeRejection
             name=failure.name, file=str(failure.path), reason=failure.reason
         )
         for failure in agents.load_failures
+    )
+
+
+def agent_file_issues(agents: AgentManager) -> tuple[ConfigIssue, ...]:
+    """What discovery kept only in part or ignored: an agent's settings an
+    agent may not set, a project's override of an approval policy.
+    """
+    from vibe.app_server.models import ConfigIssue
+
+    return tuple(
+        ConfigIssue(file=str(issue.path), message=issue.message, code=issue.code)
+        for issue in agents.agent_file_issues
     )
 
 
@@ -391,8 +403,13 @@ def _authority_digest(
 
 def _route_authority(completion: DeclaredCompletionRoute) -> object:
     provider = completion.provider
+    model = asdict(completion.model)
+    # Pricing only meters a run's budget; it grants nothing. Leaving it out keeps
+    # a declared child's profile identity the same with or without a budget, and
+    # across a price edit.
+    model.pop("pricing", None)
     return {
-        "model": asdict(completion.model),
+        "model": model,
         "model_facts": None
         if completion.model_facts is None
         else completion.model_facts.model_dump(mode="json"),
@@ -425,6 +442,7 @@ __all__ = [
     "AgentTypeRejection",
     "AgentTypeSource",
     "ResolvedAgentTypes",
+    "agent_file_issues",
     "agent_instructions",
     "resolve_agent_types",
     "workspace_agent_rejections",

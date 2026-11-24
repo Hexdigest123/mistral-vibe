@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch};
 use crate::app::App;
 use crate::commands::CommandEvent;
 use crate::config;
-use crate::server::{method, Client, Notification, SHUTDOWN_GRACE};
+use crate::server::{method, Client, Notification, SESSION_STOP_GRACE};
 use crate::session_exit;
 use crate::startup::StartupEvent;
 use crate::voice::VoiceEvent;
@@ -19,24 +19,14 @@ mod external_editor;
 mod handoff;
 mod helpers;
 pub(crate) mod keys;
+#[doc(hidden)]
+pub use keys::route_key;
 pub mod notifications;
 mod steady;
 mod suspend;
 
-/// Re-exported for the pre-TUI update prompt, which shares the replay harness's
-/// idle-marker protocol.
-pub use helpers::emit_idle_marker;
-
 const NOTIF_DRAIN_CAP: u32 = 512;
 pub(crate) const REDRAW_INTERVAL: Duration = Duration::from_micros(16_667);
-const IDLE_MARKER: &[u8] = b"\x1b]5379;vibe-idle\x07";
-// The replay harness's batch-marker keys, shared with the wizard flow:
-// the harness brackets a batched input step in them so a step's keys produce
-// one marker instead of one per key. They ride the input stream, so they are
-// ordered against the keys they bracket without any timing assumption.
-// `pub`, not `pub(crate)`: the pre-TUI update prompt shares the protocol.
-pub const HOLD_KEY: u8 = 23;
-pub const RELEASE_KEY: u8 = 24;
 /// Bounded command-result channel; slash-command results are sparse, drop on full.
 pub const COMMAND_CHANNEL_CAP: usize = 16;
 /// Bounded voice-event channel; transcription deltas burst, drop on full.
@@ -107,7 +97,20 @@ pub struct EventSources {
     pub commands: mpsc::Receiver<CommandEvent>,
     pub voice: mpsc::Receiver<VoiceEvent>,
     pub telemetry: mpsc::Receiver<crate::telemetry::TelemetryEvent>,
-    pub files: watch::Receiver<u64>,
+}
+
+impl EventSources {
+    /// Whether every queued event has been applied (the file index feed is checked beside it).
+    /// A deferred notification parks the stream on the user, so it is not waited for.
+    fn is_drained(&self, notifications_parked: bool) -> bool {
+        (notifications_parked || self.notifications.is_empty())
+            && self.ready.is_empty()
+            && self.config.is_empty()
+            && self.events.is_empty()
+            && self.commands.is_empty()
+            && self.voice.is_empty()
+            && self.telemetry.is_empty()
+    }
 }
 
 impl EventLoop {
@@ -123,6 +126,7 @@ impl EventLoop {
         startup: Vec<StartupEvent>,
         timings: &mut crate::startup::StartupRecorder,
     ) -> Result<Option<LoopExit>> {
+        self.follow_width();
         for event in startup {
             if let StartupEvent::MissingApiKey { provider, env_key } = event {
                 return Ok(Some(LoopExit::NeedsOnboarding { provider, env_key }));
@@ -143,9 +147,17 @@ impl EventLoop {
         Ok(None)
     }
 
+    /// The layouts that depend on the terminal width learn it before the first frame; resizes follow.
+    fn follow_width(&mut self) {
+        if let Ok(size) = self.terminal.size() {
+            crate::sessions_page::folders::resized(&mut self.app, size.width);
+        }
+    }
+
     /// Run to an exit; the summary is read only on a clean exit, the only case
     /// that prints the resume block.
     pub async fn run(mut self) -> RunOutcome {
+        self.follow_width();
         let result = match self.steady().await {
             Ok(LoopExit::Quit) => Ok(()),
             Ok(LoopExit::NeedsOnboarding { provider, env_key }) => {
@@ -190,7 +202,7 @@ impl EventLoop {
             let stop = stop_session(&self.client, &sid, &mut self.sources.telemetry);
             tokio::select! {
                 _ = stop => {}
-                _ = tokio::time::sleep(SHUTDOWN_GRACE) => {}
+                _ = crate::clock::sleep_real(SESSION_STOP_GRACE) => {}
                 _ = self.shutdown.wait() => {}
             }
         }
@@ -221,6 +233,9 @@ pub async fn stop_session(
     telemetry: &mut mpsc::Receiver<crate::telemetry::TelemetryEvent>,
 ) {
     crate::telemetry::flush(client, session_id, telemetry).await;
+    // The session was on screen until now: nothing in it is unread.
+    let seen = serde_json::json!({ "sessionId": session_id });
+    let _ = client.request(method::SESSION_MARK_AS_SEEN, seen).await;
     let params = serde_json::json!({"sessionId": session_id, "reason": null});
     let _ = client.request(method::SESSION_STOP, params).await;
 }

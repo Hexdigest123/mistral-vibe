@@ -18,7 +18,6 @@ _STEERED = user_msg("second")
 _STEERED["params"]["entry"]["id"] = "queued-2"
 _STEERED["params"]["entry"]["source"] = "turn_steer"
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
 handshake = {
     "session/start": {"state": {"session": {"harness": "unified"}}},
     "session/turn/queue/steer": {
@@ -29,9 +28,7 @@ handshake = {
 }
 on_request = {"session/turn/queue/steer": [_STEERED]}
 
-settle_per_key = True
-capture_steps = {1, 2}
-screen_contains = ("> second",)
+screen_contains = ("↳ second",)
 screen_excludes = ("Queued",)
 
 # CSI 13;9u is Super+Enter in the kitty keyboard protocol.

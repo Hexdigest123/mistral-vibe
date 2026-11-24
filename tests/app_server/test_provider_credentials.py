@@ -38,6 +38,8 @@ from mistralai_vibe_local_harness.vibe.adapters.generic._vertex import (
 )
 from mistralai_vibe_local_harness.vibe.completion_profile import ANTHROPIC_VERSION
 from vibe.app_server._provider_credentials import ProviderCredentialService
+from vibe.core.platform_auth import UNAUTHORIZED_AFTER_REFRESH_MESSAGE
+from vibe.core.platform_auth._mistral import api_key_credentials
 
 
 def _provider(name: str, *, api_style: str = "openai", **kwargs: Any) -> ProviderConfig:
@@ -365,6 +367,58 @@ async def test_a_vertex_rejection_drops_the_shared_google_credential() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_refused_request_keeps_the_credential() -> None:
+    """*Prepare*: A resolved API key the provider then refuses with a 403.
+    *Do*: Report the refusal and resolve again.
+    *Assert*: The same key is offered again: a 403 refuses the account or the
+      request, so another model or request may pass with it.
+    """
+    # Prepare
+    service = ProviderCredentialService(_orchestrator(_config(_provider("primary"))))
+    sent = await service.resolve()
+    assert isinstance(sent, ProviderCredentialSnapshot)
+
+    # Do
+    await service.reject(observed_revision=sent.revision, reason="http_forbidden")
+    result = await service.resolve()
+
+    # Assert
+    assert isinstance(result, ProviderCredentialSnapshot)
+    assert result.revision == sent.revision
+
+
+@pytest.mark.asyncio
+async def test_a_refused_request_keeps_the_vertex_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """*Prepare*: A Vertex provider whose process-wide credential is minted.
+    *Do*: Report a 403 for the minted token.
+    *Assert*: The shared credential is kept: a new token cannot lift a refusal
+      of the project or the request.
+    """
+    # Prepare
+    service = ProviderCredentialService(_orchestrator(_config(_vertex_provider())))
+    minted = object()
+    with patch.object(
+        VertexCredentials,
+        "access_token",
+        new_callable=PropertyMock,
+        return_value="adc-token",
+    ):
+        resolved = await service.resolve()
+        assert isinstance(resolved, ProviderCredentialSnapshot)
+        monkeypatch.setattr(VERTEX_CREDENTIALS, "_credentials", minted)
+
+        # Do
+        await service.reject(
+            observed_revision=resolved.revision, reason="http_forbidden"
+        )
+
+    # Assert
+    assert VERTEX_CREDENTIALS._credentials is minted
+
+
+@pytest.mark.asyncio
 async def test_resolution_never_raises() -> None:
     """*Prepare*: A provider whose credential lookup raises.
     *Do*: Resolve.
@@ -575,3 +629,421 @@ def test_the_unauthorized_message_names_the_key_source(
 
     # Assert
     assert message == sentence
+
+
+class _ConnectionToken:
+    """A connection's first-party credential (a CLI or Desktop user token)."""
+
+    def __init__(
+        self,
+        *,
+        signed_in: bool = True,
+        rotates: bool = False,
+        reason: str = "reauthentication_required",
+    ) -> None:
+        self.signed_in = signed_in
+        # Why a signed-out connection has no token.
+        self.reason = reason
+        # Whether the owner (Desktop) issues a new token when told of a 401.
+        self.rotates = rotates
+        self.revision = "revision-of-user-id-token"
+        self.rejected: list[Any] = []
+        self.env_vars: list[str] = []
+
+    def __call__(self, env_var: str) -> _ConnectionToken:
+        self.env_vars.append(env_var)
+        return self
+
+    async def resolve(self, target: Any) -> Any:
+        from vibe.core.platform_auth import (
+            PlatformCredentialRequired,
+            PlatformCredentialSnapshot,
+        )
+
+        if not self.signed_in:
+            return PlatformCredentialRequired(reason=self.reason)  # type: ignore[arg-type]
+        return PlatformCredentialSnapshot(
+            kind="oidc_id_token",
+            headers={
+                "Authorization": "Bearer user-id-token",
+                "x-external-organization-id": "org",
+            },
+            cache_namespace="oidc_id_token:test",
+            revision=self.revision,
+            source="the connection",
+            principal="oidc:v1:user",
+        )
+
+    async def reject(self, target: Any, *, observed: Any, **_: Any) -> Any:
+        self.rejected.append(observed)
+        if self.rotates:
+            self.revision = "revision-of-a-fresh-user-id-token"
+        return await self.resolve(target)
+
+
+def _service(
+    monkeypatch: pytest.MonkeyPatch,
+    connection: _ConnectionToken,
+    *,
+    providers: list[dict[str, Any]] | None = None,
+    run_keys: dict[str, str] | None = None,
+) -> ProviderCredentialService:
+    monkeypatch.setenv("MISTRAL_API_KEY", "process-api-key")
+    config = (
+        build_test_vibe_config(providers=providers)
+        if providers
+        else build_test_vibe_config()
+    )
+    return ProviderCredentialService(
+        cast("ConfigOrchestrator[VibeConfigSchema]", FakeConfigOrchestrator(config)),
+        credentials=run_keys,
+        platform_credentials=connection,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mistral_models_use_the_connection_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _ConnectionToken()
+    resolved = await _service(monkeypatch, connection).resolve()
+    assert isinstance(resolved, ProviderCredentialSnapshot)
+    assert resolved.headers["Authorization"] == "Bearer user-id-token"
+    assert resolved.headers["x-external-organization-id"] == "org"
+    assert resolved.follow_redirects is False
+    assert "user-id-token" not in resolved.revision
+    assert connection.env_vars == ["MISTRAL_API_KEY"]
+
+
+@pytest.mark.asyncio
+async def test_a_signed_out_connection_never_falls_back_to_an_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = await _service(monkeypatch, _ConnectionToken(signed_in=False)).resolve()
+    assert isinstance(resolved, ProviderAuthRequired)
+    assert "API_KEY" not in resolved.message
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_reason", "hint"),
+    [
+        ("reauthentication_required", "expired", "Sign in again"),
+        ("expired", "expired", "Sign in again"),
+        ("rejected", "rejected", "Sign in again"),
+        ("invalid", "missing", "Sign in again"),
+        ("missing", "missing", "Sign in"),
+        ("transient", "unavailable", "retry in a moment"),
+        ("credential_unavailable", "missing", "Sign in to Vibe Desktop and retry"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_connection_without_a_token_asks_to_sign_in_not_for_a_key(
+    monkeypatch: pytest.MonkeyPatch, reason: str, expected_reason: str, hint: str
+) -> None:
+    """*Prepare*: A signed-in connection whose token cannot be used, for each
+      reason the credential reports.
+    *Do*: Resolve the model credential.
+    *Assert*: The user is told to sign in (or retry), never to set an API key.
+    """
+    # Prepare
+    service = _service(monkeypatch, _ConnectionToken(signed_in=False, reason=reason))
+
+    # Do
+    resolved = await service.resolve()
+
+    # Assert
+    assert isinstance(resolved, ProviderAuthRequired)
+    assert resolved.reason == expected_reason
+    assert hint in resolved.message
+    assert "API_KEY" not in resolved.message
+    assert "API key" not in resolved.message
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_reason", "expected_message"),
+    [
+        (
+            "transient",
+            "unavailable",
+            "Your Mistral sign-in couldn't be checked right now (the computer may "
+            "be asleep or offline). Nothing was sent to the model; retry in a "
+            "moment.",
+        ),
+        (
+            "reauthentication_required",
+            "expired",
+            "Your Mistral sign-in has expired. Sign in again and retry.",
+        ),
+        (
+            "expired",
+            "expired",
+            "Your Mistral sign-in has expired. Sign in again and retry.",
+        ),
+        (
+            "rejected",
+            "rejected",
+            "Your Mistral sign-in was rejected. Sign in again and retry.",
+        ),
+        (
+            "invalid",
+            "missing",
+            "Your Mistral sign-in cannot be used for https://api.mistral.ai/v1. "
+            "Sign in again and retry.",
+        ),
+        ("missing", "missing", "You are not signed in to Mistral. Sign in and retry."),
+        ("unauthorized_after_refresh", "rejected", UNAUTHORIZED_AFTER_REFRESH_MESSAGE),
+    ],
+)
+@pytest.mark.asyncio
+async def test_only_an_unchecked_sign_in_reads_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+    expected_reason: str,
+    expected_message: str,
+) -> None:
+    """*Prepare*: A signed-in connection whose token cannot be used, for each
+      reason the credential reports.
+    *Do*: Resolve the model credential.
+    *Assert*: Only a sign-in that could not be checked reads as ``unavailable``,
+      which the Harness waits for; every other reason keeps its reason and
+      message.
+    """
+    # Prepare
+    service = _service(monkeypatch, _ConnectionToken(signed_in=False, reason=reason))
+
+    # Do
+    resolved = await service.resolve()
+
+    # Assert
+    assert resolved == ProviderAuthRequired(
+        reason=expected_reason,  # type: ignore[arg-type]
+        provider="mistral",
+        message=expected_message,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_api_key_connection_without_a_key_still_asks_for_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """*Prepare*: An API-key connection and no key anywhere.
+    *Do*: Resolve the model credential.
+    *Assert*: The message names the missing key, as before.
+    """
+    # Prepare
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    service = ProviderCredentialService(
+        cast(
+            "ConfigOrchestrator[VibeConfigSchema]",
+            FakeConfigOrchestrator(build_test_vibe_config()),
+        ),
+        platform_credentials=api_key_credentials,
+    )
+
+    # Do
+    resolved = await service.resolve()
+
+    # Assert
+    assert isinstance(resolved, ProviderAuthRequired)
+    assert resolved.reason == "missing"
+    assert "MISTRAL_API_KEY" in resolved.message
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_api_key_connection_asks_to_update_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """*Prepare*: An API-key connection whose key the model refused (401).
+    *Do*: Resolve the model credential again.
+    *Assert*: The user is told to update the API key, not that it is missing.
+    """
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "refused-key")
+    service = ProviderCredentialService(
+        cast(
+            "ConfigOrchestrator[VibeConfigSchema]",
+            FakeConfigOrchestrator(build_test_vibe_config()),
+        ),
+        platform_credentials=api_key_credentials,
+    )
+    sent = await service.resolve()
+    assert isinstance(sent, ProviderCredentialSnapshot)
+    await service.reject(observed_revision=sent.revision, reason="http_unauthorized")
+
+    # Do
+    resolved = await service.resolve()
+
+    # Assert
+    assert isinstance(resolved, ProviderAuthRequired)
+    assert resolved.reason == "rejected"
+    assert "Update the API key" in resolved.message
+
+
+@pytest.mark.asyncio
+async def test_a_third_party_provider_keeps_its_own_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTHER_API_KEY", "other-key")
+    connection = _ConnectionToken()
+    service = _service(
+        monkeypatch,
+        connection,
+        providers=[
+            {
+                "name": "other",
+                "api_base": "https://other.example/v1",
+                "api_key_env_var": "OTHER_API_KEY",
+                "api_style": "openai",
+                "backend": "generic",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        VibeConfigSchema, "get_active_provider", lambda self: self.providers[0]
+    )
+    service._select_provider = lambda config: config.providers[0]
+    resolved = await service.resolve()
+    assert isinstance(resolved, ProviderCredentialSnapshot)
+    assert resolved.headers == {"Authorization": "Bearer other-key"}
+    assert connection.env_vars == []
+
+
+@pytest.mark.asyncio
+async def test_a_runs_own_key_wins_over_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _ConnectionToken()
+    resolved = await _service(
+        monkeypatch, connection, run_keys={"MISTRAL_API_KEY": "run-key"}
+    ).resolve()
+    assert isinstance(resolved, ProviderCredentialSnapshot)
+    assert resolved.headers == {"Authorization": "Bearer run-key"}
+    assert connection.env_vars == []
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_connection_token_is_reported_to_its_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _ConnectionToken(rotates=True)
+    service = _service(monkeypatch, connection)
+    sent = await service.resolve()
+    assert isinstance(sent, ProviderCredentialSnapshot)
+
+    await service.reject(observed_revision=sent.revision, reason="http_unauthorized")
+    result = await service.resolve()
+
+    assert [observed.revision for observed in connection.rejected] == [
+        "revision-of-user-id-token"
+    ]
+    assert isinstance(result, ProviderCredentialSnapshot)
+    assert result.revision != sent.revision
+
+
+@pytest.mark.asyncio
+async def test_a_refused_request_keeps_the_connection_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """*Prepare*: A signed-in connection whose token the provider refuses
+      with a 403.
+    *Do*: Report the refusal and resolve again.
+    *Assert*: Desktop is not told, and the same token is offered again.
+    """
+    # Prepare
+    connection = _ConnectionToken(rotates=True)
+    service = _service(monkeypatch, connection)
+    sent = await service.resolve()
+    assert isinstance(sent, ProviderCredentialSnapshot)
+
+    # Do
+    await service.reject(observed_revision=sent.revision, reason="http_forbidden")
+    result = await service.resolve()
+
+    # Assert
+    assert connection.rejected == []
+    assert isinstance(result, ProviderCredentialSnapshot)
+    assert result.revision == sent.revision
+
+
+@pytest.mark.asyncio
+async def test_a_connection_token_its_owner_keeps_is_withheld_with_a_sign_in_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _ConnectionToken()
+    service = _service(monkeypatch, connection)
+    sent = await service.resolve()
+    assert isinstance(sent, ProviderCredentialSnapshot)
+
+    await service.reject(observed_revision=sent.revision, reason="http_unauthorized")
+    result = await service.resolve()
+
+    assert len(connection.rejected) == 1
+    assert isinstance(result, ProviderAuthRequired)
+    assert result.reason == "rejected"
+    assert "Sign in again" in result.message
+    assert "API key" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_a_signed_out_connection_asks_to_sign_in_not_for_a_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = await _service(monkeypatch, _ConnectionToken(signed_in=False)).resolve()
+    assert isinstance(resolved, ProviderAuthRequired)
+    assert "Sign in" in resolved.message
+    assert "MISTRAL_API_KEY" not in resolved.message
+
+
+@pytest.mark.asyncio
+async def test_a_connection_token_refused_after_a_refresh_asks_to_update_or_sign_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """*Prepare*: A connection whose owner already refreshed the token once.
+    *Do*: The model refuses the refreshed token (401), then the next turn
+      resolves the credential.
+    *Assert*: The next turn says to update Vibe or sign in again.
+    """
+    from vibe.core.platform_auth import (
+        UNAUTHORIZED_AFTER_REFRESH_MESSAGE,
+        PlatformCredentialRequired,
+    )
+
+    # Prepare
+    connection = _ConnectionToken()
+    service = _service(monkeypatch, connection)
+    sent = await service.resolve()
+    assert isinstance(sent, ProviderCredentialSnapshot)
+
+    async def refused_after_refresh(target: Any, *, observed: Any, **_: Any) -> Any:
+        connection.rejected.append(observed)
+        return PlatformCredentialRequired(
+            reason="unauthorized_after_refresh", observed_revision=observed.revision
+        )
+
+    connection.reject = refused_after_refresh  # type: ignore[method-assign]
+
+    # Do
+    await service.reject(observed_revision=sent.revision, reason="http_unauthorized")
+    result = await service.resolve()
+
+    # Assert
+    assert isinstance(result, ProviderAuthRequired)
+    assert result.reason == "rejected"
+    assert result.message == UNAUTHORIZED_AFTER_REFRESH_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_a_connection_reporting_unauthorized_after_refresh_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibe.core.platform_auth import UNAUTHORIZED_AFTER_REFRESH_MESSAGE
+
+    service = _service(
+        monkeypatch,
+        _ConnectionToken(signed_in=False, reason="unauthorized_after_refresh"),
+    )
+
+    resolved = await service.resolve()
+
+    assert isinstance(resolved, ProviderAuthRequired)
+    assert resolved.message == UNAUTHORIZED_AFTER_REFRESH_MESSAGE

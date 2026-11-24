@@ -40,10 +40,14 @@ async def test_agents_list_offers_smart_approve_from_cached_experiment(
     monkeypatch.setattr(
         cached_layers_module,
         "load_cached_eval_response",
-        lambda _config: _smart_approve_available_response(),
+        lambda _config, _credentials=None: _smart_approve_available_response(),
     )
     handler = HostRequestHandler(
-        HarnessFilesManager(sources=("user",)), org_config=process_services.org_config
+        HarnessFilesManager(sources=("user",)),
+        org_config=process_services.org_config,
+        worktrees=process_services.worktrees,
+        experiments=process_services.experiments,
+        model_catalog=process_services.model_catalog,
     )
 
     result = await handler.dispatch(
@@ -53,5 +57,5 @@ async def test_agents_list_offers_smart_approve_from_cached_experiment(
     )
 
     response = cast(AgentsListResponse, result.response)
-    names = [agent.name for agent in response.agents]
+    names = [policy.name for policy in response.approval_policies]
     assert "smart-approve" in names

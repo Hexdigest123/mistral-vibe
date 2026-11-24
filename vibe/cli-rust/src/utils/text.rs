@@ -21,6 +21,14 @@ pub fn thousands(value: u64) -> String {
     grouped
 }
 
+/// The first letter upper-cased, the rest as it is.
+pub fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
 const COUNT_SUFFIXES: [&str; 5] = ["", "k", "M", "B", "T"];
 const SIGNIFICANT_DIGITS: u32 = 3;
 
@@ -77,71 +85,36 @@ pub fn multi_line(text: &str) -> String {
         .collect()
 }
 
-/// Strip terminal control sequences and collapse carriage-return redraws.
-pub fn clean_output(text: &str) -> String {
-    text.replace("\r\n", "\n")
-        .split('\n')
-        .map(|line| {
-            let written = line.trim_end_matches('\r');
-            let visible = written
-                .rsplit_once('\r')
-                .map(|(_, tail)| tail)
-                .unwrap_or(written);
-            strip_terminal_sequences(visible)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// The first line of pasted text, splitting on any line boundary.
+pub fn first_line(text: &str) -> &str {
+    const BREAKS: [char; 10] = [
+        '\n', '\r', '\u{b}', '\u{c}', '\u{1c}', '\u{1d}', '\u{1e}', '\u{85}', '\u{2028}',
+        '\u{2029}',
+    ];
+    text.find(BREAKS).map_or(text, |end| &text[..end])
 }
 
-fn strip_terminal_sequences(text: &str) -> String {
-    let mut chars = text.chars().peekable();
-    let mut output = String::new();
-    while let Some(character) = chars.next() {
-        match character {
-            '\u{1b}' => strip_escape_sequence(&mut chars),
-            '\u{009b}' => strip_control_sequence(&mut chars),
-            '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
-                strip_string_sequence(&mut chars)
-            }
-            '\t' => output.push('\t'),
-            character if character.is_control() => {}
-            character => output.push(character),
-        }
-    }
-    output
+/// Characters of a server error or warning the transcript keeps: a few dozen rows at most.
+pub const MESSAGE_MAX_CHARS: usize = 4_000;
+pub const MESSAGE_TRUNCATION_MARKER: &str = "… [truncated]";
+
+/// Characters an error row keeps: a bounded message plus room for a short hint after it.
+pub const ROW_MAX_CHARS: usize = MESSAGE_MAX_CHARS + 1_000;
+
+/// Cut a server-provided message to `MESSAGE_MAX_CHARS`, marking the cut.
+pub fn bounded_message(text: &str) -> std::borrow::Cow<'_, str> {
+    bounded(text, MESSAGE_MAX_CHARS)
 }
 
-fn strip_escape_sequence(chars: &mut std::iter::Peekable<impl Iterator<Item = char>>) {
-    match chars.next() {
-        Some('[') => strip_control_sequence(chars),
-        Some(']' | 'P' | 'X' | '^' | '_') => strip_string_sequence(chars),
-        Some(character) if ('\u{20}'..='\u{2f}').contains(&character) => {
-            while chars
-                .next_if(|next| ('\u{20}'..='\u{2f}').contains(next))
-                .is_some()
-            {}
-            let _ = chars.next();
-        }
-        Some(_) | None => {}
-    }
+/// Cut a whole error row to `ROW_MAX_CHARS`, marking the cut.
+pub fn bounded_row(text: &str) -> std::borrow::Cow<'_, str> {
+    bounded(text, ROW_MAX_CHARS)
 }
 
-fn strip_control_sequence(chars: &mut impl Iterator<Item = char>) {
-    for character in chars {
-        if ('@'..='~').contains(&character) {
-            break;
-        }
-    }
-}
-
-fn strip_string_sequence(chars: &mut std::iter::Peekable<impl Iterator<Item = char>>) {
-    while let Some(character) = chars.next() {
-        if matches!(character, '\u{7}' | '\u{009c}') {
-            break;
-        }
-        if character == '\u{1b}' && chars.next_if_eq(&'\\').is_some() {
-            break;
-        }
+fn bounded(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}{MESSAGE_TRUNCATION_MARKER}", &text[..end]).into(),
+        None => text.into(),
     }
 }
 
@@ -179,31 +152,42 @@ pub fn wrap_hard(text: &str, width: usize) -> Vec<String> {
 }
 
 fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    let rows = wrap_ranges(line, width).into_iter();
+    rows.map(|range| line[range].to_owned()).collect()
+}
+
+/// `line`'s rows at `width` cells as byte ranges into it, as `wrap_hard` folds them; a fold drops the space it breaks at.
+pub fn wrap_ranges(line: &str, width: usize) -> Vec<std::ops::Range<usize>> {
     if width == 0 {
-        return vec![line.to_owned()];
+        return std::iter::once(0..line.len()).collect();
     }
-    let mut rows: Vec<String> = Vec::new();
-    let mut row = String::new();
+    let mut rows = Vec::new();
+    let (mut start, mut end, mut at) = (0, 0, 0);
     for (index, word) in line.split(' ').enumerate() {
-        let mut word = word;
-        while word.width() > width {
-            if !row.is_empty() {
-                rows.push(std::mem::take(&mut row));
+        let (mut word, mut from) = (word, at);
+        at += word.len() + 1;
+        // Counted per grapheme like `split_at_width`, once, so a long unbroken run folds in linear time.
+        let mut cells: usize = word.graphemes(true).map(|grapheme| grapheme.width()).sum();
+        while cells > width {
+            if end > start {
+                rows.push(start..end);
             }
-            let (head, tail, _) = split_at_width(word, width);
-            rows.push(head.to_owned());
-            word = tail;
+            let (head, tail, used) = split_at_width(word, width);
+            rows.push(from..from + head.len());
+            (word, from, cells) = (tail, from + head.len(), cells - used);
+            (start, end) = (from, from);
         }
         // Only a fold drops the separator, so leading and repeated spaces survive.
-        let sep = usize::from(index > 0 && (!row.is_empty() || rows.is_empty()));
-        if !row.is_empty() && row.width() + sep + word.width() > width {
-            rows.push(std::mem::take(&mut row));
-        } else if sep == 1 {
-            row.push(' ');
+        let sep = usize::from(index > 0 && (end > start || rows.is_empty()));
+        if end > start && line[start..end].width() + sep + word.width() > width {
+            rows.push(start..end);
+            start = from;
+        } else if end == start {
+            start = from - sep;
         }
-        row.push_str(word);
+        end = from + word.len();
     }
-    rows.push(row);
+    rows.push(start..end);
     rows
 }
 
@@ -231,15 +215,17 @@ pub fn expand_tabs(line: &str) -> String {
     if !line.contains('\t') {
         return line.to_owned();
     }
-    let mut out = String::new();
-    for character in line.chars() {
-        match character {
-            '\t' => {
-                let pad = TAB_WIDTH - out.width() % TAB_WIDTH;
-                out.extend(std::iter::repeat_n(' ', pad));
-            }
-            _ => out.push(character),
+    let mut out = String::with_capacity(line.len());
+    // The column is counted once per run between tabs, so a long tabbed line expands in linear time.
+    let mut column = 0;
+    for (index, run) in line.split('\t').enumerate() {
+        if index > 0 {
+            let pad = TAB_WIDTH - column % TAB_WIDTH;
+            out.extend(std::iter::repeat_n(' ', pad));
+            column += pad;
         }
+        out.push_str(run);
+        column += run.width();
     }
     out
 }

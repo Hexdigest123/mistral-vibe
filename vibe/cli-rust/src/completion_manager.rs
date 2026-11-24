@@ -1,14 +1,13 @@
 //! Shared slash-command, file-path, and skill-mention completion state.
 
-use tokio::sync::watch;
-
 use crate::app::App;
 use crate::commands;
+use crate::dir_completion;
 use crate::input_modes::InputMode;
 use crate::skill::SkillOrigin;
 use crate::utils::fuzzy;
 
-const FILE_MATCH_LIMIT: usize = 100;
+mod file_entries;
 
 #[derive(Clone, PartialEq)]
 pub struct CompletionEntry {
@@ -22,13 +21,16 @@ enum ActiveCompletion {
     Slash,
     File { start: usize, end: usize },
     Skill { start: usize, end: usize },
+    Dir { start: usize, end: usize },
 }
 
 pub fn input_changed(app: &mut App) {
+    app.completion.dirs.retry_failed();
     app.completion.dismissed = false;
     app.completion.selected = 0;
     app.completion.scroll = 0;
     app.completion.reveal = false;
+    app.completion.picked = false;
     refresh(app);
 }
 
@@ -39,6 +41,7 @@ pub fn reset_for_recall(app: &mut App) {
     app.completion.selected = 0;
     app.completion.scroll = 0;
     app.completion.reveal = false;
+    app.completion.picked = false;
 }
 
 pub fn refresh(app: &mut App) {
@@ -47,10 +50,20 @@ pub fn refresh(app: &mut App) {
         app.completion.entries.clear();
         return;
     }
-    let entries = match active(app) {
+    let active = active(app);
+    // A folder list read for an earlier `/cd` is read again the next time:
+    // a folder created meanwhile shows.
+    if !matches!(active, Some(ActiveCompletion::Dir { .. })) {
+        dir_completion::forget(app);
+    }
+    if !matches!(active, Some(ActiveCompletion::File { .. })) {
+        app.completion.dirs.forget();
+    }
+    let entries = match active {
         Some(ActiveCompletion::Slash) => slash_entries(app),
-        Some(ActiveCompletion::File { start, end }) => file_entries(app, start, end),
+        Some(ActiveCompletion::File { start, end }) => file_entries::entries(app, start, end),
         Some(ActiveCompletion::Skill { start, end }) => skill_entries(app, start, end),
+        Some(ActiveCompletion::Dir { start, end }) => dir_completion::entries(app, start, end),
         None => Vec::new(),
     };
     // The highlighted item survives only re-renders that leave the
@@ -60,16 +73,19 @@ pub fn refresh(app: &mut App) {
         app.completion.selected = 0;
         app.completion.scroll = 0;
         app.completion.reveal = false;
+        app.completion.picked = false;
     }
     app.completion.entries = entries;
 }
 
-/// Apply a file-index update not yet seen, so a frame never pairs a ready index with a stale `@` popup.
-pub fn sync_files(app: &mut App, files: &mut watch::Receiver<u64>) {
-    if files.has_changed().unwrap_or(false) {
-        files.borrow_and_update();
+/// Apply a file-index update not yet seen, so a frame never pairs a ready
+/// index with a stale `@` popup. Returns whether one landed.
+pub fn sync_files(app: &mut App) -> bool {
+    if app.completion.files.take_update() {
         refresh(app);
+        return true;
     }
+    false
 }
 
 pub fn is_open(app: &App) -> bool {
@@ -87,6 +103,7 @@ pub fn navigate(app: &mut App, down: bool) {
         (app.completion.selected + count - 1) % count
     };
     app.completion.reveal = true;
+    app.completion.picked = true;
 }
 
 pub fn wheel(app: &mut App, down: bool, delta: usize) {
@@ -103,10 +120,16 @@ pub fn dismiss(app: &mut App) -> bool {
     }
     app.completion.dismissed = true;
     app.completion.entries.clear();
+    app.completion.dirs.forget();
     true
 }
 
 pub fn accept(app: &mut App) -> bool {
+    accept_with(app, false)
+}
+
+/// Accept the highlighted entry; with `descend`, a folder keeps the popup open on its entries.
+fn accept_with(app: &mut App, descend: bool) -> bool {
     let Some(entry) = app.completion.entries.get(app.completion.selected) else {
         return false;
     };
@@ -120,15 +143,21 @@ pub fn accept(app: &mut App) -> bool {
                 .to_owned();
             app.chat_input.cursor = app.chat_input.input.len();
         }
-        Some(ActiveCompletion::File { start, end } | ActiveCompletion::Skill { start, end }) => {
-            let mention_end = start + replacement.len();
-            if !replacement.ends_with('/') {
-                replacement.push(' ');
+        Some(ActiveCompletion::File { start, end }) => {
+            if file_entries::insert(app, &replacement, start, end, descend) {
+                return true;
             }
+        }
+        Some(ActiveCompletion::Skill { start, end }) => {
+            let mention_end = start + replacement.len();
+            replacement.push(' ');
             app.chat_input.input.replace_range(start..end, &replacement);
             app.chat_input.cursor = start + replacement.len();
             app.chat_input.sync_mentions_at(start);
             app.chat_input.add_mention(start, mention_end);
+        }
+        Some(ActiveCompletion::Dir { start, end }) => {
+            dir_completion::insert(app, start, end, &replacement)
         }
         None => return false,
     }
@@ -137,13 +166,31 @@ pub fn accept(app: &mut App) -> bool {
     app.completion.entries.clear();
     app.completion.selected = 0;
     app.completion.scroll = 0;
+    app.completion.picked = false;
     true
 }
 
-/// Tab accepts like `accept`, then leaves a space after a slash command so its arguments (and hint) follow.
+/// Enter's accept: a typed built-in runs as typed, even one completion hides
+/// (`/pr` with its feature off). A `/cd` path that names a folder runs as typed
+/// too, unless the arrows picked one: otherwise Enter moves into the folder
+/// highlighted.
+pub fn accept_on_enter(app: &mut App) -> bool {
+    let typed = match active(app) {
+        Some(ActiveCompletion::Slash) => {
+            commands::parse(&format!("/{}", app.chat_input.input)).is_some()
+        }
+        Some(ActiveCompletion::Dir { start, end }) => {
+            !app.completion.picked && dir_completion::names_a_folder(app, start, end)
+        }
+        _ => false,
+    };
+    !typed && accept(app)
+}
+
+/// Tab accepts like `accept`, but descends into a folder, and leaves a space after a slash command so its arguments (and hint) follow.
 pub fn tab(app: &mut App) {
     let slash = matches!(active(app), Some(ActiveCompletion::Slash));
-    if accept(app) && slash {
+    if accept_with(app, true) && slash {
         app.chat_input.input.push(' ');
         app.chat_input.cursor = app.chat_input.input.len();
     }
@@ -177,6 +224,9 @@ fn active(app: &App) -> Option<ActiveCompletion> {
     {
         return None;
     }
+    if let Some((start, end)) = dir_completion::span(app, caret) {
+        return Some(ActiveCompletion::Dir { start, end });
+    }
     if let Some(start) = skill_mention_start(app) {
         return Some(ActiveCompletion::Skill { start, end: caret });
     }
@@ -184,12 +234,14 @@ fn active(app: &App) -> Option<ActiveCompletion> {
         // Anything typed past the command word, even a space, closes the menu.
         return (!input.contains(char::is_whitespace)).then_some(ActiveCompletion::Slash);
     }
-    let start = input[..caret].rfind('@')?;
-    let query = &input[start + 1..caret];
-    if query.contains(' ') {
+    let start = file_entries::mention_start(&input[..caret])?;
+    if !file_entries::is_open(&input[start + 1..caret]) {
         return None;
     }
-    Some(ActiveCompletion::File { start, end: caret })
+    app.session
+        .startup_config
+        .enable_file_autocomplete
+        .then_some(ActiveCompletion::File { start, end: caret })
 }
 
 /// Start of a `/skill` token ending at the caret: the whitespace-delimited
@@ -226,7 +278,8 @@ fn slash_entries(app: &App) -> Vec<CompletionEntry> {
     let input = &app.chat_input.input;
     let end = crate::chat_input::clamp_offset(input, app.chat_input.cursor);
     let query = input[..end].to_lowercase();
-    let mut scored: Vec<(i64, CompletionEntry)> = commands::entries(&app.completion.skills)
+    let entries = commands::entries(&app.completion.skills, |feature| feature.is_on(app));
+    let mut scored: Vec<(i64, CompletionEntry)> = entries
         .into_iter()
         .filter_map(|entry| {
             let score =
@@ -236,20 +289,6 @@ fn slash_entries(app: &App) -> Vec<CompletionEntry> {
         .collect();
     scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
     scored.into_iter().map(|(_, entry)| entry).collect()
-}
-
-fn file_entries(app: &App, start: usize, end: usize) -> Vec<CompletionEntry> {
-    let query = app.chat_input.input[start + 1..end].replace('\\', "/");
-    app.completion
-        .files
-        .matching(&query, FILE_MATCH_LIMIT)
-        .into_iter()
-        .map(|label| CompletionEntry {
-            label,
-            description: String::new(),
-            origin: None,
-        })
-        .collect()
 }
 
 /// User-invocable skills matching the `/` query, best score first; ties keep

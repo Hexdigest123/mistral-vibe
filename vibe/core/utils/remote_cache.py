@@ -72,7 +72,11 @@ class _KeyState[V]:
     loading: asyncio.Task[None] | None = None
     loaded: bool = False
     flight: asyncio.Task[Cached[V]] | None = None
-    flight_forced: bool = False
+    queued: asyncio.Task[Cached[V]] | None = None
+    queued_backoff: bool = False
+    # A refresh asked for failed: the value held may be outdated whatever its
+    # age, so the next check fetches.
+    doubted: bool = False
     failures: int = 0
     retry_at: float = 0.0
     error: Exception | None = None
@@ -98,6 +102,22 @@ class RemoteCache[K: Hashable, V]:
         self._store = store
         self._clock = clock
         self._states: dict[K, _KeyState[V]] = {}
+        self._change_listeners: list[Callable[[K], None]] = []
+
+    def on_changed(self, callback: Callable[[K], None]) -> Callable[[], None]:
+        """Be told when a key's held value changes: after a refresh, or when
+        another process's newer copy is adopted. Fires once per changed value,
+        never for the first one held or an unchanged re-save.
+
+        Every listener is told; the returned function stops telling this one.
+        """
+        self._change_listeners.append(callback)
+
+        def unsubscribe() -> None:
+            if callback in self._change_listeners:
+                self._change_listeners.remove(callback)
+
+        return unsubscribe
 
     def cached(self, key: K) -> Cached[V] | None:
         """The value held in memory, without starting anything."""
@@ -129,14 +149,36 @@ class RemoteCache[K: Hashable, V]:
         await asyncio.shield(state.loading)
         return self._servable(state)
 
-    def check(self, key: K) -> None:
-        """Start a refresh when the value is old or missing; never waits."""
+    def check(self, key: K, *, refresh_after_s: float | None = None) -> None:
+        """Start a refresh when the value is old or missing; never waits.
+
+        ``refresh_after_s``, when shorter than the policy's, is the age at
+        which this caller takes the value for old: one it knows may be out of
+        date sooner.
+        """
         state = self._state(key)
         entry = self._servable(state)
         if state.flight is not None or self._clock() < state.retry_at:
             return
-        if entry is None or self._stale(entry):
-            self._start(key, state, force=False)
+        if (
+            entry is None
+            or state.doubted
+            or self._stale(entry, refresh_after_s=refresh_after_s)
+        ):
+            self._start(
+                key, state, force=state.doubted, refresh_after_s=refresh_after_s
+            )
+
+    async def settled(self, key: K, *, timeout_s: float) -> None:
+        """Wait, at most ``timeout_s``, for the refresh in flight to end,
+        whatever its outcome; returns at once with none.
+        """
+        state = self._states.get(key)
+        flight = state.flight if state is not None else None
+        if flight is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(flight), timeout_s)
 
     async def first(self, key: K, *, timeout_s: float) -> Cached[V] | None:
         """The cached value, or, with none, the first fetch's.
@@ -155,22 +197,48 @@ class RemoteCache[K: Hashable, V]:
         except TimeoutError:
             return None
 
-    async def refresh(self, key: K) -> Cached[V]:
+    async def refresh(self, key: K, *, backoff: bool = True) -> Cached[V]:
         """Fetch now, whatever the value's age or a recent failure.
 
-        Joins a forced fetch already in flight rather than start a second one.
-        A background refresh in flight may answer from another process's copy
-        without asking the server, so it is let finish and followed by one.
+        A fetch in flight may have asked the server before what the caller
+        reports changed, or answer from another process's copy without
+        asking: it is let finish and followed by one, which every caller
+        arriving meanwhile shares. Without ``backoff``, a failure leaves the
+        next call free to retry at once, unless a caller sharing the fetch
+        asked for one.
         """
         state = self._state(key)
+        if state.flight is None:
+            self._start(key, state, force=True, backoff=backoff)
+            assert state.flight is not None
+            return await _joined(asyncio.shield(state.flight))
+        if state.queued is None:
+            state.queued_backoff = backoff
+            queued = asyncio.create_task(
+                self._after_flight(key, state),
+                name=f"vibe-refresh-{self._name}",
+                context=contextvars.Context(),
+            )
+            state.queued = queued
+
+            def settle(task: asyncio.Task[Cached[V]]) -> None:
+                if state.queued is task:
+                    state.queued = None
+                if not task.cancelled():
+                    task.exception()
+
+            queued.add_done_callback(settle)
+        else:
+            state.queued_backoff = state.queued_backoff or backoff
+        return await _joined(asyncio.shield(state.queued))
+
+    async def _after_flight(self, key: K, state: _KeyState[V]) -> Cached[V]:
         # A check() during the wait can start another background one.
-        while state.flight is not None and not state.flight_forced:
+        while state.flight is not None:
             with contextlib.suppress(Exception):
                 await asyncio.shield(state.flight)
-        if state.flight is None:
-            self._start(key, state, force=True)
-        assert state.flight is not None
-        return await _joined(asyncio.shield(state.flight))
+        state.queued = None
+        return await self._start(key, state, force=True, backoff=state.queued_backoff)
 
     def failure(self, key: K) -> Exception | None:
         """Why the last fetch of ``key`` failed, while it is not retried yet."""
@@ -185,7 +253,12 @@ class RemoteCache[K: Hashable, V]:
 
     async def close(self) -> None:
         """Cancel the fetches in flight and forget every value."""
-        flights = [state.flight for state in self._states.values() if state.flight]
+        flights = [
+            flight
+            for state in self._states.values()
+            for flight in (state.flight, state.queued)
+            if flight is not None
+        ]
         self._states.clear()
         for flight in flights:
             flight.cancel()
@@ -206,8 +279,11 @@ class RemoteCache[K: Hashable, V]:
             return None
         return entry
 
-    def _stale(self, entry: Cached[V]) -> bool:
-        return self._clock() - entry.stored_at >= self._policy.refresh_after_s
+    def _stale(self, entry: Cached[V], *, refresh_after_s: float | None = None) -> bool:
+        after_s = self._policy.refresh_after_s
+        if refresh_after_s is not None:
+            after_s = min(after_s, refresh_after_s)
+        return self._clock() - entry.stored_at >= after_s
 
     def _flight(self, key: K) -> asyncio.Task[Cached[V]]:
         state = self._state(key)
@@ -219,17 +295,28 @@ class RemoteCache[K: Hashable, V]:
         return self._start(key, state, force=False)
 
     def _start(
-        self, key: K, state: _KeyState[V], *, force: bool
+        self,
+        key: K,
+        state: _KeyState[V],
+        *,
+        force: bool,
+        backoff: bool = True,
+        refresh_after_s: float | None = None,
     ) -> asyncio.Task[Cached[V]]:
         # In a context of its own: one copied from the session that happened
         # to start it would keep that session alive as long as the fetch runs.
         flight = asyncio.create_task(
-            self._run(key, state, force=force),
+            self._run(
+                key,
+                state,
+                force=force,
+                backoff=backoff,
+                refresh_after_s=refresh_after_s,
+            ),
             name=f"vibe-refresh-{self._name}",
             context=contextvars.Context(),
         )
         state.flight = flight
-        state.flight_forced = force
 
         def settle(task: asyncio.Task[Cached[V]]) -> None:
             # Let go of the task: its result is held as the entry, and its
@@ -242,11 +329,21 @@ class RemoteCache[K: Hashable, V]:
         flight.add_done_callback(settle)
         return flight
 
-    async def _run(self, key: K, state: _KeyState[V], *, force: bool) -> Cached[V]:
+    async def _run(
+        self,
+        key: K,
+        state: _KeyState[V],
+        *,
+        force: bool,
+        backoff: bool,
+        refresh_after_s: float | None = None,
+    ) -> Cached[V]:
         if not force:
             # Another process may have refreshed it: its copy saves a request.
             await self._load_once(key, state)
-            if state.entry is not None and not self._stale(state.entry):
+            if state.entry is not None and not self._stale(
+                state.entry, refresh_after_s=refresh_after_s
+            ):
                 return state.entry
         failed: Exception | None = None
         value: V | None = None
@@ -258,20 +355,24 @@ class RemoteCache[K: Hashable, V]:
             # it was raised through, the fetch's and its first caller's.
             failed = _copy(exc)
         if failed is not None:
-            state.failures += 1
-            state.retry_at = self._clock() + min(
-                self._policy.retry_after_s * 2 ** (state.failures - 1),
-                self._policy.max_retry_after_s,
-            )
-            state.error = failed
+            if force:
+                state.doubted = True
+            if backoff:
+                state.failures += 1
+                state.retry_at = self._clock() + min(
+                    self._policy.retry_after_s * 2 ** (state.failures - 1),
+                    self._policy.max_retry_after_s,
+                )
+                state.error = failed
             logger.info(
                 "%s refresh failed (attempt %d): %s",
                 self._name,
-                state.failures,
+                state.failures if backoff else state.failures + 1,
                 str(failed) or type(failed).__name__,
             )
             raise RemoteFetchFailedError(failed)
         entry = Cached(value=cast("V", value), stored_at=self._clock())
+        state.doubted = False
         state.failures = 0
         state.retry_at = 0.0
         state.error = None
@@ -279,7 +380,7 @@ class RemoteCache[K: Hashable, V]:
             await asyncio.to_thread(self._store.save, key, entry)
         except Exception:
             logger.warning("%s cache write failed", self._name, exc_info=True)
-        self._adopt(state, entry)
+        self._adopt(key, state, entry)
         return entry
 
     async def _load_once(self, key: K, state: _KeyState[V]) -> None:
@@ -291,10 +392,20 @@ class RemoteCache[K: Hashable, V]:
         if stored is not None and (
             state.entry is None or stored.stored_at > state.entry.stored_at
         ):
-            self._adopt(state, stored)
+            self._adopt(key, state, stored)
 
-    def _adopt(self, state: _KeyState[V], entry: Cached[V]) -> None:
+    def _adopt(self, key: K, state: _KeyState[V], entry: Cached[V]) -> None:
+        previous = state.entry
         state.entry = entry
+        if previous is not None and entry.value != previous.value:
+            self._notify_changed(key)
+
+    def _notify_changed(self, key: K) -> None:
+        for listener in tuple(self._change_listeners):
+            try:
+                listener(key)
+            except Exception:
+                logger.debug("%s change listener failed", self._name, exc_info=True)
 
 
 @dataclass(frozen=True, slots=True)

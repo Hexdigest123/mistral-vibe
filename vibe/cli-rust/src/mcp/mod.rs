@@ -4,6 +4,7 @@ pub mod add_args;
 mod browser;
 pub mod commands;
 mod connect;
+pub mod detail;
 mod help;
 mod labels;
 mod notices;
@@ -14,13 +15,13 @@ pub mod search;
 mod toggle;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::server::Client;
 use crate::server::{method, MCPState};
 use serde_json::{json, Value};
 
-use crate::app::App;
+use crate::app::{App, Severity};
 use crate::commands::submission::new_message_id;
 use crate::transcript::local;
 use rows::Row;
@@ -28,15 +29,12 @@ use rows::Row;
 pub use browser::{back, close, mouse, navigate, select};
 pub use help::help_text;
 pub use notices::show_post_init_notices;
-pub(crate) use notices::INTEGRATIONS_UNAVAILABLE_TOAST_SECS;
 use refresh::rediscover;
-pub use refresh::{background_refresh, refresh, refresh_deadline};
+pub use refresh::{background_refresh, refresh};
 pub use toggle::{set_disabled, Toggle};
 
 /// How often the open browser re-discovers sources.
 pub const BACKGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-/// Seconds a warning toast stays up.
-const TOAST_SECS: u64 = 5;
 
 /// An answer to one `/mcp` server round-trip, applied on the main thread.
 pub enum Event {
@@ -177,7 +175,7 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, event: Event) {
         // Notify and repaint from the server; only this toggle's paint is stale.
         Event::ToggleFailed { toggle, message } => {
             toggle::revert(app, &toggle);
-            app.show_toast(message, crate::app::ToastSeverity::Warning, TOAST_SECS);
+            crate::notices::inline(app, Severity::Error, &message);
         }
         Event::ActionRequested => browser::hand_off(app, client),
         Event::Connected { name, response } => connect::finished(app, client, &name, &response),
@@ -223,11 +221,12 @@ fn open(app: &mut App, mut state: MCPState, initial_source: &str, reopened: bool
     let viewing =
         viewing.filter(|source| !(reopened && rows::pending_action(&state, source).is_some()));
     app.mcp.search = crate::search_field::Search::default();
+    app.mcp.tool_search = crate::search_field::Search::default();
     app.mcp.viewing_name = viewing.map(|source| source.name.clone());
     app.mcp.viewing_kind = viewing.map(|source| source.kind);
     app.mcp.list.reset();
     app.mcp.open = true;
-    app.mcp.refresh_at = Some(Instant::now() + BACKGROUND_REFRESH_INTERVAL);
+    app.mcp.refresh_at = Some(crate::clock::now() + BACKGROUND_REFRESH_INTERVAL);
     set_state(app, state);
 }
 

@@ -116,7 +116,7 @@ fn arm_refresh(app: &mut App) {
     }
     // Clear the dirty bit, sleep 50ms, then fetch.
     app.subagents.refresh_requested = false;
-    app.subagents.refresh_at = Some(std::time::Instant::now() + super::REFRESH_DEBOUNCE);
+    app.subagents.refresh_at = Some(crate::clock::real_now() + super::REFRESH_DEBOUNCE);
 }
 
 /// The debounce elapsed. Fetch once; requests from the wait stay dirty and
@@ -156,15 +156,12 @@ fn spawn_refresh(app: &mut App, client: &std::sync::Arc<crate::server::Client>) 
         None => (std::collections::HashSet::new(), false),
     };
     app.subagents.refresh_in_flight = true;
-    // Count the fetch as in-flight work so the idle marker waits for it.
-    let pending = app.commit_started();
     super::fetch::fetch_history(
         client.clone(),
         session_id,
         Some(tx),
         known_ids,
         cached_complete,
-        pending,
     );
     true
 }
@@ -226,9 +223,8 @@ pub fn reset_views(app: &mut App) {
     // Leave `refresh_in_flight` set so the outstanding answer, not a new read, releases the drain.
     app.subagents.viewed_subagent_id = None;
     app.subagents.transcripts.clear();
-    // Another session: its list shows again only once it has a child, with waiting ones hidden.
+    // Another session: its list shows again only once it has a child.
     app.subagents.list.shown = false;
-    app.subagents.list.show_waiting = false;
     if app.subagents.list.focused {
         super::list::leave_list(app);
     }

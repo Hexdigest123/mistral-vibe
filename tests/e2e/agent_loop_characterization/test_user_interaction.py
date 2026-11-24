@@ -16,17 +16,20 @@ from tests.e2e.common import (
     SpawnedVibeProcessFixture,
     send_ctrl_c_until_quit_confirmation,
     wait_for_dialog_to_accept_keys,
-    wait_for_main_screen,
     wait_for_rendered_text,
+    wait_for_session_ready,
 )
 from tests.e2e.mock_server import ChatCompletionsRequestPayload, StreamingMockServer
 
 QUESTION_CALL_ID = "call_question_mode"
 QUESTION_TEXT = "Which mode should Vibe use?"
+# Only the question dialog draws option rows; the transcript's tool call row
+# also shows QUESTION_TEXT, before the dialog opens.
+FIRST_OPTION_ROW = "Fast - Move quickly"
 
 
 def _answer_first_question_option(child: pexpect.spawn, captured: io.StringIO) -> None:
-    wait_for_dialog_to_accept_keys(child, captured, needle=QUESTION_TEXT)
+    wait_for_dialog_to_accept_keys(child, captured, needle=FIRST_OPTION_ROW)
     child.send("\r")
 
 
@@ -73,7 +76,7 @@ def test_ask_user_question_waits_for_answer_and_reports_it_to_the_model(
     spawned_vibe_process: SpawnedVibeProcessFixture,
 ) -> None:
     with spawned_vibe_process(e2e_workdir) as (child, captured):
-        wait_for_main_screen(child, timeout=15)
+        wait_for_session_ready(child, captured, timeout=15)
         child.send("Ask me for a mode")
         child.send("\r")
 

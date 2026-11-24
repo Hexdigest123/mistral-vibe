@@ -12,9 +12,11 @@ import logging
 from pathlib import Path
 import sys
 import tempfile
+import tomllib
 from typing import Any
 
 import pytest
+import tomli_w
 
 from tests.conftest import build_test_vibe_config
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
@@ -22,6 +24,7 @@ from vibe.core.config.harness_files import HarnessFilesManager
 from vibe.core.tools.manager import ToolManager
 from vibe.core.tools.models import PermissionScope, ToolPermission
 from vibe.core.tools.permissions import PermissionStore
+from vibe.core.trusted_folders import TrustedFoldersManager
 from vibe.permissions import RequiredPermission
 
 pytest.importorskip("mistralai_vibe_local_harness.vibe")
@@ -30,11 +33,17 @@ pytest.importorskip("mistralai_vibe_local_harness.vibe")
 # at module scope -- it builds `PermissionOutcome`, so importing the resolver is
 # importing it. `mistralai-vibe-local-harness` is an optional extra, and an environment
 # without it must skip this module rather than fail to collect it.
+from vibe.app_server._local_projects import LocalProjectStore
+from vibe.app_server._project_moves import (
+    LIST_PROJECTS_TOOL_NAME,
+    MOVE_TO_PROJECT_TOOL_NAME,
+)
 from vibe.app_server._provided_tools import (
     TODO_TOOL_NAME,
     VIBE_PROVIDED_TOOL_NAMES,
     VIBE_TOOL_GROUP,
 )
+from vibe.app_server._session_peers import RENAME_SESSION_TOOL_NAME
 from vibe.app_server._unified_permissions import (
     RUST_BUILTIN_TOOL_SOURCES,
     CommandEnvironment,
@@ -607,6 +616,109 @@ async def test_a_permanent_grant_writes_the_pattern_to_the_allowlist(
 
 
 @pytest.mark.asyncio
+async def test_a_permanent_grant_keeps_allowlist_entries_another_session_saved(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    # Prepare
+    resolver, _ = _resolver(tmp_path, bash={"allowlist": ["ls"]})
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    config_file = config_dir / "config.toml"
+    saved = tomllib.loads(config_file.read_text())
+    saved.setdefault("tools", {})["bash"] = {"allowlist": ["ls", "make"]}
+    config_file.write_text(tomli_w.dumps(saved))
+
+    # Do
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+
+    # Assert
+    persisted = tomllib.loads(config_file.read_text())
+    assert persisted["tools"]["bash"]["allowlist"] == ["ls", "make", "npm test"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows refuses to delete the process cwd"
+)
+async def test_a_permanent_grant_persists_after_the_process_cwd_is_deleted(
+    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Prepare
+    resolver, _ = _resolver(tmp_path, bash={"allowlist": ["ls"]})
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    deleted = tmp_path / "deleted"
+    deleted.mkdir()
+    monkeypatch.chdir(deleted)
+    deleted.rmdir()
+
+    # Do
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+
+    # Assert
+    persisted = tomllib.loads((config_dir / "config.toml").read_text())
+    assert "npm test" in persisted["tools"]["bash"]["allowlist"]
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_grant_rewrites_a_pattern_removed_from_the_file(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    # Prepare
+    resolver, _ = _resolver(tmp_path, bash={"allowlist": ["ls"]})
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+    config_file = config_dir / "config.toml"
+    saved = tomllib.loads(config_file.read_text())
+    saved["tools"]["bash"]["allowlist"] = ["ls"]
+    config_file.write_text(tomli_w.dumps(saved))
+
+    # Do
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+
+    # Assert
+    persisted = tomllib.loads(config_file.read_text())
+    assert persisted["tools"]["bash"]["allowlist"] == ["ls", "npm test"]
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_grant_already_in_the_file_leaves_it_byte_identical(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    # Prepare
+    resolver, _ = _resolver(tmp_path, bash={"allowlist": ["ls"]})
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    config_file = config_dir / "config.toml"
+    saved = tomllib.loads(config_file.read_text())
+    saved.setdefault("tools", {})["bash"] = {"allowlist": ["npm test", "ls"]}
+    original = "# my comment\n" + tomli_w.dumps(saved)
+    config_file.write_text(original)
+
+    # Do
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+
+    # Assert
+    assert config_file.read_text() == original
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_grant_keeps_entries_deleted_from_the_file_deleted(
+    tmp_path: Path, config_dir: Path
+) -> None:
+    # Prepare
+    resolver, _ = _resolver(tmp_path, bash={"allowlist": ["ls", "make"]})
+    outcome = await resolver.resolve("file_system.bash", {"command": "npm test"})
+    config_file = config_dir / "config.toml"
+    assert "bash" not in tomllib.loads(config_file.read_text()).get("tools", {})
+
+    # Do
+    await resolver.grant("file_system.bash", _granted(outcome), permanent=True)
+
+    # Assert
+    allowlist = tomllib.loads(config_file.read_text())["tools"]["bash"]["allowlist"]
+    assert "make" not in allowlist
+    assert {"npm test", "git status"} <= set(allowlist)
+
+
+@pytest.mark.asyncio
 async def test_a_grant_for_a_command_with_an_expansion_covers_the_next_one(
     tmp_path: Path,
 ) -> None:
@@ -719,7 +831,7 @@ async def test_a_permanent_grant_persists_command_and_path_scopes(
 
     # Assert
     allowlist = orchestrator.config.tools["bash"]["allowlist"]
-    assert allowlist == sorted(["grep", path_grant])
+    assert {"grep", path_grant} <= set(allowlist)
     assert PermissionScope.OUTSIDE_DIRECTORY.value not in caplog.text
     next_session, _ = _resolver(tmp_path, bash={"allowlist": allowlist})
     again = await next_session.resolve("file_system.bash", {"command": command})
@@ -956,6 +1068,133 @@ async def test_the_unified_todo_tool_obeys_the_permission_configured_for_todo(
     # Do / Assert
     assert (await denied.resolve(route, {"action": "read"})).decision == "deny"
     assert (await allowed.resolve(route, {"action": "read"})).decision == "allow"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("permission", "decision"), [("ask", "ask"), ("never", "deny")]
+)
+async def test_configured_peer_rename_permission_overrides_default_allow(
+    tmp_path: Path, permission: str, decision: str
+) -> None:
+    """A per-tool setting still asks or denies when renaming is allowed by default."""
+    resolver, _ = _resolver(
+        tmp_path, **{RENAME_SESSION_TOOL_NAME: {"permission": permission}}
+    )
+    resolver.provided_names.register(VIBE_TOOL_GROUP, VIBE_PROVIDED_TOOL_NAMES)
+
+    outcome = await resolver.resolve(
+        f"{VIBE_TOOL_GROUP}.{RENAME_SESSION_TOOL_NAME}",
+        {"session_id": "other", "title": "Short title"},
+    )
+
+    assert outcome.decision == decision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("permission", "decision"),
+    [(ToolPermission.ASK, "ask"), (ToolPermission.NEVER, "deny")],
+)
+async def test_session_peer_rename_permission_overrides_default_allow(
+    tmp_path: Path, permission: ToolPermission, decision: str
+) -> None:
+    resolver, _ = _resolver(tmp_path)
+    resolver.provided_names.register(VIBE_TOOL_GROUP, VIBE_PROVIDED_TOOL_NAMES)
+    resolver.store.set_tool_permission(RENAME_SESSION_TOOL_NAME, permission)
+
+    outcome = await resolver.resolve(
+        f"{VIBE_TOOL_GROUP}.{RENAME_SESSION_TOOL_NAME}",
+        {"session_id": "other", "title": "Short title"},
+    )
+
+    assert outcome.decision == decision
+
+
+@pytest.mark.asyncio
+async def test_moving_to_a_project_asks_only_when_its_folder_is_not_trusted(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: Two projects, one in a folder the user trusts for good.
+    *Do*: Resolve a ``move_to_project`` call to each, a cancel, and a project listing.
+    *Assert*: Only the move into the untrusted folder asks.
+    """
+    # Prepare
+    trusted_folder = tmp_path / "trusted"
+    untrusted_folder = tmp_path / "untrusted"
+    trusted_folder.mkdir()
+    untrusted_folder.mkdir()
+    store = LocalProjectStore()
+    trusted = store.create(name="trusted", root_path=trusted_folder)
+    untrusted = store.create(name="untrusted", root_path=untrusted_folder)
+    TrustedFoldersManager.read_file().add_trusted(trusted_folder)
+    resolver, _ = _resolver(tmp_path)
+    resolver.provided_names.register(VIBE_TOOL_GROUP, VIBE_PROVIDED_TOOL_NAMES)
+    move = f"{VIBE_TOOL_GROUP}.{MOVE_TO_PROJECT_TOOL_NAME}"
+
+    # Do
+    into_trusted = await resolver.resolve(move, {"project_id": trusted.id})
+    into_untrusted = await resolver.resolve(move, {"project_id": untrusted.id})
+    cancel = await resolver.resolve(move, {})
+    listing = await resolver.resolve(f"{VIBE_TOOL_GROUP}.{LIST_PROJECTS_TOOL_NAME}", {})
+
+    # Assert
+    assert into_trusted.decision == "allow"
+    assert into_untrusted.decision == "ask"
+    assert cancel.decision == "allow"
+    assert listing.decision == "allow"
+
+
+@pytest.mark.asyncio
+async def test_approving_one_move_does_not_approve_the_next(tmp_path: Path) -> None:
+    """*Prepare*: Two projects in folders the user has not trusted.
+    *Do*: Approve a move to one for good, then resolve a move to the other.
+    *Assert*: The second move still asks, and nothing reaches the config.
+    """
+    # Prepare
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    store = LocalProjectStore()
+    store.create(name="first", root_path=first)
+    target = store.create(name="second", root_path=second)
+    resolver, orchestrator = _resolver(tmp_path)
+    resolver.provided_names.register(VIBE_TOOL_GROUP, VIBE_PROVIDED_TOOL_NAMES)
+    move = f"{VIBE_TOOL_GROUP}.{MOVE_TO_PROJECT_TOOL_NAME}"
+
+    # Do
+    await resolver.grant(move, [], permanent=True)
+    outcome = await resolver.resolve(move, {"project_id": target.id})
+
+    # Assert
+    assert outcome.decision == "ask"
+    assert MOVE_TO_PROJECT_TOOL_NAME not in orchestrator.config.tools
+
+
+@pytest.mark.asyncio
+async def test_a_configured_ask_asks_even_for_a_trusted_folder(tmp_path: Path) -> None:
+    """*Prepare*: A project in a trusted folder, with ``move_to_project`` set to ask.
+    *Do*: Resolve a move to it.
+    *Assert*: It asks: the user's setting beats the trust shortcut.
+    """
+    # Prepare
+    folder = tmp_path / "trusted"
+    folder.mkdir()
+    project = LocalProjectStore().create(name="trusted", root_path=folder)
+    TrustedFoldersManager.read_file().add_trusted(folder)
+    resolver, _ = _resolver(
+        tmp_path, **{MOVE_TO_PROJECT_TOOL_NAME: {"permission": "ask"}}
+    )
+    resolver.provided_names.register(VIBE_TOOL_GROUP, VIBE_PROVIDED_TOOL_NAMES)
+
+    # Do
+    outcome = await resolver.resolve(
+        f"{VIBE_TOOL_GROUP}.{MOVE_TO_PROJECT_TOOL_NAME}", {"project_id": project.id}
+    )
+
+    # Assert
+    assert outcome.decision == "ask"
 
 
 @pytest.mark.asyncio
@@ -1956,3 +2195,40 @@ async def test_outside_workdir_deny_lets_the_null_device_and_streams_through(
     outcome = await resolver.resolve("file_system.bash", {"command": command})
 
     assert outcome.decision != "deny"
+
+
+def test_a_session_that_moved_into_untrusted_worktrees_reads_no_config_from_them(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A session whose tools moved into one worktree after another,
+        neither trusted, each with project hooks and skills.
+    *Do*: Read the tools' project roots and write boundary.
+    *Assert*: Both worktrees are writable, but neither is a root project
+    config is read from.
+    """
+    # Prepare
+    checkout, first, second = (tmp_path / name for name in ("c", "w1", "w2"))
+    for directory in (checkout, first, second):
+        (directory / ".vibe").mkdir(parents=True)
+        (directory / ".vibe" / "hooks.toml").write_text("", encoding="utf-8")
+    orchestrator = FakeConfigOrchestrator(build_test_vibe_config())
+    store = PermissionStore()
+    manager = ToolManager(
+        lambda: orchestrator.config,
+        defer_mcp=True,
+        cwd=checkout,
+        harness_files=HarnessFilesManager(sources=("user", "project")).for_session(
+            checkout
+        ),
+        permission_getter=store.get_tool_permission,
+    )
+
+    # Do
+    manager.move_to(second, [first, second])
+    tool = manager.get("write_file")
+
+    # Assert
+    assert first.resolve() not in tool.harness_files.project_roots
+    assert second.resolve() not in tool.harness_files.project_roots
+    assert tool.workspace.allows((first / "a.md").resolve())
+    assert tool.workspace.allows((second / "a.md").resolve())

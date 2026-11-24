@@ -278,6 +278,128 @@ fn steering_and_notifications_keep_their_shared_admission_order() {
     );
 }
 
+///
+/// *Prepare*: One completion is pending for an active turn.
+/// *Do*: Receive a context message, a notification, then steering, and restore and finish the
+/// retained completion.
+/// *Assert*: The next model call reads the three in the order Core received them.
+///
+#[test]
+fn context_notifications_and_steering_keep_their_admission_order() {
+    // Prepare
+    let turn_id = "turn-context-notification-steer";
+    let mut runtime = SynchronousRuntime::new(config());
+    let original_completion = runtime.start_turn(turn_id, "prepare the answer");
+    let notification = notification("notification-after-context", "background evidence is ready");
+
+    // Do
+    runtime.apply(
+        json!({
+            "type": "context_message",
+            "content": [{"type": "text", "text": "github is down"}],
+        }),
+        running(turn_id).keep(&original_completion),
+    );
+    runtime.receive_notification(turn_id, &notification, &[&original_completion]);
+    runtime.receive_steering(turn_id, "use the evidence", &[&original_completion]);
+    runtime.restart_from_checkpoint();
+    let follow_up_completion = runtime
+        .apply(
+            text_completion(&original_completion, "first answer"),
+            running(turn_id)
+                .dispatch(llm_call(1))
+                .observe(assistant_text_committed(
+                    turn_id,
+                    &original_completion,
+                    "first answer",
+                ))
+                .observe(notification_delivered(
+                    turn_id,
+                    observed_notification(&notification),
+                ))
+                .observe(turn_steered(turn_id, "use the evidence")),
+        )
+        .only_action();
+
+    // Assert
+    runtime.assert_last_model_message_update(
+        &follow_up_completion,
+        "replace",
+        &[
+            model_system(),
+            model_user_text("prepare the answer"),
+            model_assistant_text("first answer"),
+            model_context_text("github is down"),
+            model_notifications(&[&notification]),
+            model_user_text("use the evidence"),
+        ],
+    );
+    runtime.finish_turn_with_text(turn_id, &follow_up_completion, "answer with the evidence");
+}
+
+///
+/// *Prepare*: One completion is pending for an active turn.
+/// *Do*: Receive a notification, a context message, then steering, and restore and finish the
+/// retained completion.
+/// *Assert*: The next model call reads the three in the order Core received them.
+///
+#[test]
+fn notifications_context_and_steering_keep_their_admission_order() {
+    // Prepare
+    let turn_id = "turn-notification-context-steer";
+    let mut runtime = SynchronousRuntime::new(config());
+    let original_completion = runtime.start_turn(turn_id, "check the connection");
+    let notification = notification("notification-before-context", "github was disconnected");
+
+    // Do
+    runtime.receive_notification(turn_id, &notification, &[&original_completion]);
+    runtime.apply(
+        json!({
+            "type": "context_message",
+            "content": [{"type": "text", "text": "github is connected now"}],
+        }),
+        running(turn_id).keep(&original_completion),
+    );
+    runtime.receive_steering(
+        turn_id,
+        "continue with the latest state",
+        &[&original_completion],
+    );
+    runtime.restart_from_checkpoint();
+    let follow_up_completion = runtime
+        .apply(
+            text_completion(&original_completion, "first answer"),
+            running(turn_id)
+                .dispatch(llm_call(1))
+                .observe(assistant_text_committed(
+                    turn_id,
+                    &original_completion,
+                    "first answer",
+                ))
+                .observe(notification_delivered(
+                    turn_id,
+                    observed_notification(&notification),
+                ))
+                .observe(turn_steered(turn_id, "continue with the latest state")),
+        )
+        .only_action();
+
+    // Assert
+    runtime.assert_last_model_message_update(
+        &follow_up_completion,
+        "replace",
+        &[
+            model_system(),
+            model_user_text("check the connection"),
+            model_assistant_text("first answer"),
+            model_notifications(&[&notification]),
+            model_context_text("github is connected now"),
+            model_user_text("continue with the latest state"),
+        ],
+    );
+    runtime.finish_turn_with_text(turn_id, &follow_up_completion, "continue");
+}
+
 #[test]
 fn stops_at_iteration_limit_before_delivering_pending_steering() {
     let turn_id = "turn-steer-at-iteration-limit";
@@ -455,11 +577,13 @@ fn interrupting_a_running_tool_keeps_its_steering_after_the_interrupted_tool_mes
     );
 }
 
-/// *Prepare*: A V1 checkpoint has steering and a notification without an admission position.
-/// *Do*: Restore that earlier shape and finish the retained model completion.
-/// *Assert*: Earlier checkpoints retain their all-steering-before-notifications interpretation.
+/// *Prepare*: A notification then a steering message arrive during a completion; the checkpoint is rewritten
+/// to the earlier V1 layout, which keeps steering on the active Turn and pending notifications beside the
+/// delivered identities, each with the number of steering messages admitted before it.
+/// *Do*: Restore that earlier layout and finish the retained model completion.
+/// *Assert*: The restored queue keeps admission order: the notification comes before the steering.
 #[test]
-fn earlier_checkpoint_without_notification_positions_preserves_its_input_order() {
+fn earlier_checkpoint_layout_restores_admission_order() {
     // Prepare
     let turn_id = "earlier-input-order";
     let mut runtime = SynchronousRuntime::new(config());
@@ -468,9 +592,25 @@ fn earlier_checkpoint_without_notification_positions_preserves_its_input_order()
     runtime.receive_notification(turn_id, &notice, &[&original]);
     runtime.receive_steering(turn_id, "correction", &[&original]);
     let mut checkpoint = runtime.checkpoint_value();
-    for entry in checkpoint["notifications"].as_array_mut().unwrap() {
-        entry.as_object_mut().unwrap().remove("preceding_steers");
+    let pending_input = checkpoint
+        .as_object_mut()
+        .unwrap()
+        .remove("pending_input")
+        .unwrap();
+    let mut pending_steer = Vec::new();
+    let mut pending_notifications = Vec::new();
+    for entry in pending_input.as_array().unwrap() {
+        match entry["type"].as_str().unwrap() {
+            "steering" => pending_steer.push(entry["message"].clone()),
+            _ => pending_notifications.push(json!({
+                "type": "pending",
+                "notification": entry["notification"].clone(),
+                "preceding_steers": pending_steer.len(),
+            })),
+        }
     }
+    checkpoint["turn"]["pending_steer"] = Value::Array(pending_steer);
+    checkpoint["notifications"] = Value::Array(pending_notifications);
 
     // Do
     runtime.restore_checkpoint_value(checkpoint, config());
@@ -484,11 +624,11 @@ fn earlier_checkpoint_without_notification_positions_preserves_its_input_order()
                     &original,
                     "initial answer",
                 ))
-                .observe(turn_steered(turn_id, "correction"))
                 .observe(notification_delivered(
                     turn_id,
                     observed_notification(&notice),
-                )),
+                ))
+                .observe(turn_steered(turn_id, "correction")),
         )
         .only_action();
 
@@ -500,8 +640,8 @@ fn earlier_checkpoint_without_notification_positions_preserves_its_input_order()
             model_system(),
             model_user_text("start"),
             model_assistant_text("initial answer"),
-            model_user_text("correction"),
             model_notifications(&[&notice]),
+            model_user_text("correction"),
         ],
     );
 }

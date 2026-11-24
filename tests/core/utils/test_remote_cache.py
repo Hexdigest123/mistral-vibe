@@ -167,6 +167,56 @@ async def test_a_reader_giving_up_does_not_cancel_the_shared_fetch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_settled_wait_timing_out_leaves_the_shared_refresh_to_finish_once() -> (
+    None
+):
+    # Two sessions wait on a slow refresh: the first one's wait running out
+    # must not cancel the fetch both share.
+    clock, fetch = _Clock(), _Fetch(values=["fresh"])
+    fetch.release = asyncio.Event()
+    store = _Store({"k": Cached("old", stored_at=clock.now - 601)})
+    cache = _cache(fetch, clock, store)
+    await _get(cache, "k")
+
+    await cache.settled("k", timeout_s=0.01)
+    second = asyncio.create_task(cache.settled("k", timeout_s=5))
+    await _settle()
+    fetch.release.set()
+    await second
+
+    assert fetch.calls == 1
+    assert cache.cached("k") == Cached("fresh", stored_at=clock.now)
+
+
+@pytest.mark.asyncio
+async def test_a_settled_wait_with_no_refresh_in_flight_returns_at_once() -> None:
+    clock, fetch = _Clock(), _Fetch()
+    store = _Store({"k": Cached("recent", stored_at=clock.now - 60)})
+    cache = _cache(fetch, clock, store)
+    await _get(cache, "k")
+
+    await cache.settled("k", timeout_s=5)
+
+    assert fetch.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_check_with_a_shorter_age_refreshes_sooner_than_the_policy() -> None:
+    clock, fetch = _Clock(), _Fetch(values=["fresh"])
+    store = _Store({"k": Cached("recent", stored_at=clock.now - 60)})
+    cache = _cache(fetch, clock, store)
+    await cache.load("k")
+
+    cache.check("k")
+    await _settle()
+    assert fetch.calls == 0
+
+    cache.check("k", refresh_after_s=30)
+    await _settle()
+    assert fetch.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_a_failure_backs_off_doubling_up_to_its_cap() -> None:
     clock = _Clock()
     fetch = _Fetch(values=[OSError("down")] * 10)
@@ -422,3 +472,179 @@ async def test_a_disk_read_holds_nothing_of_the_reader_that_started_it() -> None
 
     assert entry is not None and entry.value == "disk"
     assert alive() is None
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_refresh_does_not_take_an_answer_asked_before_it() -> None:
+    # A forced fetch in flight may have asked the server before the change the
+    # caller reports: the refresh waits it out and asks again, once for every
+    # caller that came in meanwhile.
+    clock, fetch = _Clock(), _Fetch(values=["before", "after"])
+    fetch.release = asyncio.Event()
+    cache = _cache(fetch, clock)
+    warming = asyncio.create_task(cache.refresh("k"))
+    await asyncio.sleep(0)
+
+    reported = [asyncio.create_task(cache.refresh("k")) for _ in range(2)]
+    await asyncio.sleep(0)
+    fetch.release.set()
+    entries = await asyncio.gather(*reported)
+
+    assert (await warming).value == "before"
+    assert [entry.value for entry in entries] == ["after", "after"]
+    assert fetch.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_without_backoff_leaves_the_next_read_free_to_fetch() -> None:
+    clock, fetch = _Clock(), _Fetch(values=[OSError("down"), "v"])
+    cache = _cache(fetch, clock)
+    with pytest.raises(RemoteFetchFailedError):
+        await cache.refresh("k", backoff=False)
+
+    entry = await _first(cache, "k")
+
+    assert entry is not None and entry.value == "v"
+    assert cache.failure("k") is None
+
+
+@pytest.mark.parametrize("warm_up_first", [True, False])
+@pytest.mark.asyncio
+async def test_a_queued_refresh_backs_off_when_any_caller_sharing_it_asked(
+    warm_up_first: bool,
+) -> None:
+    clock, fetch = _Clock(), _Fetch(values=["v1", OSError("down")])
+    fetch.release = asyncio.Event()
+    cache = _cache(fetch, clock)
+    running = asyncio.create_task(cache.refresh("k"))
+    await asyncio.sleep(0)
+    flags = [False, True] if warm_up_first else [True, False]
+    queued = []
+    for backoff in flags:
+        queued.append(asyncio.create_task(cache.refresh("k", backoff=backoff)))
+        await asyncio.sleep(0)
+
+    fetch.release.set()
+    await running
+    results = await asyncio.gather(*queued, return_exceptions=True)
+
+    assert all(isinstance(result, RemoteFetchFailedError) for result in results)
+    assert fetch.calls == 2
+    assert cache.failure("k") is not None
+
+
+@pytest.mark.parametrize("backoff", [False, True])
+@pytest.mark.asyncio
+async def test_a_failed_explicit_refresh_has_the_next_check_fetch_a_recent_copy(
+    backoff: bool,
+) -> None:
+    # The caller forced it because the copy may be outdated: a recent copy is
+    # not trusted again until a fetch answers, within the usual backoff.
+    clock, fetch = _Clock(), _Fetch(values=[OSError("down"), "fresh"])
+    store = _Store({"k": Cached("disk", stored_at=clock.now - 60)})
+    cache = _cache(fetch, clock, store)
+    await cache.load("k")
+    with pytest.raises(RemoteFetchFailedError):
+        await cache.refresh("k", backoff=backoff)
+    if backoff:
+        cache.check("k")
+        await _settle()
+        assert fetch.calls == 1
+        clock.now += 31
+
+    cache.check("k")
+    await _settle()
+
+    assert fetch.calls == 2
+    assert cache.cached("k") == Cached("fresh", stored_at=clock.now)
+
+
+@pytest.mark.asyncio
+async def test_a_changed_refreshed_value_tells_the_change_listener_once() -> None:
+    clock, fetch = _Clock(), _Fetch(values=["fresh"])
+    store = _Store({"k": Cached("old", stored_at=clock.now - 601)})
+    cache = _cache(fetch, clock, store)
+    changed: list[str] = []
+    cache.on_changed(changed.append)
+
+    await _get(cache, "k")  # serves "old", starts the background refresh
+    await _settle()
+
+    assert changed == ["k"]
+    assert cache.cached("k") == Cached("fresh", stored_at=clock.now)
+
+    # An unchanged re-save never tells again; the value is already held.
+    await cache.refresh("k")
+    await _settle()
+    assert changed == ["k"]
+
+
+@pytest.mark.asyncio
+async def test_the_first_value_held_tells_nothing() -> None:
+    clock, fetch = _Clock(), _Fetch()
+    cache = _cache(fetch, clock)
+    changed: list[str] = []
+    cache.on_changed(changed.append)
+
+    await _first(cache, "k")
+    await _settle()
+
+    assert changed == []
+
+
+@pytest.mark.asyncio
+async def test_another_process_newer_copy_tells_the_listener() -> None:
+    clock, fetch = _Clock(), _Fetch()
+    store = _Store({"k": Cached("disk", stored_at=clock.now - 601)})
+    cache = _cache(fetch, clock, store)
+    await cache.load("k")
+    changed: list[str] = []
+    cache.on_changed(changed.append)
+
+    # Another process's copy is newer than the one held, but not stale: the
+    # next refresh adopts it and saves the request.
+    store.entries["k"] = Cached("newer", stored_at=clock.now - 60)
+    cache.check("k")
+    await _settle()
+
+    assert changed == ["k"]
+    assert cache.cached("k") == Cached("newer", stored_at=clock.now - 60)
+    assert fetch.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failing_listener_does_not_break_the_refresh() -> None:
+    clock, fetch = _Clock(), _Fetch(values=["fresh"])
+    store = _Store({"k": Cached("old", stored_at=clock.now - 601)})
+    cache = _cache(fetch, clock, store)
+
+    def refuse(_key: str) -> None:
+        raise RuntimeError("listener broken")
+
+    cache.on_changed(refuse)
+
+    await _get(cache, "k")
+    await _settle()
+
+    assert cache.cached("k") == Cached("fresh", stored_at=clock.now)
+
+
+@pytest.mark.asyncio
+async def test_every_change_listener_is_told_until_it_unsubscribes() -> None:
+    clock, fetch = _Clock(), _Fetch(values=["fresh", "fresher"])
+    store = _Store({"k": Cached("old", stored_at=clock.now - 601)})
+    cache = _cache(fetch, clock, store)
+    await cache.load("k")
+    first: list[str] = []
+    second: list[str] = []
+    cache.on_changed(first.append)
+    stop_second = cache.on_changed(second.append)
+
+    await cache.refresh("k")
+    await _settle()
+    stop_second()
+    await cache.refresh("k")
+    await _settle()
+
+    assert first == ["k", "k"]
+    assert second == ["k"]

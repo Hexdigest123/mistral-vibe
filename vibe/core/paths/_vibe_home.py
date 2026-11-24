@@ -4,7 +4,10 @@ import os
 import stat
 
 from vibe import VIBE_ROOT
-from vibe.core.experiments._constants import EVAL_CACHE_FILE_NAME
+from vibe.core.experiments._constants import (
+    EVAL_CACHE_FILE_NAME,
+    HELD_EVAL_CACHE_FILE_NAME,
+)
 from vibe.observability.logging import logger
 from vibe.utils.paths import GlobalPath
 from vibe.utils.platform import is_windows
@@ -14,6 +17,8 @@ VIBE_HOME = GlobalPath(get_vibe_home)
 GLOBAL_ENV_FILE = GlobalPath(lambda: VIBE_HOME.path / ".env")
 SESSION_LOG_DIR = GlobalPath(lambda: VIBE_HOME.path / "logs" / "session")
 WORKTREES_DIR = GlobalPath(lambda: VIBE_HOME.path / "worktrees")
+# The working folders of projectless sessions, never trusted.
+SCRATCH_DIR = GlobalPath(lambda: VIBE_HOME.path / "scratch")
 TRUSTED_FOLDERS_FILE = GlobalPath(lambda: VIBE_HOME.path / "trusted_folders.toml")
 LOG_DIR = GlobalPath(lambda: VIBE_HOME.path / "logs")
 LOG_FILE = GlobalPath(lambda: VIBE_HOME.path / "logs" / "vibe.log")
@@ -24,6 +29,9 @@ CONNECTOR_BOOTSTRAP_CACHE_FILE = GlobalPath(
     lambda: VIBE_HOME.path / "connector_bootstrap_cache.json"
 )
 EXPERIMENT_EVAL_CACHE_FILE = GlobalPath(lambda: VIBE_HOME.path / EVAL_CACHE_FILE_NAME)
+EXPERIMENT_HELD_EVAL_CACHE_FILE = GlobalPath(
+    lambda: VIBE_HOME.path / HELD_EVAL_CACHE_FILE_NAME
+)
 MANAGED_CONFIG_CACHE_FILE = GlobalPath(
     lambda: VIBE_HOME.path / "managed_config_cache.json"
 )

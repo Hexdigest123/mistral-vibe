@@ -11,7 +11,14 @@ from typing import Literal
 
 from croniter import CroniterError, croniter
 from dateutil.tz import gettz
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from vibe.core.loop import (
     MAX_LOOPS_PER_SESSION,
@@ -20,6 +27,7 @@ from vibe.core.loop import (
     parse_interval,
 )
 from vibe.utils.io import atomic_replace, file_write_lock, read_safe_async
+from vibe.utils.platform import PRIVATE_DIRECTORY_MODE
 
 
 class ScheduledLoopStoreError(RuntimeError):
@@ -86,6 +94,19 @@ class ScheduledPrompt(BaseModel):
             return now + self.interval_seconds
         assert self.cron is not None
         return _next_cron_fire(self.cron, now)
+
+
+def _cron_fields(cron: str | None) -> list[str] | None:
+    """A cron's fields, so spacing alone never reads as a new schedule."""
+    return None if cron is None else cron.split()
+
+
+def _readable(error: ValidationError) -> str:
+    """The validators' own messages, without Pydantic's wrapping."""
+    return " ".join(
+        str(detail.get("ctx", {}).get("error", detail["msg"]))
+        for detail in error.errors()
+    )
 
 
 class _StoredLoopsV1(BaseModel):
@@ -205,10 +226,69 @@ class UnifiedScheduledLoops:
                     created_at=now,
                 )
                 loop.next_fire_at = loop.next_fire_after(now)
+            except ValidationError as exc:
+                raise LoopError(_readable(exc)) from exc
             except (ValueError, OverflowError) as exc:
                 raise LoopError(str(exc)) from exc
             await self._commit([*self._loops, loop])
             return loop.model_copy(deep=True)
+
+    async def update(
+        self,
+        loop_id: str,
+        prompt: str,
+        *,
+        interval: str | None = None,
+        cron: str | None = None,
+    ) -> ScheduledPrompt:
+        """Replace a loop's prompt and schedule, keeping its id.
+
+        An unchanged schedule keeps the next run; a new one counts from now.
+        """
+        interval_seconds = None if interval is None else parse_interval(interval)
+        async with self._lock:
+            loop = next((item for item in self._loops if item.id == loop_id), None)
+            if loop is None:
+                raise LoopError(f"No scheduled loop with id `{loop_id}`.")
+            rescheduled = (loop.interval_seconds, _cron_fields(loop.cron)) != (
+                interval_seconds,
+                _cron_fields(cron),
+            )
+            now = time.time()
+            try:
+                updated = ScheduledPrompt(
+                    id=loop.id,
+                    interval_seconds=interval_seconds,
+                    cron=cron,
+                    prompt=prompt,
+                    next_fire_at=loop.next_fire_at,
+                    created_at=loop.created_at,
+                )
+                if rescheduled:
+                    updated.next_fire_at = updated.next_fire_after(now)
+            except ValidationError as exc:
+                raise LoopError(_readable(exc)) from exc
+            except (ValueError, OverflowError) as exc:
+                raise LoopError(str(exc)) from exc
+            await self._commit([
+                updated if item.id == loop_id else item for item in self._loops
+            ])
+            return updated.model_copy(deep=True)
+
+    async def run_now(self, loop_id: str, now: float | None = None) -> ScheduledPrompt:
+        """Make a loop due now; it fires on the next idle tick, then reschedules."""
+        async with self._lock:
+            loop = next((item for item in self._loops if item.id == loop_id), None)
+            if loop is None:
+                raise LoopError(f"No scheduled loop with id `{loop_id}`.")
+            due = loop.model_copy(
+                update={"next_fire_at": now if now is not None else time.time()},
+                deep=True,
+            )
+            await self._commit([
+                due if item.id == loop_id else item for item in self._loops
+            ])
+            return due.model_copy(deep=True)
 
     async def delete(self, loop_id: str) -> ScheduledPrompt:
         async with self._lock:
@@ -294,7 +374,9 @@ class UnifiedScheduledLoops:
         if not self._persistent():
             return
         try:
-            self._path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            self._path.parent.mkdir(
+                parents=True, mode=PRIVATE_DIRECTORY_MODE, exist_ok=True
+            )
             # Scheduled loops reference session content, so the store file is
             # created owner-only; an existing file keeps its current mode.
             self._path.touch(mode=0o600, exist_ok=True)

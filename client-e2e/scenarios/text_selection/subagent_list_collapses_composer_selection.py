@@ -1,4 +1,4 @@
-"""Focusing the subagent list collapses the composer selection to its caret."""
+"""Opening the subagent list from the rail collapses the composer selection to its caret."""
 
 from __future__ import annotations
 
@@ -23,11 +23,10 @@ timeline: Timeline = [
     turn_completed(),
     "draft text",
     _SHIFT_LEFT * 4,
-    "\x1b[B",  # Down on the last line: the list takes focus on Main
+    "\x1b[<0;112;34M\x1b[<0;112;34m",  # click the rail's subagents item: the list takes focus on Main
     "\x1b[A",  # Up on Main: focus returns to the input
     "X",
 ]
-capture_steps = {2, 3, 4, 5}
 
 # A surviving selection would be replaced by the typed key: "draft X".
 screen_contains = ("draft Xtext",)

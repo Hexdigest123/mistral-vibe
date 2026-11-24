@@ -10,7 +10,7 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _PROMPT = "create the worktree"
 _EFFECT_ID = "running-long-bash"
@@ -24,12 +24,6 @@ _COMMAND = (
     'git -C "$WT/$NAME" log --oneline -1'
 )
 
-# Busy frames settle under replay so the running header is capturable.
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
-# A release step must not consume a marker of its own, so settle key by key.
-settle_per_key = True
-capture_steps = {1, 2}
-
 timeline: Timeline = [
     f"{_PROMPT}\r",
     turn_started(),
@@ -41,4 +35,5 @@ timeline: Timeline = [
     # Turn start, the harness queue drain, the prompt, then the running call.
     {"release": 4},
     {"release": 3},
+    take_snapshot(),
 ]

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+from dataclasses import dataclass
 from enum import StrEnum, auto
 from pathlib import Path
-from typing import Any
+from typing import cast
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class SkillSource(StrEnum):
@@ -18,6 +20,9 @@ class SkillScope(StrEnum):
     BUILTIN = auto()
     GLOBAL = auto()
     PROJECT = auto()
+    SESSION = auto()
+    # A plugin synced from the user's AI Registry plugins (``vibe.core.plugins.remote``).
+    REMOTE = auto()
 
 
 # The registry's reserved alias that always resolves to the newest version,
@@ -25,6 +30,19 @@ class SkillScope(StrEnum):
 # alias auto-resolves to latest and never reports an "update available".
 REGISTRY_LATEST_ALIAS = "latest"
 DISABLE_MODEL_INVOCATION_FIELD = "disable-model-invocation"
+
+
+class ManifestEntry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    skill_id: str
+    version: int | str = REGISTRY_LATEST_ALIAS
+    description: str = ""
+
+    @property
+    def alias(self) -> str | None:
+        return self.version if isinstance(self.version, str) else None
 
 
 class RegistryRef(BaseModel):
@@ -86,19 +104,30 @@ class SkillMetadata(BaseModel):
 
     @field_validator("allowed_tools", mode="before")
     @classmethod
-    def parse_allowed_tools(cls, v: str | list[str] | None) -> list[str]:
-        if v is None:
-            return []
-        if isinstance(v, str):
-            return v.split()
-        return list(v)
+    def parse_allowed_tools(cls, v: object) -> list[str]:
+        match v:
+            case None:
+                return []
+            case str():
+                return v.split()
+            case list() | tuple():
+                return [str(tool) for tool in cast(Iterable[object], v)]
+            case _:
+                raise ValueError(
+                    "allowed-tools must be a space-separated string or a list"
+                )
 
     @field_validator("metadata", mode="before")
     @classmethod
-    def normalize_metadata(cls, v: dict[str, Any] | None) -> dict[str, str]:
-        if v is None:
-            return {}
-        return {str(k): str(val) for k, val in v.items()}
+    def normalize_metadata(cls, v: object) -> dict[str, str]:
+        match v:
+            case None:
+                return {}
+            case dict():
+                items = cast(dict[object, object], v).items()
+                return {str(k): str(val) for k, val in items}
+            case _:
+                raise ValueError("metadata must be a mapping of keys to values")
 
 
 class SkillInfo(BaseModel):
@@ -111,6 +140,8 @@ class SkillInfo(BaseModel):
     user_invocable: bool = True
     model_invocable: bool = True
     skill_path: Path | None = None
+    entry_path: Path | None = None
+    """The ``SKILL.md`` under the skill root that lists it, links left unresolved."""
     prompt: str
     source: SkillSource = SkillSource.LOCAL
     scope: SkillScope = SkillScope.GLOBAL
@@ -152,6 +183,16 @@ class SkillInfo(BaseModel):
             scope=scope,
             registry=registry,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledSkill:
+    """``active`` says whether the skill's name loads this one, not whether it is
+    enabled.
+    """
+
+    info: SkillInfo
+    active: bool
 
 
 class SkillConfigIssue(BaseModel):

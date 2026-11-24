@@ -134,6 +134,38 @@ def test_a_known_model_takes_its_input_modalities_from_the_table_when_unset() ->
     assert declared_off.agent.input_modalities == _TEXT_ONLY
 
 
+@pytest.mark.parametrize(
+    ("name", "modalities"),
+    [("azure_ai/gpt-5.5", _TEXT_ONLY), ("azure_ai/claude-opus-5-5", _TEXT_AND_IMAGE)],
+)
+def test_the_gateway_gpt_5_5_reads_no_images(
+    name: str, modalities: tuple[InputModality, ...]
+) -> None:
+    """*Prepare*: The internal AI gateway, which sends tool-result images, and
+    gpt-5.5 on it with images unset: the gateway answers HTTP 500 to any image
+    sent to that model. Claude on the same gateway reads them.
+    *Do*: Compile the session's facts.
+    *Assert*: gpt-5.5 reads text only, so Core sends it ``[Image]`` in place of
+    every image, tool results included; Claude keeps its images.
+    """
+    # Prepare
+    provider = ProviderConfig(
+        name="p",
+        api_base="https://internal-ai-gateway.mistralai.com",
+        backend=Backend.GENERIC,
+        api_style="openai",
+    )
+    model = _model(name)
+
+    # Do
+    facts = compile_session_model_facts(provider, model, model)
+
+    # Assert
+    assert provider.sends_tool_result_images is True
+    assert facts.agent.input_modalities == modalities
+    assert facts.compaction.input_modalities == modalities
+
+
 def test_only_the_agent_route_warns() -> None:
     """*Prepare*: A known agent model and an unknown compaction model.
     *Do*: Compile the session's facts.
@@ -150,24 +182,40 @@ def test_only_the_agent_route_warns() -> None:
     assert facts.warnings == ()
 
 
-def test_a_threshold_past_the_window_is_a_config_error() -> None:
-    """*Prepare*: A threshold equal to the model's window.
-    *Do*: Compile the session's facts and the agent route's threshold.
-    *Assert*: Both are refused with the window's range; neither lowers the threshold.
-    """
-    # Prepare
-    model = _model(max_context_length=100_000, auto_compact_threshold=100_000)
-    message = (
-        r"compaction threshold 100000 is outside 50000\.\.76000 for a "
-        r"100000-token context window"
+@pytest.mark.parametrize(
+    ("window", "threshold", "fitted", "bounds", "fit", "moved"),
+    [
+        (262_144, 800_000, 238_144, "50000 to 238144", "too high for", "capped"),
+        (100_000, 100_000, 76_000, "50000 to 76000", "too high for", "capped"),
+        (100_000, 20_000, 50_000, "50000 to 76000", "too low for", "raised"),
+    ],
+    ids=["above-range", "at-window", "below-range"],
+)
+def test_a_threshold_outside_the_window_range_is_fitted_with_a_warning(
+    window: int, threshold: int, fitted: int, bounds: str, fit: str, moved: str
+) -> None:
+    model = _model(max_context_length=window, auto_compact_threshold=threshold)
+
+    facts = compile_session_model_facts(_provider(), model, model)
+    route = compile_agent_route_facts(_provider(), model)
+
+    assert facts.agent.compaction_threshold == fitted
+    assert compile_agent_compaction_threshold(_provider(), model) == fitted
+    assert route.threshold_warning == (
+        f"Model 'custom-model': auto_compact_threshold {threshold} is {fit} "
+        f"max_context_length {window} (allowed: {bounds}), so it was "
+        f"{moved} automatically to {fitted}. "
+        "Set auto_compact_threshold within that range or remove it."
     )
 
-    # Do / Assert
-    with pytest.raises(ModelFactsError, match=message) as raised:
-        compile_session_model_facts(_provider(), model, model)
-    with pytest.raises(ModelFactsError, match=message):
-        compile_agent_compaction_threshold(_provider(), model)
-    assert raised.value.data == {OUTCOME_ERROR_FIELD: RunOutcome.CONFIG_ERROR.value}
+
+def test_a_threshold_inside_the_window_range_does_not_warn() -> None:
+    model = _model(max_context_length=100_000, auto_compact_threshold=60_000)
+
+    route = compile_agent_route_facts(_provider(), model)
+
+    assert route.compaction_threshold == 60_000
+    assert route.threshold_warning is None
 
 
 @pytest.mark.parametrize(
@@ -252,17 +300,17 @@ def test_the_default_level_set_leaves_reasoning_unknown() -> None:
 
 
 def test_the_configs_level_set_wins_over_a_known_models() -> None:
-    """*Prepare*: Mistral Large 4, whose table row lists low, high and max, while
-    its config lists low, medium and high.
+    """*Prepare*: Mistral Large 4, whose table row lists low, medium and high,
+    while its config lists low, high and max.
     *Do*: Compile the session's facts at each listed level.
     *Assert*: The config's levels apply, and each level runs as written.
     """
     # Prepare
     provider = _provider()
 
-    for level in ("low", "medium", "high"):
+    for level in ("low", "high", "max"):
         model = _model(
-            "mistral-large-4", thinking=level, thinking_levels=["low", "medium", "high"]
+            "mistral-large-4", thinking=level, thinking_levels=["low", "high", "max"]
         )
 
         # Do
@@ -270,7 +318,7 @@ def test_the_configs_level_set_wins_over_a_known_models() -> None:
 
         # Assert
         assert facts.agent_reasoning == ReasoningSupport(
-            ("low", "medium", "high"), can_turn_off=False
+            ("low", "high", "max"), can_turn_off=False
         )
         assert facts.agent_thinking == level
         assert facts.warnings == ()
@@ -319,8 +367,8 @@ def test_a_level_of_the_models_own_runs_as_written_over_a_known_model(
     expected_offered: tuple[str, ...],
 ) -> None:
     """*Prepare*: A known model, served on an OpenAI-compatible route, whose table
-    row stops at high, while its config lists a level of its own, and sets it or a
-    word it does not list.
+    row lists low, medium and high, while its config lists a level of its own, and sets
+    it or a word it does not list.
     *Do*: Compile the session's facts and the picker's levels.
     *Assert*: The config's levels are the model's, lowest first with the own level
     kept in its place; the session runs the level as written, and the picker
@@ -392,8 +440,8 @@ def test_the_configs_own_levels_win_over_the_catalogues(
 
 
 def test_a_level_outside_the_known_levels_runs_when_the_config_lists_none() -> None:
-    """*Prepare*: Mistral Large 4, whose known levels are low, high and max, set to xhigh
-    with no level set in its config.
+    """*Prepare*: Mistral Large 4, whose known levels are low, medium and high, set to
+    xhigh with no level set in its config.
     *Do*: Compile the session's facts.
     *Assert*: The session runs at xhigh: with no listed levels, Vibe sends the level
     and the provider says whether the model takes it.
@@ -406,6 +454,39 @@ def test_a_level_outside_the_known_levels_runs_when_the_config_lists_none() -> N
 
     # Assert
     assert facts.agent_thinking == "xhigh"
+
+
+@pytest.mark.parametrize("name", ["mistral-large-4", "mistral-large-4-0"])
+def test_mistral_large_4_offers_the_levels_its_api_takes(name: str) -> None:
+    """*Prepare*: Mistral Large 4, under each id the API serves it, with no level set
+    in its config.
+    *Do*: Compile the picker's levels.
+    *Assert*: The picker offers low, medium and high, the efforts the API takes.
+    """
+    # Do
+    route = compile_agent_route_facts(_provider(), _model(name))
+
+    # Assert
+    assert route.thinking_levels == ("low", "medium", "high")
+
+
+def test_mistral_large_latest_offers_the_levels_of_the_model_its_card_names(
+    catalogue: _CountingFetcher,
+) -> None:
+    """*Prepare*: The latest alias, whose card names Mistral Large 4.
+    *Do*: Compile the session's facts, then the picker's levels.
+    *Assert*: The picker offers low, medium and high, Mistral Large 4's efforts.
+    """
+    # Prepare
+    catalogue.entry = CatalogueEntry(name="mistral-large-4")
+    model = _model("mistral-large-latest")
+
+    # Do
+    compile_session_model_facts(_keyed_provider(), model, model)
+    route = compile_agent_route_facts(_keyed_provider(), model)
+
+    # Assert
+    assert route.thinking_levels == ("low", "medium", "high")
 
 
 @pytest.mark.parametrize("levels", [[], ["off"]])
@@ -695,6 +776,7 @@ def test_a_saved_catalogue_answer_round_trips_and_a_bad_one_is_ignored(
             context_window=131_072,
             max_output_tokens=8_192,
             input_modalities=_TEXT_ONLY,
+            name="m-2604",
             reasoning=ReasoningSupport(
                 ("low", "turbo", "high"),
                 can_turn_off=True,
@@ -795,16 +877,17 @@ def test_a_reopen_with_a_saved_answer_asks_only_for_another_compaction_model(
     [
         (_provider(), "zai-glm-5-3", "low"),
         (_provider(backend=Backend.GENERIC), "gpt-6-astra", "low"),
+        (_provider(), "mistral-large-4", "low"),
         (_provider(), "mistral-medium-3.5", "off"),
         (_provider(), "custom-model", "off"),
     ],
-    ids=["glm-5.3", "gpt-6-astra", "can-turn-off", "unknown-model"],
+    ids=["glm-5.3", "gpt-6-astra", "mistral-large-4", "can-turn-off", "unknown-model"],
 )
 def test_an_unset_thinking_takes_the_models_lowest_setting(
     provider: ProviderConfig, name: str, lowest: str
 ) -> None:
-    """*Prepare*: A model entry without `thinking`, on models that always reason,
-    one that can stop and one nobody knows.
+    """*Prepare*: A model entry without `thinking`, on models that always reason
+    (Mistral Large 4 among them), one that can stop and one nobody knows.
     *Do*: Compile the session's facts.
     *Assert*: Both routes think at the model's lowest setting: off where it can
     stop, else its lowest level. Nothing is refused.

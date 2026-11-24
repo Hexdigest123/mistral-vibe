@@ -1,6 +1,18 @@
 use super::*;
 use crate::input_modes::InputMode;
 
+/// Every message role in the transcript, in order.
+fn roles(app: &App) -> Vec<String> {
+    app.view
+        .transcript
+        .lines()
+        .filter_map(|line| match line.entry {
+            crate::server::HistoryEntry::Message(message) => Some(message.role.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn selected(app: &mut App, has_file_changes: bool) {
     apply_event(
         app,
@@ -49,17 +61,33 @@ fn a_new_selection_reopens_on_the_action_step() {
     assert_eq!(app.view.scroll_to_entry, Some(0));
 }
 
+fn notice_text(app: &App) -> Option<&str> {
+    app.overlays.notice.as_ref().map(|n| n.text.as_str())
+}
+
+#[test]
+fn a_failure_with_the_panel_still_open_shows_only_a_notice() {
+    let mut app = App::default();
+    selected(&mut app, false);
+    apply_event(&mut app, Event::Failed("boom".into()));
+    assert!(app.rewind.open);
+    assert!(roles(&app).is_empty());
+    assert_eq!(notice_text(&app), Some("boom"));
+}
+
 #[test]
 fn a_failed_read_leaves_rewind_mode_when_nothing_is_highlighted() {
     let mut app = App::default();
     apply_event(&mut app, Event::Failed("boom".into()));
     assert!(!app.rewind.open);
-    assert!(!app.overlays.toasts.is_empty());
+    assert!(roles(&app).is_empty());
+    assert_eq!(notice_text(&app), Some("boom"));
 }
 
 #[test]
 fn a_done_rewind_restores_the_message_into_the_composer() {
     let mut app = App::default();
+    app.session.session_id = Some("old-session-id".into());
     selected(&mut app, false);
     let state = serde_json::json!({
         "eventId": 3,
@@ -69,6 +97,7 @@ fn a_done_rewind_restores_the_message_into_the_composer() {
     apply_event(
         &mut app,
         Event::Done {
+            entry_id: "entry-1".into(),
             message: "fix the parser".into(),
             restore_errors: vec!["Failed to restore file: a.py".into()],
             old_session_id: "old-session-id".into(),
@@ -80,17 +109,19 @@ fn a_done_rewind_restores_the_message_into_the_composer() {
     assert_eq!(app.chat_input.input, "fix the parser");
     assert_eq!(app.chat_input.cursor, "fix the parser".len());
     assert_eq!(app.session.session_id.as_deref(), Some("new-session-id"));
-    assert!(!app.overlays.toasts.is_empty());
-    // The fork notice is the only entry left after the history was replaced.
-    assert_eq!(app.view.transcript.lines().count(), 1);
+    // The fork notice and the restore warning are the only entries left after the rebuild.
+    assert_eq!(app.view.transcript.lines().count(), 2);
+    assert_eq!(roles(&app), ["command_warning"]);
 }
 
 fn done(app: &mut App, message: &str) {
+    app.session.session_id = Some("session-id".into());
     selected(app, false);
     let state = serde_json::json!({"eventId": 3, "session": {"id": "session-id"}, "history": []});
     apply_event(
         app,
         Event::Done {
+            entry_id: "entry-1".into(),
             message: message.into(),
             restore_errors: Vec::new(),
             old_session_id: "session-id".into(),
@@ -128,4 +159,24 @@ fn a_done_rewind_ending_on_a_mention_keeps_completions_closed() {
     done(&mut app, "please run /code-review");
     assert_eq!(app.chat_input.cursor, "please run /code-review".len());
     assert!(app.completion.entries.is_empty());
+}
+
+#[test]
+fn a_done_rewind_for_a_session_left_meanwhile_is_ignored() {
+    let mut app = App::default();
+    app.session.session_id = Some("other-session".into());
+    let state = serde_json::json!({"eventId": 3, "session": {"id": "session-id"}, "history": []});
+    apply_event(
+        &mut app,
+        Event::Done {
+            entry_id: "entry-1".into(),
+            message: "hello".into(),
+            restore_errors: Vec::new(),
+            old_session_id: "session-id".into(),
+            inplace: true,
+            state: Box::new(serde_json::from_value(state).expect("state")),
+        },
+    );
+    assert_eq!(app.session.session_id.as_deref(), Some("other-session"));
+    assert!(app.chat_input.input.is_empty());
 }

@@ -23,16 +23,10 @@ fn clearing_adopts_the_replacement_session() {
         message_id: "rs-1".into(),
         text: "hi".into(),
     };
-    let CommandEvent::Cleared {
-        session_id,
-        usage,
-        seed,
-        ..
-    } = cleared(result, None, Some(seed))
-    else {
+    let CommandEvent::Cleared { state, seed, .. } = cleared(result, None, Some(seed)) else {
         panic!("expected a cleared event");
     };
-    assert_eq!(session_id, "new-session");
+    assert_eq!(state.session.id, "new-session");
     assert_eq!(seed.map(|seed| seed.text).as_deref(), Some("hi"));
 
     let mut app = App::default();
@@ -45,7 +39,7 @@ fn clearing_adopts_the_replacement_session() {
         output_tokens: 500,
         total_tokens: 0,
     });
-    apply_cleared(&mut app, session_id, usage, Vec::new());
+    apply_cleared(&mut app, &state);
     assert_eq!(app.session.session_id.as_deref(), Some("new-session"));
     assert!(app.session.active_turn_id.is_none());
     // The gauge resets instead of waiting for the fresh session's first stats.
@@ -74,9 +68,17 @@ fn a_response_without_state_is_an_error() {
 fn a_resumable_previous_session_is_named_with_its_resume_command() {
     assert_eq!(
         new_conversation_text(Some("0123456789abcdef")),
-        "New conversation started.\n\nPrevious session: `01234567`\n\
-         To resume it later, run: `vibe --resume 01234567`"
+        "New conversation started.\n\nPrevious session: `89abcdef`\n\
+         To resume it later, run: `vibe --resume 89abcdef`"
     );
+}
+
+#[test]
+fn uuidv7_sessions_started_together_get_distinct_resume_ids() {
+    let first = new_conversation_text(Some("019a5f2e-8c41-7d3a-9b1e-4f6a2c8d0e17"));
+    let second = new_conversation_text(Some("019a5f2e-8c41-7f02-a4c9-d71b3e5f9a28"));
+    assert!(first.ends_with("`vibe --resume 2c8d0e17`"));
+    assert!(second.ends_with("`vibe --resume 3e5f9a28`"));
 }
 
 #[test]

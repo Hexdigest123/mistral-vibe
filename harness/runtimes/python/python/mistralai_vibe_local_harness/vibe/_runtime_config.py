@@ -7,9 +7,15 @@ from typing import Literal
 
 from mistralai_vibe_local_harness.protocol import (
     RustHarnessConfig,
+    RustMessage,
     RustRuntimeBuiltinToolName,
+    RustToolDefinition,
 )
 from mistralai_vibe_local_harness.session_protocol import PublicRetryCategory
+from mistralai_vibe_local_harness.vibe._completion_budget import (
+    CompletionPricing,
+    SharedCompletionBudget,
+)
 from mistralai_vibe_local_harness.vibe._credentials import (
     ProviderCredentialProvider,
     StaticProviderCredentials,
@@ -22,6 +28,7 @@ from mistralai_vibe_local_harness.vibe._sandbox import (
 )
 from mistralai_vibe_local_harness.vibe.completion_profile import (
     FIRST_OUTPUT_WAIT_SECONDS,
+    REASONING_OFF,
     REQUIRED_MAX_TOKENS_FALLBACK,
     STREAM_IDLE_SECONDS,
     ReasoningSetting,
@@ -133,7 +140,8 @@ class RequestSentTelemetry:
     remaining request metrics once per provider call. ``turn_id`` is the turn
     an agent or compaction call serves, which tells a Session's own calls
     from its subagents' when they share one sink; utility completions have
-    none.
+    none. ``reasoning_effort`` is the reasoning setting the request sends, or
+    ``off`` when it sends none.
     """
 
     model: str
@@ -143,10 +151,34 @@ class RequestSentTelemetry:
     nb_context_messages: int
     nb_prompt_chars: int
     turn_id: str | None = None
+    reasoning_effort: ReasoningSetting = REASONING_OFF
 
 
 # Host sink for per-completion request telemetry, called once per LLM call.
 type RequestSentSink = Callable[[RequestSentTelemetry], None]
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRequest:
+    """The model input of one agent completion, reported once the call succeeded.
+
+    ``messages`` and ``tools`` are exactly what the completion sent: the
+    assembled system prompt, the conversation, and the tool catalogue. A Host
+    can measure them to explain what fills the model's context window; as only
+    successful calls are reported, the newest input always pairs with the
+    newest usage reading. They are shared with the Runtime, so a sink must not
+    mutate them.
+    ``turn_id`` is the turn the call serves, which tells a Session's own calls
+    from its subagents' when they share one sink.
+    """
+
+    turn_id: str
+    messages: tuple[RustMessage, ...]
+    tools: tuple[RustToolDefinition, ...]
+
+
+# Host sink for each agent completion's model input, called once per agent call.
+type ModelRequestSink = Callable[[ModelRequest], None]
 
 # The ways a provider response can break the tool call contract Core enforces,
 # each named after the rejection it would cause.
@@ -204,6 +236,7 @@ class LocalModelRoute:
     # One request's own setting, such as the lowest for a summary; None keeps
     # ``thinking``.
     request_thinking: RequestReasoning | None = None
+    pricing: CompletionPricing | None = None
 
     def reasoning_setting(self, wire: WireFormat) -> ReasoningSetting | None:
         """The setting one request on this route sends; None leaves the field out."""
@@ -213,6 +246,17 @@ class LocalModelRoute:
 
 
 _DEFAULT_LOCAL_MODEL_ROUTE = LocalModelRoute()
+
+
+def output_room(context_window: int, compaction_threshold: int) -> int | None:
+    """What a request at the compaction threshold leaves the model for output.
+
+    A server that checks input plus ``max_tokens`` against the window refuses
+    more. A window with no room left at the threshold overflows on input
+    alone, so it bounds nothing and the room is None.
+    """
+    room = context_window - compaction_threshold
+    return room if room > 0 else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +277,7 @@ class LocalProviderRoute:
     credentials: ProviderCredentialProvider
     reasoning_field_name: str = "reasoning_content"
     emits_finish_reason: bool = True
+    tool_result_images: bool = False
     extra_headers: Mapping[str, str] = field(default_factory=dict)
     project_id: str = ""
     region: str = ""
@@ -301,6 +346,7 @@ class LocalRuntimeAdapterPorts:
     request_sent_sink: RequestSentSink | None
     image_describer: ImageDescriberSink | None = None
     malformed_tool_calls_sink: MalformedToolCallsSink | None = None
+    model_request_sink: ModelRequestSink | None = None
     sandbox: SandboxAdapter | None = None
     helper_crashes: HelperCrashCount = field(
         default_factory=HelperCrashCount, compare=False
@@ -330,6 +376,9 @@ class LocalRuntimeAdapterConfig:
     # Reasoning effort passed to reasoning-capable providers: "off" or a level.
     thinking: ThinkingLevel = "off"
     active_model: LocalModelRoute = field(default_factory=LocalModelRoute)
+    # The name the user knows the active model by (its alias in the embedder's
+    # config), reported to pre_llm hooks; None when the embedder has none.
+    active_model_alias: str | None = None
     # The agent configuration this session runs: recorded in the transcript when it
     # changes, and matched by post_agent hooks. None disables the transcript record.
     active_agent: str | None = None
@@ -348,9 +397,11 @@ class LocalRuntimeAdapterConfig:
     # routes the classify call to Mistral with Mistral credentials. ``None``
     # keeps the classifier on the session provider (already Mistral).
     classifier_provider: LocalProviderRoute | None = None
-    # Model for the classify gate; empty keeps the Runtime default. A name, not a
-    # route: the gate pins its own sampling settings.
+    # Model for the classify gate; empty keeps the Runtime default. The gate pins
+    # its own sampling settings, while pricing follows this selected model.
     classifier_model: str = ""
+    classifier_pricing: CompletionPricing | None = None
+    completion_budget: SharedCompletionBudget | None = None
     max_tokens: int | None = None
     # Caps sent as ``max_tokens`` on every agent or compaction request whatever
     # the format; None sends one only where the format requires it.
@@ -368,6 +419,10 @@ class LocalRuntimeAdapterConfig:
     reasoning_field_name: str = "reasoning_content"
     # Some OpenAI-compatible endpoints never emit a finish reason.
     emits_finish_reason: bool = True
+    # Whether the endpoint takes images in a tool message, which the Chat
+    # Completions spec does not allow. Off, tool results carry `[Image]` in
+    # place of each image; an endpoint that takes them sets it to True.
+    tool_result_images: bool = False
     # Extra static headers merged into every provider request.
     extra_headers: dict[str, str] = field(default_factory=dict)
     affinity_id: AffinityIdSource | None = None
@@ -386,6 +441,12 @@ class LocalRuntimeAdapterConfig:
     # call is a long silence that a short limit cannot tell apart from a stall.
     stream_idle_timeout_s: float | None = STREAM_IDLE_SECONDS
     retry_max_elapsed_time_s: float = 300.0
+    # How long, in seconds the computer is awake, a model call waits for a
+    # provider credential the Host could not check yet (``ProviderAuthRequired``
+    # with reason ``unavailable``) before the turn fails. Separate from
+    # ``retry_max_elapsed_time_s``: no request has been sent yet. The last 5 s
+    # are left for the last check, so a budget of 5 s or less fails at once.
+    credential_wait_s: float = 120.0
     # Verify provider certificates with the operating system's trust store (the
     # macOS Keychain, for example) instead of OpenSSL's default roots plus
     # Certifi. That store also skips the strict chain checks of Python's
@@ -414,6 +475,9 @@ class LocalRuntimeAdapterConfig:
     # keeps the Runtime default.
     subagent_max_children: int | None = None
     subagent_max_concurrent_turns: int | None = None
+    # Whether the Session API serves this session. Only then does the Runtime
+    # record the Session API facts and save them in the Session file.
+    session_api: bool = False
     # Host-bound per-call permission resolver: refines an ``ask`` call into allow/ask/deny
     # (main's Vibe rules — .env prompt, denylists, allowlist grants), named by a builtin's
     # name or a provided tool's full route. Under smart approve it runs first, and only
@@ -425,6 +489,7 @@ class LocalRuntimeAdapterConfig:
     correlation_id_sink: CorrelationIdSink | None = None
     request_sent_sink: RequestSentSink | None = None
     malformed_tool_calls_sink: MalformedToolCallsSink | None = None
+    model_request_sink: ModelRequestSink | None = None
     skills: Mapping[str, str] = field(default_factory=dict)
     # Where workspace file and shell tools run. None runs them on this host;
     # an adapter runs them in its Sandbox Environment, whose paths ``workspace``
@@ -448,6 +513,8 @@ class LocalRuntimeAdapterConfig:
             and self.compaction_reasoning_limit_tokens < 1
         ):
             raise ValueError("compaction_reasoning_limit_tokens must be positive")
+        if self.credential_wait_s < 0:
+            raise ValueError("credential_wait_s must not be negative")
         if self.subagent_max_children is not None and self.subagent_max_children < 1:
             raise ValueError("subagent_max_children must be positive")
         if (
@@ -571,6 +638,7 @@ class LocalRuntimeAdapterConfig:
             request_sent_sink=self.request_sent_sink,
             image_describer=self.image_describer,
             malformed_tool_calls_sink=self.malformed_tool_calls_sink,
+            model_request_sink=self.model_request_sink,
             sandbox=self.sandbox,
             helper_crashes=self.helper_crashes,
         )
@@ -593,6 +661,7 @@ class LocalRuntimeAdapterConfig:
             request_sent_sink=ports.request_sent_sink,
             image_describer=ports.image_describer,
             malformed_tool_calls_sink=ports.malformed_tool_calls_sink,
+            model_request_sink=ports.model_request_sink,
             sandbox=ports.sandbox,
             helper_crashes=ports.helper_crashes,
         )
@@ -607,23 +676,28 @@ _LOCAL_RUNTIME_ADAPTER_BEHAVIOR_FIELDS = frozenset({
     "temperature",
     "thinking",
     "active_model",
+    "active_model_alias",
     "active_agent",
     "compaction_model",
     "title_model",
     "title_prompt",
     "classifier_model",
+    "classifier_pricing",
+    "completion_budget",
     "max_tokens",
     "agent_max_tokens",
     "compaction_max_tokens",
     "compaction_reasoning_limit_tokens",
     "reasoning_field_name",
     "emits_finish_reason",
+    "tool_result_images",
     "extra_headers",
     "project_id",
     "region",
     "timeout_s",
     "stream_idle_timeout_s",
     "retry_max_elapsed_time_s",
+    "credential_wait_s",
     "enable_system_trust_store",
     "env",
     "command_environment",
@@ -634,6 +708,7 @@ _LOCAL_RUNTIME_ADAPTER_BEHAVIOR_FIELDS = frozenset({
     "provided_tool_mode",
     "subagent_max_children",
     "subagent_max_concurrent_turns",
+    "session_api",
     "skills",
 })
 
@@ -675,6 +750,8 @@ __all__ = [
     "MalformedToolCallReason",
     "MalformedToolCallsSink",
     "MalformedToolCallsTelemetry",
+    "ModelRequest",
+    "ModelRequestSink",
     "ProcessAuthority",
     "ProviderDeltaObserver",
     "ProviderStreamDelta",

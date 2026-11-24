@@ -1,6 +1,8 @@
 //! Session titles and focus-aware terminal notifications.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::UiInstant;
 
 use crate::program_status::{encode_report, ProgramState};
 
@@ -12,6 +14,11 @@ pub enum NotificationContext {
     ActionRequired,
     Complete,
     Failed,
+    /// The goal stopped on its own; `message` titles the notification.
+    Goal {
+        message: &'static str,
+        complete: bool,
+    },
 }
 
 impl NotificationContext {
@@ -20,8 +27,8 @@ impl NotificationContext {
             Self::ActionRequired => {
                 ProgramState::Blocked(crate::program_status::BlockedKind::Permission)
             }
-            Self::Complete => ProgramState::Done,
-            Self::Failed => ProgramState::Error,
+            Self::Complete | Self::Goal { complete: true, .. } => ProgramState::Done,
+            Self::Failed | Self::Goal { .. } => ProgramState::Error,
         }
     }
 }
@@ -44,7 +51,7 @@ pub struct TerminalNotifier {
     enabled: bool,
     title_enabled: bool,
     bell_context: Option<NotificationContext>,
-    last_notification_time: Option<Instant>,
+    last_notification_time: Option<UiInstant>,
     bell_pending: bool,
     dirty: bool,
 }
@@ -163,7 +170,10 @@ impl TerminalNotifier {
             .map(|_| encode_report(ProgramState::Idle, ""))
     }
 
-    pub fn notify(&mut self, context: NotificationContext, now: Instant) {
+    pub fn notify(&mut self, context: NotificationContext, now: UiInstant) {
+        if let NotificationContext::Goal { message, .. } = context {
+            self.set_error_message(message);
+        }
         if !matches!(context, NotificationContext::ActionRequired) {
             self.remember_completion(context.program_state());
         }
@@ -188,6 +198,7 @@ impl TerminalNotifier {
             let suffix = match context {
                 NotificationContext::ActionRequired => "Action Required",
                 NotificationContext::Complete | NotificationContext::Failed => "Task Complete",
+                NotificationContext::Goal { message, .. } => message,
             };
             format!("{} - {suffix}", self.default_title)
         } else if self.title_enabled {
@@ -250,6 +261,7 @@ pub fn updated_title(params: &serde_json::Value) -> Option<&str> {
 
 pub fn configure(app: &mut crate::app::App, runtime: &serde_json::Value) {
     let config = crate::server::RuntimeSnapshot::config(runtime).unwrap_or_default();
+    app.storage.enabled = config.experimental_enable_storage_usage;
     app.terminal_notifier.configure(
         config.enable_notifications,
         config.experimental_enable_tab_status,

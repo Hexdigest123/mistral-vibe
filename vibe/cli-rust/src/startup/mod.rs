@@ -2,6 +2,7 @@
 
 mod attach;
 pub mod banners;
+pub mod failure;
 mod launch;
 mod reads;
 mod trust;
@@ -12,7 +13,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use crate::cli::StartupResume;
+use crate::cli::{StartModel, StartupResume};
 use crate::server::{
     method, AgentConfig, ClientCapabilities, ClientInfo, InitializeParams, WorkspaceTrustDetails,
     CALLBACK_KINDS,
@@ -57,23 +58,21 @@ fn entrypoint() -> &'static str {
 }
 
 pub use crate::utils::startup_cache::read_skills;
-pub use attach::{continue_params, nothing_to_continue, resume_params};
+pub use attach::{continue_params, nothing_to_continue, resume_params, start_kind};
 pub use launch::{
     agent_ready_duration_ms, first_frame_duration_ms, launch_from_env, mark_first_draw,
     resolve_launch, resolve_launch_cwd, StartupRecorder,
 };
 pub use reads::{
-    read_ask_confirmation_on_exit, read_show_subagent_status_list, read_show_thinking_nodes,
-    read_tokens, ConfigRead,
+    read_ask_confirmation_on_exit, read_collapse_turn_details, read_enable_sticky_prompt,
+    read_pr_monitoring, read_show_subagent_status_list, read_show_thinking_nodes, read_tokens,
+    read_vim_keybindings, ConfigRead,
 };
 
 pub enum StartupEvent {
     /// The cwd is untrusted: the gate must answer before the session opens.
     Trust(Box<WorkspaceTrustDetails>),
     Attached(String),
-    /// Raw `session/list`, read before `session/start` so `--resume` can show
-    /// its picker without waiting for the engine to come up.
-    Sessions(Box<Value>),
     Config(Box<StartupConfig>),
     Ready(Box<Ready>),
     Failed(String),
@@ -131,6 +130,8 @@ pub struct HandshakeParams {
     pub show_unready_config: bool,
     pub resume: StartupResume,
     pub agent_config: AgentConfig,
+    /// `--model` / `--thinking` for the session this handshake starts.
+    pub start_model: StartModel,
     /// A worktree run's notification stream, handed to the settle gate and
     /// bridged back to the event loop afterwards.
     pub notifications: Option<WorktreeNotifications>,
@@ -194,10 +195,9 @@ pub async fn handshake(
     trust_rx: mpsc::Receiver<String>,
     params: HandshakeParams,
 ) {
-    if let Err(error) = handshake_inner(client, &event_tx, trust_rx, params).await {
-        // The full error chain, not just the outer context: a bare
-        // "session/start" hides whether the server rejected the request or
-        // the process died, which is the first question at every triage.
+    if let Err(error) = handshake_inner(client.clone(), &event_tx, trust_rx, params).await {
+        failure::log(&error, &client);
+        // The full chain: the outer context alone hides whether the server refused or died.
         let _ = event_tx
             .send(StartupEvent::Failed(format!("{error:#}")))
             .await;
@@ -215,6 +215,7 @@ async fn handshake_inner(
         show_unready_config,
         resume,
         agent_config,
+        start_model,
         mut notifications,
         pre_initialized,
         trust_already_resolved,
@@ -237,50 +238,19 @@ async fn handshake_inner(
 
     let worktree = agent_config.worktree.is_some();
 
-    // The saved sessions are read before the session is attached: the server
-    // answers in order, so afterwards this cheap read would queue behind the
-    // whole engine bring-up. Only the picker paints from it. A worktree run
-    // cannot scope its list yet — the worktree does not exist until the
-    // app-server prepares it — so the list moves after the settle, scoped to
-    // the worktree directory (the settled cwd).
-    let mut sessions = None;
-    let mut list_error = None;
-    if !worktree && matches!(resume, StartupResume::Picker) {
-        match client
-            .request(method::SESSION_LIST, json!({"cwd": cwd}))
-            .await
-        {
-            Ok(value) => sessions = Some(value),
-            // Without the list the picker cannot be honoured, so the notice
-            // says that rather than claiming there was nothing to resume.
-            Err(error) => list_error = Some(format!("Failed to list sessions: {error}")),
-        }
-    }
-    if let (StartupResume::Picker, Some(value)) = (&resume, sessions) {
-        event_tx
-            .send(StartupEvent::Sessions(Box::new(value)))
-            .await
-            .context("startup event receiver closed")?;
-    }
-
     let cwd_owned = cwd.clone();
     let (mut state, mut attach) = if worktree {
         // A worktree run starts bare: the session is rebound onto its
         // worktree after the settle below.
-        let started = match attach::start_session(&client, agent_config.clone()).await {
-            Ok(started) => started,
-            Err(error) => return handle_start_error(error, event_tx).await,
-        };
+        let started =
+            match attach::start_session(&client, agent_config.clone(), &resume, &start_model).await
+            {
+                Ok(started) => started,
+                Err(error) => return handle_start_error(error, event_tx).await,
+            };
         (started, Attach::Started)
     } else {
-        match attach_session(
-            &client,
-            resume.clone(),
-            agent_config.clone(),
-            list_error.clone(),
-        )
-        .await
-        {
+        match attach_session(&client, resume.clone(), agent_config.clone(), &start_model).await {
             Ok(result) => result,
             Err(error) => return handle_start_error(error, event_tx).await,
         }
@@ -293,16 +263,9 @@ async fn handshake_inner(
     let mut prepared: Option<WorktreeInfo> = None;
     let mut absorbed: Vec<Notification> = Vec::new();
     if worktree {
-        let (rebound, reattached, cwd, worktree, replayed) = settle_worktree_session(
-            &client,
-            event_tx,
-            notifications.take(),
-            &resume,
-            &agent_config,
-            list_error,
-            state,
-        )
-        .await?;
+        let (rebound, reattached, cwd, worktree, replayed) =
+            settle_worktree_session(&client, notifications.take(), &resume, &agent_config, state)
+                .await?;
         settled = cwd;
         prepared = worktree;
         absorbed = replayed;

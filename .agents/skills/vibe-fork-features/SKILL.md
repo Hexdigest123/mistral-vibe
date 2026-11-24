@@ -67,8 +67,10 @@ Contract:
 Map: `vibe/cli-rust/src/utils/fzf.rs` (the only matcher for lists; the older
 `utils/fuzzy.rs` stays for path and command completion), `model_picker.rs`,
 `config.rs` (`filtered`), `config_edit/search.rs`, `ui/config_edit/search.rs`,
-`resume_picker/search.rs`, `ui/resume_picker.rs`, `mcp/rows.rs`,
-`plugins/rows.rs`; dependency `nucleo-matcher` in `vibe/cli-rust/Cargo.toml`.
+`resume_picker/search.rs` (the fzf `shown` over session titles/previews; since
+upstream v3.1 `/resume` opens the sessions page, `sessions_page/model.rs` ranks
+its rows through it), `mcp/rows.rs`, `plugins/rows.rs`; dependency
+`nucleo-matcher` in `vibe/cli-rust/Cargo.toml`.
 
 Guards: `tests/units/{fzf_rank,config_filter,model_picker_search,fork_features}.rs`;
 scenarios `model/model_search`, `model/model_fzf_terms`,

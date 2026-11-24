@@ -38,6 +38,24 @@ class _Workspaces(BaseModel):
     workspaces: list[_Workspace]
 
 
+def read_stored_oidc_credential() -> str | None:
+    """The marker when a matching session is stored, else None.
+
+    Raises ``OidcStorageError`` when the session cannot be read and
+    ``OidcError`` when the configuration is invalid, so a caller that reports
+    on the sign-in (``/status``) can tell "cannot tell" from "signed out".
+    """
+    config = OidcConfig.from_env()
+    tokens = OidcCredentialStore()._load()
+    if tokens is None or (tokens.issuer, tokens.client_id, tokens.audience) != (
+        config.issuer,
+        config.client_id,
+        config.audience,
+    ):
+        return None
+    return OIDC_API_KEY
+
+
 def stored_oidc_credential() -> str | None:
     """The marker when a matching session is stored, else None (never raises).
 
@@ -46,17 +64,9 @@ def stored_oidc_credential() -> str | None:
     still offer browser sign-in.
     """
     try:
-        config = OidcConfig.from_env()
-        tokens = OidcCredentialStore()._load()
+        return read_stored_oidc_credential()
     except (OidcError, OidcStorageError):
         return None
-    if tokens is None or (tokens.issuer, tokens.client_id, tokens.audience) != (
-        config.issuer,
-        config.client_id,
-        config.audience,
-    ):
-        return None
-    return OIDC_API_KEY
 
 
 def stored_oidc_cache_key() -> str | None:
@@ -237,6 +247,42 @@ def _resolve_id_token() -> str:
             raise OidcError(
                 "OIDC credential resolution failed; explicitly re-login"
             ) from None
+
+
+def _refresh_id_token(rejected_revision: str) -> str:
+    """A new ID token after the platform refused the one whose SHA-256 digest
+    is ``rejected_revision``.
+
+    Refreshes only while the store still holds the refused token: a concurrent
+    rejection may have refreshed it already. Raises ``OidcError`` when the
+    refresh fails, which asks the user to sign in again.
+    """
+    with _refresh_lock:
+        try:
+            service = OidcService.from_env()
+            tokens = run_sync(service.access_tokens())
+            if _revision(tokens) == rejected_revision or not (
+                _id_token_is_fresh(tokens.id_token_expires_at)
+            ):
+                tokens = run_sync(service.access_tokens(force_refresh=True))
+            token = tokens.id_token.get_secret_value()
+            if (
+                not token
+                or _revision(tokens) == rejected_revision
+                or not _id_token_is_fresh(tokens.id_token_expires_at)
+            ):
+                raise OidcError("OIDC re-login required: ID token was not renewed")
+            return token
+        except OidcError:
+            raise
+        except Exception:
+            raise OidcError(
+                "OIDC credential resolution failed; explicitly re-login"
+            ) from None
+
+
+def _revision(tokens: OidcTokens) -> str:
+    return sha256(tokens.id_token.get_secret_value().encode()).hexdigest()
 
 
 def _id_token_is_fresh(expires_at: float | None) -> bool:

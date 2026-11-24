@@ -21,7 +21,7 @@ pub fn refresh(app: &mut App, client: &Arc<Client>) {
     };
     app.begin_command_loading();
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = serde_json::json!({ "sessionId": session_id });
         let event = match client.request(method::MODELS_REFRESH, params).await {
             Ok(value) => summary(&value),

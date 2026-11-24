@@ -7,10 +7,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
 
+use super::visual_lines::VisualLine;
 use super::{hint_line, scrollbar, search_field, theme};
 use crate::app::App;
 use crate::mcp::{help_text, rows};
-use layout::VisualLine;
 
 /// Columns the option list loses to the border, the padding and its own gutter.
 const GUTTER: u16 = 6;
@@ -20,7 +20,8 @@ const SCROLLBAR_GUTTER: u16 = 7;
 /// Draw the whole screen with the browser replacing the input box.
 pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     let lines = visual_lines(app, area);
-    let height = box_height(app, lines.len(), area.height);
+    let extra = hint_line::extra(&help_text(app), area.width);
+    let height = box_height(app, lines.len(), area.height) + extra;
     let kind = super::bottom_app::Kind::Mcp;
     super::bottom_app::draw(app, f, area, height, kind, |app, f, area| {
         draw_box(app, f, area, &lines)
@@ -46,12 +47,12 @@ fn box_height(app: &App, total: usize, area_height: u16) -> u16 {
 }
 
 /// Rows above the option list. The title always, plus the search row and the
-/// blank its `margin-bottom` leaves; the detail view hides both.
+/// blank its `margin-bottom` leaves while the view has something to search.
 fn header_height(app: &App) -> u16 {
-    if rows::viewing_source(&app.mcp).is_some() {
-        1
-    } else {
+    if crate::mcp::detail::searchable(&app.mcp) {
         3
+    } else {
+        1
     }
 }
 
@@ -67,9 +68,7 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect, lines: &[VisualLine]) {
     f.render_widget(Clear, area);
     f.buffer_mut()
         .set_style(area, Style::default().bg(theme::background()));
-    let border = Style::default()
-        .fg(theme::popup_border())
-        .bg(theme::background());
+    let border = theme::border_style().bg(theme::background());
     f.render_widget(
         Block::default().borders(Borders::ALL).border_style(border),
         area,
@@ -87,9 +86,19 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect, lines: &[VisualLine]) {
 
     let header = header_height(app);
     if header > 1 {
-        draw_search(app, f, area);
+        let placeholder = if app.mcp.viewing_name.is_some() {
+            "Search tools by name or description"
+        } else {
+            "Search servers and connectors"
+        };
+        let target = crate::mouse::MouseTarget::Mcp;
+        let field = crate::mcp::search::field;
+        search_field::draw_under_title(app, f, area, field, placeholder, target);
     }
-    let visible = area.height.saturating_sub(header + 3) as usize;
+    let help = help_text(app);
+    let visible =
+        area.height
+            .saturating_sub(header + 3 + hint_line::extra(&help, area.width)) as usize;
     let top = area.y + 1 + header;
     let overflows = lines.len() > visible;
     let list_area = Rect::new(
@@ -126,7 +135,7 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect, lines: &[VisualLine]) {
         );
     }
 
-    hint_line::draw(f, area.x + 2, area.y + area.height - 2, &help_text(app));
+    hint_line::draw_footer(f, area, &help);
 }
 
 fn draw_line(f: &mut Frame, area: Rect, y: u16, line: &VisualLine, overflows: bool) {
@@ -142,20 +151,5 @@ fn draw_line(f: &mut Frame, area: Rect, y: u16, line: &VisualLine, overflows: bo
     }
 }
 
-/// The search row under the title; the field owns its mouse like Python's `Input`.
-fn draw_search(app: &mut App, f: &mut Frame, area: Rect) {
-    let row = Rect::new(area.x + 3, area.y + 2, area.width.saturating_sub(6), 1);
-    let input = search_field::draw_row(
-        f,
-        row,
-        &app.mcp.search,
-        "Search servers and connectors",
-        app.view.cursor_on,
-        theme::background(),
-    );
-    app.mcp.search.area = input;
-    crate::mouse::register_region(app, input, crate::mouse::MouseTarget::Mcp);
-    // A box drag never selects the field.
-    let field = (input.y, input.x, input.right().saturating_sub(1));
-    app.view.bottom_app_selection_chrome.push(field);
-}
+#[cfg(test)]
+mod tests;

@@ -1,6 +1,5 @@
 //! Keyboard input handling for the prompt and completion popup.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -15,10 +14,10 @@ use crate::quit_manager::QuitConfirmKey;
 use crate::server::Client;
 use crate::utils::input_edit;
 use crate::{
-    agents, chat_input, clipboard, completion_manager, config, config_write, connector_auth,
-    debug_console, feedback, keymap, log_level_picker, mcp, mcp_oauth, message_queue, model_picker,
-    paste_files, paste_image, paste_path, question_input, rewind, subagents, theme_picker,
-    thinking_picker, turn_summary, voice,
+    agents, chat_input, clipboard, completion_manager, composer_stash, composer_yank, config,
+    config_write, connector_auth, debug_console, feedback, keymap, log_level_picker, mcp,
+    mcp_oauth, message_queue, model_picker, paste_files, paste_image, paste_path, question_input,
+    reverse_search, rewind, subagents, theme_picker, thinking_picker, turn_summary, voice,
 };
 
 fn is_ctrl_c(key: &KeyEvent) -> bool {
@@ -28,9 +27,14 @@ fn is_ctrl_c(key: &KeyEvent) -> bool {
         && key.code == KeyCode::Char('c')
 }
 
-/// Ctrl+R toggles voice recording.
+/// Ctrl+R searches the prompt history.
 fn is_ctrl_r(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r')
+}
+
+/// Ctrl+T toggles voice recording.
+fn is_ctrl_t(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t')
 }
 
 fn is_ctrl_d(key: &KeyEvent) -> bool {
@@ -68,9 +72,8 @@ fn is_copy_key(key: &KeyEvent) -> bool {
     let command = key.modifiers.contains(KeyModifiers::SUPER);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     (command && key.code == KeyCode::Char('c'))
-        || (ctrl
-            && ((cfg!(unix) && key.code == KeyCode::Char('y') && !shift)
-                || (matches!(key.code, KeyCode::Char('c' | 'C')) && shift)))
+        || composer_yank::is_yank_key(key)
+        || (ctrl && shift && matches!(key.code, KeyCode::Char('c' | 'C')))
 }
 
 /// The cached text of an active mouse selection (region or bottom bar),
@@ -92,15 +95,22 @@ pub(crate) fn handle_copy_key(app: &mut App, key: &KeyEvent) -> bool {
         return false;
     }
     app.chat_input.normalize_positions();
-    if !copy_selected_input(app) {
-        if let Some(text) = selection_text(app) {
-            // Region and bottom-bar text are cached at paint time so the copy
-            // works regardless of the autocopy setting.
-            clipboard::copy_to_clipboard(&text);
-            crate::telemetry::user_copied_text(app, &text);
-        }
+    if copy_selected_input(app) {
+        return true;
     }
-    true
+    if let Some(text) = selection_text(app) {
+        // Region and bottom-bar text are cached at paint time so the copy
+        // works regardless of the autocopy setting.
+        clipboard::copy_to_clipboard(&text);
+        let source = crate::code_preview::telemetry::note_copy(app);
+        crate::telemetry::user_copied_text(app, &text, source);
+        crate::ui::selection::flash(app);
+        return true;
+    }
+    // A mouse selection whose text the next paint reads still owns the key.
+    let mouse_selection = app.selection.region.is_some() || app.selection.bottom_bar.is_some();
+    // With nothing selected, Ctrl+Y reaches the composer as a yank.
+    !(composer_yank::is_yank_key(key) && composer_owns_key(app) && !mouse_selection)
 }
 
 /// Toggle the plan panel: Cmd+\, or the Alt+\ (ESC \) remap terminals deliver instead.
@@ -112,23 +122,25 @@ fn is_todo_key(key: &KeyEvent) -> bool {
         && key.code == KeyCode::Char('\\')
 }
 
+/// Ctrl+X moves from the prompt to the rail.
+fn enters_rail(app: &App, key: &KeyEvent) -> bool {
+    crate::rail::is_toggle_key(key) && composer_reachable(app)
+}
+
 /// Handle application-level bindings before a modal consumes local keys.
 pub fn handle_priority_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) -> Option<bool> {
-    if key.code == KeyCode::BackTab {
-        if app.focus() == Focus::VibeCodeProject {
-            return None;
-        }
+    // Where Tab moves through something, Shift+Tab moves back through it instead;
+    // the Sessions page takes Shift+Tab itself.
+    if key.code == KeyCode::BackTab
+        && !crate::focus::tab_navigates(app)
+        && app.focus() != Focus::SessionsPage
+    {
         agents::cycle(app, client);
         return Some(false);
     }
     // The crash notice says "Press Ctrl+C to exit": nothing is left to copy, cancel or confirm.
     if is_ctrl_c(&key) && app.server_closed {
         return Some(true);
-    }
-    if (is_ctrl_c(&key) || is_copy_key(&key))
-        && crate::vibe_code_project::input::copy_selection(app, false)
-    {
-        return Some(false);
     }
     if is_ctrl_c(&key) && crate::proxy_setup::copy_selection(app, false) {
         return Some(false);
@@ -139,6 +151,9 @@ pub fn handle_priority_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) -
             return Some(false);
         }
         if stress::stop(app) {
+            return Some(false);
+        }
+        if composer_reachable(app) && reverse_search::cancel(app) {
             return Some(false);
         }
         // Queue selection takes Ctrl+C to remove the highlighted prompt (ADR 0013).
@@ -152,6 +167,10 @@ pub fn handle_priority_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) -
         }
         return Some(handle_ctrl_c(app, client));
     }
+    // The search previews text Ctrl+D must not delete, nor quit over.
+    if is_ctrl_d(&key) && app.reverse_search.is_some() && composer_reachable(app) {
+        return Some(false);
+    }
     if is_ctrl_d(&key) {
         return Some(handle_ctrl_d(app));
     }
@@ -162,7 +181,10 @@ pub fn handle_priority_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) -
         debug_console::toggle(app, client);
         return Some(false);
     }
-    if key.modifiers.contains(KeyModifiers::SHIFT) {
+    if crate::tmux_hint::handle_key(app, &key) {
+        return Some(false);
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) && app.focus() != Focus::SessionsPage {
         match key.code {
             KeyCode::Up => scroll_chat(app, true, KEY_SCROLL_STEP),
             KeyCode::Down => scroll_chat(app, false, KEY_SCROLL_STEP),
@@ -171,11 +193,6 @@ pub fn handle_priority_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) -
         return Some(false);
     }
     None
-}
-
-/// Cut the selection or current line: Ctrl+X.
-fn is_cut_key(key: &KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x')
 }
 
 fn copy_selected_input(app: &App) -> bool {
@@ -187,11 +204,11 @@ fn copy_selected_input(app: &App) -> bool {
     // A collapsed paste copies as the text it stands for; pasted back, it collapses again.
     let text = input.mentions.expanded_range(&input.input, lo, hi);
     clipboard::copy_to_clipboard(&text);
-    crate::telemetry::user_copied_text(app, &text);
+    crate::telemetry::user_copied_text(app, &text, None);
     true
 }
 
-fn composer_owns_key(app: &App) -> bool {
+pub(crate) fn composer_owns_key(app: &App) -> bool {
     app.focus() == Focus::Composer && (app.queue.selected.is_none() || app.queue.editing)
 }
 
@@ -207,12 +224,13 @@ pub fn handle_key(
     config_tx: &mpsc::Sender<config::Loaded>,
     key: KeyEvent,
 ) -> bool {
-    let before = if composer_owns_key(app) && !app.recording_active() {
-        crate::composer_history::before_key(app, &key)
-    } else {
-        app.chat_input.edit_history.checkpoint();
-        None
-    };
+    let before =
+        if composer_owns_key(app) && !app.recording_active() && app.reverse_search.is_none() {
+            crate::composer_history::before_key(app, &key)
+        } else {
+            app.chat_input.edit_history.checkpoint();
+            None
+        };
     let exit = handle_key_inner(app, client, config_tx, key);
     crate::composer_history::finish(&mut app.chat_input, before);
     exit
@@ -227,6 +245,7 @@ fn handle_key_inner(
     if let Some(exit) = handle_priority_key(app, client, key) {
         return exit;
     }
+    let key = keymap::line_alias(key);
     app.chat_input.normalize_positions();
     // The subagent list owns navigation and selection while focused; other
     // keys fall through, and the unfocused composer never edits.
@@ -242,7 +261,7 @@ fn handle_key_inner(
                 | KeyCode::End
                 | KeyCode::PageUp
                 | KeyCode::PageDown
-        ) || (plain && matches!(key.code, KeyCode::Char('j' | 'k' | 'a')));
+        ) || (plain && matches!(key.code, KeyCode::Char('j' | 'k')));
         match key.code {
             _ if list_key => {
                 subagents::handle_list_key(app, key);
@@ -260,9 +279,12 @@ fn handle_key_inner(
         }
     }
     // Reaching here the chat input owns the key.
-    app.chat_input.last_keystroke = Some(std::time::Instant::now());
-    // Ctrl+R toggles voice recording.
-    if is_ctrl_r(&key) && app.voice.mode_enabled {
+    app.chat_input.last_keystroke = Some(crate::clock::now());
+    if reverse_search::handle_key(app, &key) {
+        return false;
+    }
+    // Ctrl+T toggles voice recording.
+    if is_ctrl_t(&key) && app.voice.mode_enabled {
         app.toggle_recording();
         return false;
     }
@@ -312,10 +334,21 @@ fn handle_key_inner(
             _ => {}
         }
     }
+    if crate::goal::handle_prompt_key(app, client, &key) {
+        return false;
+    }
     // Queue selection locks the input: navigation, removal, edit and escape are
     // intercepted before any editing key (ADR 0013), only where its hints show.
     if app.queue.selected.is_some() && !app.queue.editing && composer_reachable(app) {
         message_queue::handle_selection_key(app, client, key);
+        return false;
+    }
+    if is_ctrl_r(&key) && !app.queue.editing && !composer_hidden(app) {
+        reverse_search::open(app);
+        return false;
+    }
+    if composer_stash::is_stash_key(&key) && !app.queue.editing && !composer_hidden(app) {
+        composer_stash::toggle(app);
         return false;
     }
     // Editing a queued prompt: only Escape is special, the rest edits the text.
@@ -326,22 +359,8 @@ fn handle_key_inner(
     if crate::external_editor::request(app, &key) {
         return false;
     }
-    // Cut the chat input selection or current line; copy is an app-level priority binding.
-    if is_cut_key(&key) {
-        app.chat_input.scroll = None;
-        crate::long_paste::dismiss(app);
-        // Without a selection a cut takes the caret line, from its start.
-        let line_start = app.chat_input.line_cut_start();
-        let text = app
-            .chat_input
-            .edit_atomically(line_start, |input, cursor, anchor| {
-                chat_input::cut(input, cursor, anchor);
-            });
-        if !text.is_empty() {
-            clipboard::copy_to_clipboard(&text);
-            reset_history_state(app);
-            completion_manager::input_changed(app);
-        }
+    if composer_yank::is_yank_key(&key) {
+        composer_yank::yank(app);
         return false;
     }
     if paste_image::is_paste_image_key(&key, paste_image::is_supported()) {
@@ -355,12 +374,16 @@ fn handle_key_inner(
         completion_manager::input_changed(app);
         return false;
     }
+    if enters_rail(app, &key) && crate::rail::enter(app) {
+        return false;
+    }
     // ChatInput editing (keymap -> Action -> apply), decoupled from the backend.
     // An edit resets history recall and the loaded-entry state and refreshes
     // completion; a caret/selection move only marks the caret as moved.
     if let Some(action) = keymap::action_for(&key) {
         app.chat_input.scroll = None;
         if matches!(action, chat_input::Action::Undo | chat_input::Action::Redo) {
+            crate::long_paste::dismiss(app);
             crate::composer_history::restore(app, &action);
             return false;
         }
@@ -379,12 +402,14 @@ fn handle_key_inner(
                     .map_or(input.cursor, |anchor| anchor.min(input.cursor));
                 input_edit::line_bounds(&input.input, first).0
             });
-            app.chat_input
+            let removed = app
+                .chat_input
                 .edit_atomically(line_start, |input, cursor, anchor| {
                     chat_input::apply(&action, input, cursor, anchor);
                 });
-            // Raw-keystroke drops only get image mentions; mixed lists need a bracketed paste.
-            crate::composer_paths::rewrite_image_paths(&mut app.chat_input);
+            if action.is_kill() && !removed.is_empty() {
+                app.chat_input.kill_buffer = removed;
+            }
             completion_manager::input_changed(app);
         } else {
             chat_input::apply(
@@ -411,20 +436,18 @@ fn handle_key_inner(
             subagents::show_main_chat(app, true);
         }
         KeyCode::Esc if completion_manager::dismiss(app) => app.overlays.last_escape = None,
+        // The server is opening a session: it lands whatever is pressed, so Esc waits for it.
+        KeyCode::Esc if crate::sessions_page::switching(app) => app.overlays.last_escape = None,
         KeyCode::Esc if app.session.shell_operation_id.is_some() => {
             crate::commands::shell::interrupt(app, client);
-            app.overlays.last_escape = Some(std::time::Instant::now());
-        }
-        KeyCode::Esc if crate::teleport::busy(app) => {
-            crate::teleport::interrupt(app, client);
-            app.overlays.last_escape = Some(std::time::Instant::now());
+            app.overlays.last_escape = Some(crate::clock::now());
         }
         // Only a docked panel owns Esc; a dropped column must not swallow the interrupt.
         KeyCode::Esc if app.todo_sidebar.close() => {}
         // Escape while generating interrupts the turn.
         KeyCode::Esc if matches!(app.session.status, Status::Generating { .. }) => {
             submission::interrupt_turn(app, client);
-            app.overlays.last_escape = Some(std::time::Instant::now());
+            app.overlays.last_escape = Some(crate::clock::now());
         }
         // An active narrator stops without arming the double-escape.
         KeyCode::Esc if turn_summary::cancel(app) => {}
@@ -458,11 +481,6 @@ fn handle_key_inner(
             let (target, moved_row) = crate::ui::chat_input::vertical_cursor(app, true);
             let history = handle_history_down(app, !moved_row);
             if !history {
-                // Focus the subagent list at the Main row when the caret is on the last
-                // wrapped line.
-                if !moved_row && subagents::focus_first(app) {
-                    return false;
-                }
                 if !moved_row {
                     app.set_app_focus(true);
                 }
@@ -484,14 +502,18 @@ fn handle_key_inner(
         // An agent switch in flight swallows the submit.
         KeyCode::Enter if agents::switching(app) => {}
         KeyCode::Enter => {
-            if completion_manager::accept(app) {
+            if completion_manager::accept_on_enter(app) {
                 completion_manager::input_changed(app);
             }
+            let typed = !app.chat_input.full_text().trim().is_empty();
             let exit = submission::submit(app, client, config_tx);
             // `submission` clears the input on submit but does not know about the
             // chat input caret; keep it in bounds so the next render is consistent.
             app.chat_input.cursor = app.chat_input.cursor.min(app.chat_input.input.len());
             app.chat_input.anchor = None;
+            if typed && !exit {
+                composer_stash::pop_after_submit(app);
+            }
             return exit;
         }
         _ => {}
@@ -502,18 +524,25 @@ fn handle_key_inner(
 /// Escape with nothing to interrupt: a second one inside `DOUBLE_ESC_DELAY`
 /// clears a non-empty input, else it enters rewind mode.
 fn handle_escape(app: &mut App, client: &Arc<Client>) {
-    let now = std::time::Instant::now();
+    let now = crate::clock::now();
     let doubled = rewind::is_double_escape(app.overlays.last_escape, now);
     app.overlays.last_escape = if doubled { None } else { Some(now) };
     if !doubled {
         return;
     }
     if app.chat_input.full_text().is_empty() {
-        rewind::start(app, client);
+        match submission::rewind_hint(app) {
+            Some(hint) => crate::ui::notice::show_sticky(
+                app,
+                crate::app::Severity::Warning,
+                &format!("Rewind is not available — {hint}"),
+            ),
+            None => rewind::start(app, client),
+        }
         return;
     }
     reset_history_state(app);
-    app.chat_input.clear();
+    crate::composer_history::clear(app);
     completion_manager::input_changed(app);
 }
 
@@ -626,8 +655,9 @@ pub fn handle_mcp_oauth_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) 
     }
 }
 
-/// The `/model` picker owns keys: `/` searches, arrows/jk navigate, Enter saves to config,
-/// `s` keeps the pick for this session only, Esc cancels. Navigation does not live-preview.
+/// The `/model` picker owns keys: `/` searches (fzf terms), arrows/jk navigate, Enter saves
+/// to config, `s` keeps the pick for this session only, Esc leaves search, clears the
+/// filter, then cancels. Navigation does not live-preview.
 pub fn handle_model_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     if model_picker::search_key(app, &key) {
         return;
@@ -658,31 +688,10 @@ pub fn handle_thinking_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) {
     }
 }
 
-/// The artifacts modal owns keys: arrows/jk navigate, Enter opens the
-/// highlighted link, Esc closes.
-pub fn handle_artifacts_modal_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => crate::artifacts_modal::close(app),
-        KeyCode::Up | KeyCode::Char('k') => crate::artifacts_modal::navigate(app, false),
-        KeyCode::Down | KeyCode::Char('j') => crate::artifacts_modal::navigate(app, true),
-        KeyCode::Enter => crate::artifacts_modal::select(app),
-        _ => {}
-    }
-}
-
-/// Hand a commit's answer to the main thread, which releases the commit once it
-/// has applied it. With no receiver the commit is released here instead.
-pub(crate) async fn deliver<T>(
-    tx: Option<mpsc::Sender<T>>,
-    event: impl Into<T>,
-    pending: &Arc<AtomicU32>,
-) {
-    let sent = match tx {
-        Some(tx) => tx.send(event.into()).await.is_ok(),
-        None => false,
-    };
-    if !sent {
-        pending.fetch_sub(1, Ordering::Relaxed);
+/// Hand a tracked task's answer to the main thread; dropped when there is no receiver.
+pub(crate) async fn deliver<T>(tx: Option<mpsc::Sender<T>>, event: impl Into<T>) {
+    if let Some(tx) = tx {
+        let _ = tx.send(event.into()).await;
     }
 }
 
@@ -759,7 +768,6 @@ fn recall_next(app: &mut App) {
 /// the loaded-entry state.
 fn load_history_entry(app: &mut App, entry: String) {
     crate::long_paste::load_collapsed(app, entry);
-    crate::composer_paths::rewrite_image_paths(&mut app.chat_input);
     park_after_load(app);
 }
 
@@ -778,7 +786,7 @@ fn park_after_load(app: &mut App) {
 }
 
 /// Mark the caret as moved off a loaded history entry so Up/Down edit text next.
-fn mark_cursor_moved(app: &mut App) {
+pub(crate) fn mark_cursor_moved(app: &mut App) {
     if app.chat_input.cursor_pos_after_load.is_some()
         && !app.chat_input.cursor_moved_since_load
         && app.chat_input.cursor_pos_after_load != Some(app.chat_input.cursor)
@@ -799,7 +807,7 @@ pub(crate) fn reset_history_state(app: &mut App) {
 /// existence probe may turn a pasted path list into mentions as a second edit. A
 /// paste replaces the active selection.
 pub fn handle_paste(app: &mut App, text: String) {
-    if composer_hidden(app) {
+    if composer_hidden(app) || reverse_search::paste(app, &text) {
         return;
     }
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -807,7 +815,7 @@ pub fn handle_paste(app: &mut App, text: String) {
     let before = crate::edit_history::Snapshot::capture(&app.chat_input);
     let probe = handle_paste_inner(app, &text);
     app.chat_input
-        .record_edit(before, true, std::time::Instant::now());
+        .record_edit(before, true, crate::clock::now());
     if let Some((start, raw, candidates)) = probe {
         paste_files::request_probe(app, start, raw, candidates);
     }
@@ -816,10 +824,9 @@ pub fn handle_paste(app: &mut App, text: String) {
     }
 }
 
-// The hidden composer takes no paste while the list is focused or a child
-// view is open.
+/// A rail window, the subagent list or a child view hides the composer, which then takes no paste.
 pub(crate) fn composer_hidden(app: &App) -> bool {
-    app.subagents.list.focused || app.subagents.viewed_subagent_id.is_some()
+    crate::rail::window_open(app)
 }
 
 /// Insert `text`; returns the inserted path list's start, text and paths when
@@ -828,14 +835,15 @@ fn handle_paste_inner(app: &mut App, text: &str) -> Option<(usize, String, Vec<S
     app.chat_input.normalize_positions();
     app.chat_input.scroll = None;
     reset_history_state(app);
-    // Pasting a collapsed paste again shows it in full instead of adding a copy.
+    // Pasting a collapsed paste or image path again shows it as text instead of adding a copy.
     if crate::long_paste::expand(app, text) {
         completion_manager::input_changed(app);
         return None;
     }
     let names = app.chat_input.mode.names_images();
     if let Some(paths) = paste_path::pasted_image_paths(text).filter(|_| names) {
-        paste_files::insert_images(app, &paths);
+        let span = paste_files::insert_images(app, &paths);
+        crate::long_paste::offer_literal(app, text, span);
         completion_manager::input_changed(app);
         return None;
     }
@@ -852,7 +860,9 @@ fn handle_paste_inner(app: &mut App, text: &str) -> Option<(usize, String, Vec<S
     app.chat_input.anchor = None;
     let text = app.chat_input.open_pasted_mode(text);
     // A path list stays inline: the existence probe turns it into compact mentions.
-    let candidates = match app.chat_input.mode.names_images() {
+    // A `/cd` argument stays a path: `/cd` reads it, not the model.
+    let cd_argument = crate::dir_completion::span(app, app.chat_input.cursor).is_some();
+    let candidates = match app.chat_input.mode.names_images() && !cd_argument {
         true => paste_path::path_candidates(text),
         false => Vec::new(),
     };
@@ -864,25 +874,29 @@ fn handle_paste_inner(app: &mut App, text: &str) -> Option<(usize, String, Vec<S
     let start = app.chat_input.cursor;
     input_edit::insert(&mut app.chat_input.input, &mut app.chat_input.cursor, text);
     app.chat_input.sync_mentions_at(start);
-    let input = &app.chat_input.input;
-    let (prefix, suffix) = (
-        input[..start].to_owned(),
-        input[app.chat_input.cursor..].to_owned(),
-    );
-    crate::composer_paths::rewrite_image_paths(&mut app.chat_input);
     completion_manager::input_changed(app);
-    let input = &app.chat_input.input;
-    let kept = input.len() >= prefix.len() + suffix.len()
-        && input.starts_with(&prefix)
-        && input.ends_with(&suffix);
-    (kept && !candidates.is_empty()).then(|| {
-        let raw = input[start..input.len() - suffix.len()].to_owned();
-        (start, raw, candidates)
-    })
+    (!candidates.is_empty()).then(|| (start, text.to_owned(), candidates))
 }
 
 /// Ctrl+C ladder; returns true to exit.
 fn handle_ctrl_c(app: &mut App, client: &Arc<Client>) -> bool {
+    // A rail window hides the composer, so it closes before an unseen draft is cleared or a subagent view arms quit.
+    if crate::rail::close_window(app) {
+        return false;
+    }
+    if app.focus() == Focus::SessionsPage {
+        crate::sessions_page::close(app);
+        return false;
+    }
+    // The server is opening a session the page picked: it lands whatever is
+    // pressed, so Ctrl+C neither cancels it nor arms quit meanwhile.
+    if crate::sessions_page::switching(app) {
+        return false;
+    }
+    if app.focus() == Focus::Loops {
+        crate::loops::close(app);
+        return false;
+    }
     // The subagent view is checked before touching the input or the queue.
     if let Some(viewed) = app.subagents.viewed_subagent_id.clone() {
         if app.quit.is_confirmed(QuitConfirmKey::CtrlC) {
@@ -894,7 +908,7 @@ fn handle_ctrl_c(app: &mut App, client: &Arc<Client>) -> bool {
         return false;
     }
     if !app.chat_input.full_text().is_empty() {
-        app.chat_input.clear();
+        crate::composer_history::clear(app);
         reset_history_state(app);
         completion_manager::input_changed(app);
         app.quit.cancel_confirmation();
@@ -911,10 +925,6 @@ fn handle_ctrl_c(app: &mut App, client: &Arc<Client>) -> bool {
     }
     if app.question_app.open {
         question_input::handle_key(app, client, esc);
-        return false;
-    }
-    if app.vibe_code_project.open || app.vibe_code_project.pending {
-        crate::vibe_code_project::input::handle_key(app, client, esc);
         return false;
     }
     // An active narrator stops first, before the queue step.
@@ -935,10 +945,6 @@ fn handle_ctrl_c(app: &mut App, client: &Arc<Client>) -> bool {
         crate::commands::shell::interrupt(app, client);
         return false;
     }
-    if crate::teleport::busy(app) {
-        crate::teleport::interrupt(app, client);
-        return false;
-    }
     if matches!(app.session.status, Status::Generating { .. }) {
         submission::interrupt_turn(app, client);
         return false;
@@ -950,7 +956,14 @@ fn handle_ctrl_c(app: &mut App, client: &Arc<Client>) -> bool {
 /// Ctrl+D; returns true to exit. Deletes right in the main-view input, else
 /// quits (on a second press if confirmation is on).
 fn handle_ctrl_d(app: &mut App) -> bool {
-    if app.subagents.viewed_subagent_id.is_none() && !app.chat_input.full_text().is_empty() {
+    let draft = !app.chat_input.full_text().is_empty();
+    let viewing = app.subagents.viewed_subagent_id.is_some();
+    // A rail window hides the draft: Ctrl+D neither edits it nor quits over it.
+    if draft && !viewing && composer_hidden(app) {
+        return false;
+    }
+    let editable = !viewing && app.reverse_search.is_none();
+    if editable && draft {
         app.chat_input.normalize_positions();
         let before = crate::edit_history::Snapshot::capture(&app.chat_input);
         reset_history_state(app);
@@ -960,7 +973,7 @@ fn handle_ctrl_d(app: &mut App) -> bool {
                 chat_input::apply(&chat_input::Action::DeleteRight, input, cursor, anchor);
             });
         app.chat_input
-            .record_edit(before, false, std::time::Instant::now());
+            .record_edit(before, false, crate::clock::now());
         completion_manager::input_changed(app);
         return false;
     }

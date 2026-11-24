@@ -1,6 +1,8 @@
 //! Terminal mode lifecycle.
 
-use crossterm::cursor::{Hide, Show};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crossterm::cursor::{Hide, SetCursorStyle, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -17,16 +19,21 @@ pub type Tui = ratatui::Terminal<ResyncBackend<std::io::Stdout>>;
 pub struct TerminalGuard {
     active: bool,
     keyboard_pushed: bool,
-    /// Mouse capture, following `enable_mouse_capture`; resume restores it.
+    /// Mouse capture, following `captures_mouse`; resume re-reads tmux and restores it.
     mouse: bool,
+    /// The `enable_mouse_capture` setting last applied.
+    configured: bool,
     /// Whether `ENABLE_WINDOW_INPUT` was added to the Windows console, to clear on suspend.
     window_input: bool,
+    /// Whether VT input was turned off on the Windows console, to turn back on at suspend.
+    vt_input: bool,
 }
 
 /// Ratatui's `try_init`, with the resyncing backend.
 pub fn try_init() -> std::io::Result<Tui> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        set_bar_cursor(false);
         ratatui::restore();
         hook(info);
     }));
@@ -46,17 +53,26 @@ pub fn require_interactive_terminal() {
     std::process::exit(1);
 }
 
-/// Own the terminal, capturing the mouse only when `mouse` (the cached `enable_mouse_capture`).
-pub fn init(mouse: bool) -> std::io::Result<(Tui, TerminalGuard)> {
+/// Whether to capture the mouse: the `enable_mouse_capture` setting, off inside a tmux session with `mouse off`.
+pub fn captures_mouse(configured: bool) -> bool {
+    configured && !crate::tmux::mouse_off()
+}
+
+/// Own the terminal, capturing the mouse only when `captures_mouse(configured)`.
+pub fn init(configured: bool) -> std::io::Result<(Tui, TerminalGuard)> {
     // Own the terminal before arming the guard: a failed `try_init` must not
     // write teardown sequences to a terminal we never took over.
     let terminal = try_init()?;
+    crate::tmux::refresh_mouse();
+    let mouse = captures_mouse(configured);
     crate::mouse::pixels::set_capture(mouse);
     let mut guard = TerminalGuard {
         active: true,
         keyboard_pushed: false,
         mouse,
+        configured,
         window_input: false,
+        vt_input: false,
     };
     if let Err(error) = guard.enter() {
         drop(guard);
@@ -102,8 +118,23 @@ pub fn hold_cell_reports(held: bool) {
     }
 }
 
+/// Whether the terminal cursor is bar-shaped, as vim Insert mode shows it.
+static BAR_CURSOR: AtomicBool = AtomicBool::new(false);
+
+fn set_bar_cursor(bar: bool) {
+    if BAR_CURSOR.swap(bar, Ordering::Relaxed) == bar {
+        return;
+    }
+    let style = match bar {
+        true => SetCursorStyle::SteadyBar,
+        false => SetCursorStyle::DefaultUserShape,
+    };
+    let _ = execute!(std::io::stdout(), style);
+}
+
 /// Draw `app`, then park the hidden cursor on its caret, else the static bottom-left cell.
 pub fn draw(terminal: &mut Tui, app: &mut crate::app::App) -> std::io::Result<()> {
+    set_bar_cursor(crate::vim::inserting(app));
     let area = terminal.draw(|frame| app.draw(frame))?.area;
     let bottom_left = ratatui::layout::Position::new(area.x, area.bottom().saturating_sub(1));
     let caret = app.view.cursor_position.take().unwrap_or(bottom_left);
@@ -136,6 +167,8 @@ impl TerminalGuard {
     }
 
     fn enable_raw_modes(&mut self) -> std::io::Result<()> {
+        // Before mouse capture, which overwrites the whole console mode.
+        self.vt_input = crate::platform::disable_vt_input();
         if self.mouse {
             capture_mouse(&mut std::io::stdout())?;
         } else {
@@ -155,7 +188,9 @@ impl TerminalGuard {
     }
 
     /// Follow `enable_mouse_capture` live; while suspended, only `resume` applies it.
-    pub fn set_mouse_capture(&mut self, enabled: bool) -> std::io::Result<()> {
+    pub fn set_mouse_capture(&mut self, configured: bool) -> std::io::Result<()> {
+        self.configured = configured;
+        let enabled = captures_mouse(configured);
         if enabled == self.mouse {
             return Ok(());
         }
@@ -188,6 +223,7 @@ impl TerminalGuard {
             let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
         }
         crate::pointer::emit(crate::pointer::Shape::Default);
+        set_bar_cursor(false);
         if crate::mouse::pixels::disable() {
             let _ = execute!(std::io::stdout(), Print(crate::mouse::pixels::DISABLE));
         }
@@ -198,6 +234,7 @@ impl TerminalGuard {
         if std::mem::take(&mut self.window_input) {
             crate::platform::disable_window_input();
         }
+        crate::platform::restore_vt_input(std::mem::take(&mut self.vt_input));
         let _ = ratatui::try_restore();
         let _ = execute!(std::io::stdout(), Show, crossterm::terminal::SetTitle(""));
     }
@@ -207,6 +244,10 @@ impl TerminalGuard {
         // Raw mode is on, so teardown is owed even if the rest fails below.
         self.active = true;
         execute!(std::io::stdout(), EnterAlternateScreen, Hide)?;
+        // tmux's `mouse` option may have changed while suspended.
+        crate::tmux::refresh_mouse();
+        self.mouse = captures_mouse(self.configured);
+        crate::mouse::pixels::set_capture(self.mouse);
         self.enable_raw_modes()
     }
 }

@@ -3,7 +3,14 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, StrictInt
+from pydantic import (
+    ConfigDict,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    StrictInt,
+    model_serializer,
+)
 
 from vibe.app_server._model import ProtocolModel
 from vibe.utils import AgentEntrypoint
@@ -19,7 +26,9 @@ class ClientInfo(ProtocolModel):
 
 
 type CallbackKind = Literal["approval", "user_input", "connector_auth"]
-type ClientToolCapability = Literal["filesystem/read", "filesystem/write", "terminal"]
+type ClientToolCapability = Literal[
+    "filesystem/read", "filesystem/write", "terminal", "tools/call"
+]
 type TransportKind = Literal["in_process", "stdio"]
 
 
@@ -33,9 +42,69 @@ class ClientToolMethod(StrEnum):
     TERMINAL_RELEASE = "clientTool/terminal/release"
 
 
+type PlatformCredentialsKind = Literal["oauth_access_token", "oidc_id_token"]
+
+
+# "process": the client keeps this connection open as long as the process
+# runs (Desktop's catalogue), so its account always has a lender.
+type PlatformCredentialsLifetime = Literal["connection", "process"]
+
+
 class PlatformCredentialsCapability(ProtocolModel):
     version: Literal[1]
-    kind: Literal["oauth_access_token"]
+    kind: PlatformCredentialsKind
+    lifetime: PlatformCredentialsLifetime = "connection"
+
+
+class ClientToolDefinitionParams(ProtocolModel):
+    name: Annotated[str, Field(min_length=1)]
+    namespace: Annotated[str, Field(min_length=1)]
+    description: str
+    input_schema: dict[str, JsonValue]
+    output_schema: dict[str, JsonValue] | None
+
+
+class AgentPlugin(ProtocolModel):
+    name: Annotated[str, Field(min_length=1)]
+    root: Annotated[str, Field(min_length=1)]
+
+
+class ClientToolCallerParams(ProtocolModel):
+    session_id: str
+    root_session_id: str
+    parent_session_id: str | None = None
+    name: str | None = None
+    agent_type: str | None = None
+
+
+class ClientToolCallParams(ProtocolModel):
+    call_id: str
+    name: str
+    input: JsonValue
+    tool_call_id: str
+    caller: ClientToolCallerParams
+
+    @model_serializer(mode="wrap")
+    def serialize_call(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, JsonValue]:
+        serialized = handler(self)
+        # Null is a valid required input, not an absent optional parameter.
+        if self.input is None:
+            serialized["input"] = None
+        return serialized
+
+
+class ClientToolCallError(ProtocolModel):
+    message: str
+    code: str | None = None
+    details: JsonValue = None
+
+
+class ClientToolCallResponse(ProtocolModel):
+    output: JsonValue = None
+    annotations: dict[str, JsonValue] = Field(default_factory=dict)
+    error: ClientToolCallError | None = None
 
 
 class ClientCapabilities(ProtocolModel):
@@ -47,13 +116,43 @@ class ClientCapabilities(ProtocolModel):
     client_tools: list[ClientToolCapability] = Field(default_factory=list)
     session_spawn: bool = False
     session_peers: bool = False
+    session_peer_restore: bool = False
+    session_peer_rename: bool = False
+    session_peer_mark_seen: bool = False
+    agent_worktrees: bool = False
+    # The client follows a session's `/project` patch, so the agent may move it.
+    agent_projects: bool = False
+    # Stream each child session's own events, so the client can keep a replica
+    # of it as it does of the root.
+    child_session_events: bool = False
     disabled_notifications: list[str] = Field(default_factory=list)
     platform_credentials: PlatformCredentialsCapability | None = None
+    agent_plugins: list[AgentPlugin] = Field(default_factory=list)
+    client_tool_definitions: list[ClientToolDefinitionParams] = Field(
+        default_factory=list
+    )
+    # The server carries on, by itself, the turns this connection's owner
+    # (``initialize.account``) left mid-flight in an earlier process.
+    resume_left_turns: bool = False
+
+
+class ClientAccount(ProtocolModel):
+    """The account the client is signed in to, as opaque strings it reports."""
+
+    organization_id: str
+    workspace_id: str
+    user_id: str
 
 
 class InitializeParams(ProtocolModel):
     client_info: ClientInfo
     capabilities: ClientCapabilities = Field(default_factory=ClientCapabilities)
+    # With ``client_info.entrypoint``, the connection's owner: only the owner
+    # that last opened a session is offered a turn a stop left running in it.
+    account: ClientAccount | None = None
+    # Which client instance this is (Desktop: its profile folder), among those
+    # sharing this Vibe home (see `vibe.app_server._client_instance`).
+    client_instance: str | None = Field(default=None, min_length=1, max_length=4096)
 
 
 class ServerInfo(ProtocolModel):
@@ -110,6 +209,10 @@ class ClientToolTerminalOutputResponse(ProtocolModel):
 class InitializeResponse(ProtocolModel):
     server_info: ServerInfo
     process_id: int | None = None
+    # Whether this connection uses the client's platform credentials. A client
+    # sends `platformCredentials/invalidated` only when this is true, or once
+    # the server asked it for a credential; older servers omit it.
+    platform_credentials: bool = False
 
 
 class PlatformCredentialsResolveParams(ProtocolModel):
@@ -120,16 +223,26 @@ class PlatformCredentialsResolveParams(ProtocolModel):
 
 class PlatformCredentialsSnapshot(ProtocolModel):
     status: Literal["ready"]
-    kind: Literal["oauth_access_token"]
+    kind: PlatformCredentialsKind
     token: Annotated[str, Field(min_length=1, repr=False)]
     audience: Annotated[str, Field(min_length=1)]
     expires_at: Annotated[StrictInt, Field(gt=0, le=253_402_300_799_999)]
     revision: Annotated[str, Field(min_length=1)]
+    # The tenant an ID token's model requests belong to. The Desktop knows it
+    # from its session; omitted when it does not, or for access tokens.
+    organization_id: Annotated[str, Field(min_length=1)] | None = None
+    workspace_id: Annotated[str, Field(min_length=1)] | None = None
 
 
 class PlatformCredentialsUnavailable(ProtocolModel):
     status: Literal["unavailable"]
-    reason: Literal["missing", "reauthentication_required", "transient", "invalid"]
+    reason: Literal[
+        "missing",
+        "reauthentication_required",
+        "transient",
+        "invalid",
+        "unauthorized_after_refresh",
+    ]
 
 
 type PlatformCredentialsResolveResponse = (

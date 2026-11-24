@@ -20,19 +20,18 @@ fn box_height() -> u16 {
 
 pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     let kind = super::bottom_app::Kind::LogLevel;
-    super::bottom_app::draw(app, f, area, box_height(), kind, draw_box);
+    let height = box_height() + hint_line::extra(HINTS, area.width);
+    super::bottom_app::draw(app, f, area, height, kind, draw_box);
 }
 
 fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
-    if area.height < box_height() {
+    if area.height < box_height() + hint_line::extra(HINTS, area.width) {
         return;
     }
     f.render_widget(Clear, area);
     f.buffer_mut()
         .set_style(area, Style::default().bg(theme::background()));
-    let border = Style::default()
-        .fg(theme::popup_border())
-        .bg(theme::background());
+    let border = theme::border_style().bg(theme::background());
     f.render_widget(
         Block::default().borders(Borders::ALL).border_style(border),
         area,
@@ -70,7 +69,7 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
         badges.extend(draw_row(app, f, area, by + 4 + row as u16, level, &chain));
     }
     app.log_level_picker.badges = badges;
-    hint_line::draw(f, bx + 2, by + area.height - 2, HINTS);
+    hint_line::draw_footer(f, area, HINTS);
 }
 
 fn subtitle(chain: &LogLevelChain) -> String {

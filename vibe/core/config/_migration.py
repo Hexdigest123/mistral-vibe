@@ -3,8 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Set as AbstractSet
 from typing import Any
 
-from vibe.core.agents.models import BuiltinAgentName
+from vibe.core.agents.models import ApprovalPolicyName
 from vibe.core.config._defaults import SHELL_TOOLS
+from vibe.core.config._retry import retry_on_conflict
 from vibe.core.config.layer import (
     ConfigLayer,
     EmptyLayerError,
@@ -15,6 +16,7 @@ from vibe.core.config.layer import (
 from vibe.core.config.layers._base import BaseTomlConfigLayer
 from vibe.core.config.layers.user import SuppliedUserConfigLayer, UserConfigLayer
 from vibe.core.config.patch import ConfigPatch, ReplaceOperationPatch
+from vibe.core.config.types import ConcurrencyConflictError
 from vibe.core.utils import name_matches
 
 # One-shot id: syncs an existing bash allowlist up to the current default
@@ -24,8 +26,6 @@ BASH_READ_ONLY_MIGRATION = "bash_read_only_defaults_v1"
 # Old tool name -> new tool name. The new tools replaced these in-place, so
 # existing user configs keyed by the old names need their settings moved over.
 RENAMED_TOOLS: dict[str, str] = {"read": "read_file", "search_replace": "edit"}
-
-RENAMED_AGENTS: dict[str, str] = {"default": "ask"}
 
 # The value older versions wrote for an unset ``auto_compact_threshold``.
 UNSET_AUTO_COMPACT_THRESHOLD = -1
@@ -74,28 +74,50 @@ async def migrate_config_layers(layers: Iterable[ConfigLayer[RawConfig]]) -> Non
         if _sets_shell_maximum(data, name)
     }
 
-    for layer, data in loaded:
+    for layer, _ in loaded:
         seeded_shells = (
             frozenset[str](SHELL_TOOLS) - shells_with_max
             if isinstance(layer, (UserConfigLayer, SuppliedUserConfigLayer))
             else frozenset()
         )
+        await _migrate_layer(
+            layer, complete_aliases=complete_aliases, seeded_shells=seeded_shells
+        )
+
+
+async def _migrate_layer(
+    layer: BaseTomlConfigLayer | SuppliedUserConfigLayer,
+    *,
+    complete_aliases: AbstractSet[str],
+    seeded_shells: AbstractSet[str],
+) -> None:
+    async def write() -> list[BaseException]:
+        try:
+            data = (await layer.load()).model_dump()
+        except (EmptyLayerError, UntrustedLayerError):
+            return []
         if not migrate_config(
             data, complete_aliases=complete_aliases, seeded_shells=seeded_shells
         ):
-            continue
-
+            return []
         fingerprint = layer.fingerprint
         if fingerprint is None:
             raise LayerNotLoadedError(layer.name)
-
-        await layer.apply(
-            ConfigPatch(
-                ReplaceOperationPatch(path="", value=data),
-                fingerprint=fingerprint,
-                reason="config migration",
+        try:
+            await layer.apply(
+                ConfigPatch(
+                    ReplaceOperationPatch(path="", value=data),
+                    fingerprint=fingerprint,
+                    reason="config migration",
+                )
             )
-        )
+        except ConcurrencyConflictError as exc:
+            # Another session saved since the load: the next attempt migrates what it wrote.
+            await layer.refresh()
+            return [exc]
+        return []
+
+    await retry_on_conflict(write, description=f"migrating {layer.name}")
 
 
 def migrate_config(
@@ -124,6 +146,8 @@ def migrate_config(
     changed |= _migrate_seeded_shell_default_timeout(data, seeded_shells)
     changed |= _migrate_unset_auto_compact_threshold(data)
     changed |= _migrate_removed_tool_paths(data)
+    changed |= _migrate_renamed_worktree_copy_on_write(data)
+    changed |= _migrate_renamed_enable_model_catalog(data)
     return changed
 
 
@@ -343,6 +367,31 @@ def _migrate_removed_tool_paths(data: dict[str, Any]) -> bool:
     return data.pop("tool_paths", None) is not None
 
 
+def _migrate_renamed_worktree_copy_on_write(data: dict[str, Any]) -> bool:
+    """Rename ``experimental_worktree_copy_on_write`` and keep its value.
+
+    The setting is now on by default, so an old ``false`` is kept as an opt-out.
+    """
+    if "experimental_worktree_copy_on_write" not in data:
+        return False
+    value = data.pop("experimental_worktree_copy_on_write")
+    data.setdefault("worktree_copy_on_write", value)
+    return True
+
+
+def _migrate_renamed_enable_model_catalog(data: dict[str, Any]) -> bool:
+    """Rename ``experimental_enable_model_catalog``, keeping only an opt-out.
+
+    The catalog is now on by default, so an old ``true`` asks for nothing.
+    """
+    if "experimental_enable_model_catalog" not in data:
+        return False
+    value = data.pop("experimental_enable_model_catalog")
+    if value is False:
+        data.setdefault("enable_model_catalog", False)
+    return True
+
+
 def _migrate_renamed_tools(data: dict[str, Any]) -> bool:
     """Move config from old tool names to new ones, and rename them in lists."""
     changed = False
@@ -374,34 +423,17 @@ def _migrate_renamed_tools(data: dict[str, Any]) -> bool:
 
 
 def _migrate_renamed_agents(data: dict[str, Any]) -> bool:
-    changed = False
-
-    default_agent = data.get("default_agent")
-    if isinstance(default_agent, str) and default_agent in RENAMED_AGENTS:
-        data["default_agent"] = RENAMED_AGENTS[default_agent]
-        changed = True
-
-    for list_key in ("enabled_agents", "disabled_agents", "installed_agents"):
-        names = data.get(list_key)
-        if not isinstance(names, list):
-            continue
-        renamed = [
-            RENAMED_AGENTS.get(name, name) if isinstance(name, str) else name
-            for name in names
-        ]
-        if renamed != names:
-            data[list_key] = renamed
-            changed = True
-
-    if "default_agent" not in data:
-        ask = RENAMED_AGENTS["default"]
-        if _agent_filters_exclude(
-            data, BuiltinAgentName.ACCEPT_EDITS
-        ) and not _agent_filters_exclude(data, ask):
-            data["default_agent"] = ask
-            changed = True
-
-    return changed
+    # A config excluding accept-edits, the default policy, starts on ask. It is
+    # written as default_agent, which builds from before agents and policies
+    # split read too.
+    if "default_agent" in data or "default_approval_policy" in data:
+        return False
+    if _agent_filters_exclude(
+        data, ApprovalPolicyName.ACCEPT_EDITS
+    ) and not _agent_filters_exclude(data, ApprovalPolicyName.ASK):
+        data["default_agent"] = ApprovalPolicyName.ASK.value
+        return True
+    return False
 
 
 def _agent_filters_exclude(data: dict[str, Any], agent: str) -> bool:

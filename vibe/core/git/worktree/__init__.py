@@ -7,6 +7,8 @@ from vibe.core.git.worktree.progress import (
 )
 from vibe.core.git.worktree.repository import (
     SNAPSHOT_REF_PREFIX,
+    BrokenCheckoutError,
+    BrokenCheckouts,
     LinkedWorktree,
     ManagedWorktree,
     PendingSessionHold,
@@ -18,10 +20,13 @@ from vibe.core.git.worktree.repository import (
     WorktreeRelease,
     WorktreeReleaseOutcome,
     WorktreeRepository,
+    access_roots_at,
 )
 
 __all__ = [
     "SNAPSHOT_REF_PREFIX",
+    "BrokenCheckoutError",
+    "BrokenCheckouts",
     "LinkedWorktree",
     "ManagedWorktree",
     "PendingSessionHold",
@@ -36,4 +41,5 @@ __all__ = [
     "WorktreeRelease",
     "WorktreeReleaseOutcome",
     "WorktreeRepository",
+    "access_roots_at",
 ]

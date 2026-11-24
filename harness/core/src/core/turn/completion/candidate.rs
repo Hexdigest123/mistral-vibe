@@ -3,9 +3,8 @@ use std::collections::BTreeSet;
 
 use crate::core::config::OutputLimitRecovery;
 use crate::core::features::output_limit_recovery;
-use crate::core::features::programmatic_tool_calling::is_private_wrapper;
 use crate::core::hooks::{CompletionHookOutput, HookPoint, PreLlmCallOutput};
-use crate::core::step_protocol::DeterminismContext;
+use crate::core::step_protocol::{DeterminismContext, TurnStopReason};
 use crate::core::tools::context::ToolContext;
 use crate::core::tools::execution::batch::{ToolBatchTransition, start_tool_batch};
 use crate::core::wire::completion::{
@@ -134,6 +133,7 @@ pub(in crate::core::turn) enum CompletionWait {
 pub(in crate::core::turn) enum CompletionFinish {
     Skipped {
         action_id: String,
+        reason: Vec<ContentBlock>,
     },
     Rejected {
         action_id: String,
@@ -157,12 +157,18 @@ pub(in crate::core::turn) struct AcceptedCompletion {
     /// the session's estimate correction.
     pub(in crate::core::turn) input_tokens: Option<u64>,
     pub(in crate::core::turn) message: StoredMessage,
-    pub(in crate::core::turn) observable_candidate: Option<CompletionCandidate>,
+    pub(in crate::core::turn) candidate: CompletionCandidate,
     pub(in crate::core::turn) continuation: AcceptedCompletionContinuation,
 }
 
 pub(in crate::core::turn) enum AcceptedCompletionContinuation {
-    Complete { output: Vec<ContentBlock> },
+    /// `stop_reason`: `OutputLimit` when the model's reply stopped at the output limit and
+    /// recovery did not retry it. It follows the model's finish reason, also when a hook replaced
+    /// the reply's content.
+    Complete {
+        output: Vec<ContentBlock>,
+        stop_reason: Option<TurnStopReason>,
+    },
     ToolBatch(Box<ToolBatchTransition>),
 }
 
@@ -214,9 +220,10 @@ fn resolve_completion_hook(
                     completion_action_id,
                 )),
             ))),
-            PreLlmCallOutput::Skip { .. } => {
+            PreLlmCallOutput::Skip { reason } => {
                 Ok(CompletionResolution::Finish(CompletionFinish::Skipped {
                     action_id: completion_action_id,
+                    reason,
                 }))
             }
         },
@@ -386,7 +393,6 @@ fn resolve_accepted(
     let message = Message::assistant(candidate.message.content.clone());
     message.validate()?;
     let tool_calls = candidate.message.tool_calls();
-    let observable_candidate = observable_candidate(&candidate);
     // The final iteration's tool call runs like any other. The turn stops after
     // the tool result lands, when the loop would otherwise start a completion it
     // has no budget for (see `apply_tool_batch_transition`), so the pending tool
@@ -394,6 +400,8 @@ fn resolve_accepted(
     let continuation = if tool_calls.is_empty() {
         AcceptedCompletionContinuation::Complete {
             output: candidate.message.content_blocks(),
+            stop_reason: (candidate.finish_reason == CompletionFinishReason::Length)
+                .then_some(TurnStopReason::OutputLimit),
         }
     } else {
         AcceptedCompletionContinuation::ToolBatch(Box::new(start_tool_batch(
@@ -408,7 +416,7 @@ fn resolve_accepted(
         context_tokens,
         input_tokens,
         message: StoredMessage::visible(message),
-        observable_candidate,
+        candidate,
         continuation,
     }))
 }
@@ -524,18 +532,6 @@ pub(in crate::core::turn) fn parse_completion_result(
     })
 }
 
-fn observable_candidate(candidate: &CompletionCandidate) -> Option<CompletionCandidate> {
-    let mut observable = candidate.clone();
-    observable.message.content.retain(|part| {
-        !matches!(
-            part,
-            AssistantPart::Semantic(AssistantSemanticPart::ToolCall { name, .. })
-                if is_private_wrapper(name)
-        )
-    });
-    (!observable.message.content.is_empty()).then_some(observable)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,8 +584,9 @@ mod tests {
     #[test]
     fn completion_rejection_stores_only_the_rejection_state() {
         let mut state = started();
-        add_always_hook(&mut state.config, HookPoint::PostLlmCall);
-        rebuild_hook_binding_index(&mut state);
+        edit_config(&mut state, |config| {
+            add_always_hook(config, HookPoint::PostLlmCall)
+        });
         let messages = state.context.messages().to_vec();
         let action_id = awaiting_action_id(&state);
         let state = advance(
@@ -618,7 +615,7 @@ mod tests {
         // The rejected draft is not committed: context is untouched, and the turn
         // ends carrying only why it declined.
         assert_eq!(step.state.context.messages(), messages);
-        assert_eq!(step.output(), Some(Vec::new()));
+        assert_eq!(step.output(), Some(vec![ContentBlock::text("unsafe")]));
         assert_eq!(
             turn_outcome(&step.state),
             Some(&TurnOutcome::Rejected {
@@ -632,8 +629,9 @@ mod tests {
         let mut config = config();
         config.settings.turn.max_iterations = Some(1);
         let mut state = started_with(config);
-        add_always_hook(&mut state.config, HookPoint::PostLlmCall);
-        rebuild_hook_binding_index(&mut state);
+        edit_config(&mut state, |config| {
+            add_always_hook(config, HookPoint::PostLlmCall)
+        });
         let action_id = awaiting_action_id(&state);
         state = advance(
             state,

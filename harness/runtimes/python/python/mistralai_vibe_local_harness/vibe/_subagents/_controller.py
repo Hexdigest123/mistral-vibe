@@ -4,21 +4,22 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-import hashlib
 import logging
+from pathlib import Path
 import time
 from typing import Literal, Protocol, cast
 
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 from pydantic import JsonValue, ValidationError
-import rfc8785
 
 from mistralai_vibe_local_harness._deprecated_tools import deprecated_tool_failure
 from mistralai_vibe_local_harness.protocol import (
     DEPRECATED_RUNTIME_BUILTIN_TOOL_NAMES,
+    JsonObject,
     RustEvent,
     RustFailTurnEvent,
     RustHarnessNotification,
@@ -27,13 +28,18 @@ from mistralai_vibe_local_harness.protocol import (
     RustToolSucceededEvent,
     RustToolSuccessResult,
 )
+from mistralai_vibe_local_harness.vibe._errors import HarnessStaleTurnError
 from mistralai_vibe_local_harness.vibe._observability import (
     add_subagent_active_turns,
     add_subagent_recovery_failure,
     record_subagent_notification_lag,
     record_subagent_operation,
 )
-from mistralai_vibe_local_harness.vibe._storage import RuntimeStateV3
+from mistralai_vibe_local_harness.vibe._storage import RuntimeStateV3, sha256_json
+from mistralai_vibe_local_harness.vibe._subagents._closed_log import (
+    ClosedSubagentLog,
+    known_child_records,
+)
 from mistralai_vibe_local_harness.vibe._subagents._core_adapter import (
     CORE_AGENT_TOOL_NAMES,
     controller_action,
@@ -92,6 +98,7 @@ from mistralai_vibe_local_harness.vibe._subagents._notifications import (
     pending_notification,
 )
 from mistralai_vibe_local_harness.vibe._subagents._operations import (
+    CHILD_WATCH_FAILED,
     AgentInput,
     InterruptInput,
     ListInput,
@@ -124,6 +131,9 @@ class ParentRuntime(Protocol):
     @property
     def identity(self) -> SessionIdentity: ...
 
+    @property
+    def session_root(self) -> Path: ...
+
     async def update_runtime_state(
         self, update: Callable[[RuntimeStateV3], RuntimeStateV3]
     ) -> None: ...
@@ -150,6 +160,23 @@ class ChildInterruptResult:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ChildMessageResult:
+    """What a host's message did to one child.
+
+    ``started``: the message started a new Turn of the child. ``busy``: the
+    child, or the parent's concurrent Turn limit, was running a Turn, so the
+    message was not delivered. ``unavailable``: the child cannot take messages
+    now, for the reason in ``error``.
+    """
+
+    outcome: Literal["started", "busy", "unavailable"]
+    error: str | None = None
+
+
+_BUSY_CHILD_FAILURES = frozenset({"subagent_busy", "subagent_concurrency_limit"})
+
+
 class SubagentController:
     """Own the parent graph, receipts, child operations, and notifications."""
 
@@ -169,6 +196,7 @@ class SubagentController:
         self._rejected_agent_types = dict(rejected_agent_types or {})
         self._policy_ceiling = policy_ceiling
         self._limits = limits
+        self._closed_log = ClosedSubagentLog(runtime.session_root)
         self._graph_lock = asyncio.Lock()
         self._notification_lock = asyncio.Lock()
         self._turn_admission_lock = asyncio.Lock()
@@ -177,9 +205,15 @@ class SubagentController:
         self._closing = False
         # Signalled on every commit to the graph, so a waiter re-reads it.
         self._graph_changed = asyncio.Condition()
-        # Receipts of the host's own operations, which no Core Action backs:
-        # reconciliation leaves them alone while they run.
-        self._host_operations: set[str] = set()
+        # Operations running in this process, Core Actions and the host's own
+        # alike, and the abandonments a reconciliation is finishing:
+        # reconciliation leaves their receipts alone.
+        self._running_operations: set[str] = set()
+        self._abandoning_operations: set[str] = set()
+        # What close() unloads: a child can leave the state while still loaded.
+        self._loaded_children: set[str] = set()
+        self._child_host_calls = 0
+        self._child_host_idle = asyncio.Condition()
 
     @classmethod
     async def open(
@@ -191,7 +225,13 @@ class SubagentController:
         policy_ceiling: ResolvedSubagentPolicyCeiling,
         limits: SubagentLimits | None = None,
         rejected_agent_types: Mapping[str, str] | None = None,
+        end_left_turns: str | None = None,
     ) -> SubagentController:
+        """``end_left_turns``: end the turns a stopped process left the
+        children running, as interrupted with that reason, instead of carrying
+        them on.
+        """
+
         def initialize_subagents(state: RuntimeStateV3) -> RuntimeStateV3:
             if isinstance(state.identity, SubagentSessionIdentity):
                 raise ValueError(
@@ -204,39 +244,17 @@ class SubagentController:
                     },
                     deep=True,
                 )
-            drifted = not _same_enforced_policy(
-                state.subagents.policy_ceiling, policy_ceiling
+            if _same_enforced_policy(state.subagents.policy_ceiling, policy_ceiling):
+                return state
+            return state.model_copy(
+                update={
+                    "subagents": state.subagents.model_copy(
+                        update={"policy_ceiling": policy_ceiling}, deep=True
+                    )
+                },
+                deep=True,
             )
-            unbindable = _unbindable_recoverable_children(state.subagents, bindings)
-            if drifted or unbindable:
-                # ``open`` is always a cold boundary: nothing here is live.
-                subagents = state.subagents
-                if drifted and not _policy_can_be_rebound(subagents):
-                    # Enforced policy changed: nothing was admitted under it, so
-                    # settle every child and adopt the new ceiling for future work.
-                    subagents = _settle_children_for_restore(
-                        subagents,
-                        frozenset(subagents.children),
-                        observed_at=_now_milliseconds(),
-                    )
-                elif unbindable:
-                    # Same policy, but some children can no longer be bound; settle
-                    # just those and leave bindable siblings to recover.
-                    subagents = _settle_children_for_restore(
-                        subagents, unbindable, observed_at=_now_milliseconds()
-                    )
-                return state.model_copy(
-                    update={
-                        "subagents": subagents.model_copy(
-                            update={"policy_ceiling": policy_ceiling}, deep=True
-                        )
-                    },
-                    deep=True,
-                )
-            return state
 
-        stored = runtime.runtime_state.subagents
-        quiescent = frozenset() if stored is None else _quiescent_children(stored)
         await runtime.update_runtime_state(initialize_subagents)
         controller = cls(
             runtime=runtime,
@@ -246,11 +264,15 @@ class SubagentController:
             limits=limits or SubagentLimits(),
             rejected_agent_types=rejected_agent_types,
         )
+        # Moves the closed children an older build kept in the state to the log.
+        await controller._commit(controller._subagents())
         # A recovered notification can immediately ask the model for more child
         # work, so install the controller before replaying any queued delivery.
         runtime.configure_subagent_controller(controller)
-        await controller._rebind_quiescent_children(quiescent)
+        await controller._adopt_current_bindings()
         await controller._preflight_children()
+        if end_left_turns is not None:
+            await controller._end_left_child_turns(end_left_turns)
         await controller.deliver_pending_notifications()
         controller.start_watchers()
         return controller
@@ -376,7 +398,8 @@ class SubagentController:
             for action_id, receipt in tuple(state.operation_receipts.items()):
                 if (
                     action_id in pending_action_ids
-                    or action_id in self._host_operations
+                    or action_id in self._running_operations
+                    or action_id in self._abandoning_operations
                 ):
                     continue
                 if isinstance(receipt.state, SucceededReceipt | FailedReceipt):
@@ -389,8 +412,14 @@ class SubagentController:
                 abandoning.append((receipt.admission_sequence, action_id))
             if changed:
                 await self._commit(state)
-        for _sequence, action_id in sorted(abandoning):
-            await self._finish_abandonment(action_id)
+            self._abandoning_operations.update(action_id for _, action_id in abandoning)
+        try:
+            for _sequence, action_id in sorted(abandoning):
+                await self._finish_abandonment(action_id)
+        finally:
+            self._abandoning_operations.difference_update(
+                action_id for _, action_id in abandoning
+            )
 
     async def execute(
         self, action: RustRuntimeBuiltinToolCallAction, *, recovering: bool
@@ -400,6 +429,7 @@ class SubagentController:
         with tracer.start_as_current_span("subagent_operation") as span:
             span.set_attribute("mistral_ai.vibe_harness.subagent.operation", operation)
             span.set_attribute("mistral_ai.vibe_harness.recovering", recovering)
+            self._running_operations.add(action.action_id)
             try:
                 event = await self._execute(action, recovering=recovering)
             except BaseException as exc:
@@ -426,6 +456,8 @@ class SubagentController:
                     exc_info=exc,
                 )
                 raise
+            finally:
+                self._running_operations.discard(action.action_id)
             outcome, failure_code = _event_outcome(event, operation=operation)
             elapsed_s = time.perf_counter() - started_at
             record_subagent_operation(
@@ -506,7 +538,7 @@ class SubagentController:
             await self._graph_changed.wait_for(self._settled)
 
     async def interrupt_running_children(
-        self, reason: str
+        self, reason: str, *, turn_ids: frozenset[str] | None = None
     ) -> tuple[ChildInterruptResult, ...]:
         """Interrupt each child's running Turn on the host's behalf, and
         return one result per child that was running, in name order.
@@ -517,11 +549,14 @@ class SubagentController:
         as it ended, and reported as not running. A child whose interrupt
         raises is reported failed with the error and left running, with its
         receipt, and the others are still interrupted. Does not wait for the
-        children to settle.
+        children to settle. With ``turn_ids``, only the children running those
+        Turns are interrupted.
         """
         results: list[ChildInterruptResult] = []
         for agent_name, child in sorted(self._subagents().children.items()):
             if not isinstance(child.state, RunningChild):
+                continue
+            if turn_ids is not None and child.state.active.turn_id not in turn_ids:
                 continue
             operation_key = (
                 f"host-interrupt:{child.child_session_id}:"
@@ -556,10 +591,27 @@ class SubagentController:
             )
         return tuple(results)
 
+    async def _end_left_child_turns(self, reason: str) -> None:
+        # Preflight opened each running child without starting its execution.
+        for agent_name, child in sorted(self._subagents().children.items()):
+            if not isinstance(child.state, RunningChild):
+                continue
+            try:
+                await self._interrupt_on_host_behalf(
+                    agent_name,
+                    f"host-interrupt:{child.child_session_id}:"
+                    f"{child.state.active.generation}",
+                    reason,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not end subagent %s's left turn", agent_name, exc_info=True
+                )
+
     async def _interrupt_on_host_behalf(
         self, agent_name: str, operation_key: str, reason: str
     ) -> dict[str, JsonValue]:
-        self._host_operations.add(operation_key)
+        self._running_operations.add(operation_key)
         try:
             result = await self._interrupt_child(
                 agent_name,
@@ -569,9 +621,136 @@ class SubagentController:
                 reason=reason,
             )
         finally:
-            self._host_operations.discard(operation_key)
+            self._running_operations.discard(operation_key)
         await self._remove_receipt(operation_key)
         return result
+
+    def child_binding(
+        self, child_session_id: str
+    ) -> ResolvedChildSessionBinding | None:
+        """The binding a child of this parent opens under, or None for another Session."""
+        if self._runtime.runtime_state.subagents is None:
+            return None
+        for child in self.known_child_records():
+            if child.child_session_id == child_session_id:
+                return self._bindings.get(child.agent_type)
+        return None
+
+    async def message_idle_child(
+        self,
+        child_session_id: str,
+        message: str,
+        *,
+        content_meta: JsonObject | None = None,
+    ) -> ChildMessageResult:
+        """Start a new Turn of an idle child with ``message``, on the host's behalf.
+
+        Takes the path a parent's ``send_message`` call takes, with a durable
+        receipt of its own, except that it never steers: a child running a
+        Turn, or one the concurrent Turn limit keeps waiting, is reported
+        ``busy`` and left as it is. The child's result reaches the parent like
+        any other child result.
+        """
+        admitted = await self._admit_host_message(child_session_id)
+        if isinstance(admitted, ChildMessageResult):
+            return admitted
+        child, operation_key = admitted
+        request = MessageInput(agentName=child.agent_name, message=message)
+        self._running_operations.add(operation_key)
+        try:
+            output = await self._send(
+                operation_key,
+                _host_operation_digest("send", child.agent_name),
+                request,
+                None,
+                allow_steer=False,
+                content_meta=content_meta,
+            )
+        except HarnessStaleTurnError:
+            # The child started a Turn of its own after the check above.
+            await self._settle_failed_host_message(operation_key, child.agent_name)
+            return ChildMessageResult(
+                outcome="busy", error="Subagent is running a Turn"
+            )
+        except Exception:
+            await self._settle_failed_host_message(operation_key, child.agent_name)
+            raise
+        finally:
+            self._running_operations.discard(operation_key)
+        await self._remove_receipt(operation_key)
+        if output == success_output():
+            return ChildMessageResult(outcome="started")
+        error = output.get("error")
+        message = error if isinstance(error, str) else "Subagent cannot take messages"
+        code, _, detail = message.partition(": ")
+        if code in _BUSY_CHILD_FAILURES:
+            return ChildMessageResult(outcome="busy", error=detail)
+        return ChildMessageResult(outcome="unavailable", error=message)
+
+    async def _admit_host_message(
+        self, child_session_id: str
+    ) -> tuple[ChildSessionRecord, str] | ChildMessageResult:
+        """The child and operation key of a host message, or why it cannot go."""
+        child = next(
+            (
+                record
+                for record in self._subagents().children.values()
+                if record.child_session_id == child_session_id
+            ),
+            None,
+        )
+        if child is None:
+            return ChildMessageResult(outcome="unavailable", error="Subagent not found")
+        if not child_is_sendable(child):
+            return ChildMessageResult(
+                outcome="unavailable", error=child_unavailable_failure(child).message
+            )
+        operation_key = (
+            f"host-send:{child_session_id}:"
+            f"{_require_current_generation(child).generation}"
+        )
+        if operation_key in self._subagents().operation_receipts:
+            # An earlier attempt failed midway and could not be settled at once.
+            # Reconciliation settles it; only one path may, so wait for it.
+            return ChildMessageResult(
+                outcome="busy", error="Subagent is taking an earlier message"
+            )
+        if isinstance(
+            child.state, RunningChild
+        ) or await self._child_host.child_turn_in_flight(child_session_id):
+            return ChildMessageResult(
+                outcome="busy", error="Subagent is running a Turn"
+            )
+        return child, operation_key
+
+    async def _settle_failed_host_message(
+        self, operation_key: str, agent_name: str
+    ) -> None:
+        """Settle what a failed host message admitted, the way reconciliation
+        settles an abandoned parent call, so the next message finds no receipt
+        in its way. The key is still a host operation, so reconciliation skips
+        it meanwhile. A failure here leaves the receipt to reconciliation; the
+        caller's own error is the one it sees.
+        """
+        try:
+            await self._abandon_host_operation(operation_key)
+        except Exception:
+            logger.warning(
+                "Could not settle a failed message to subagent %s",
+                agent_name,
+                exc_info=True,
+            )
+
+    async def _abandon_host_operation(self, operation_key: str) -> None:
+        async with self._graph_lock:
+            state = self._subagents()
+            receipt = state.operation_receipts.get(operation_key)
+            if receipt is None:
+                return
+            if not isinstance(receipt.state, AbandoningReceipt):
+                receipt.state = AbandoningReceipt(previous=receipt.state)
+                await self._commit(state)
+        await self._finish_abandonment(operation_key)
 
     def _settled(self) -> bool:
         if self._closing:
@@ -594,21 +773,18 @@ class SubagentController:
         if watchers:
             await asyncio.gather(*watchers, return_exceptions=True)
         self._watchers.clear()
-        children = sorted(
-            (
-                child
-                for child in self._subagents().children.values()
-                if not isinstance(
-                    child.state,
-                    CreationFailedChild | CreationCleanupPendingChild | ChildTombstone,
-                )
-            ),
-            key=lambda child: child.child_session_id,
-        )
-        for child in children:
-            await self._child_host.unload_child(
-                ChildSessionHandle(session_id=child.child_session_id)
-            )
+        # No child loads from here on (`_open_child` refuses while closing),
+        # so after the in-flight calls drain, the loaded set only shrinks.
+        async with self._child_host_idle:
+            await self._child_host_idle.wait_for(lambda: self._child_host_calls == 0)
+        failures: list[Exception] = []
+        for session_id in sorted(self._loaded_children):
+            try:
+                await self._unload(ChildSessionHandle(session_id=session_id))
+            except Exception as error:
+                failures.append(error)
+        if failures:
+            raise failures[0]
 
     async def _finish_abandonment(self, action_id: str) -> None:
         async with self._graph_lock:
@@ -724,7 +900,7 @@ class SubagentController:
             )
             await self._commit(state)
         try:
-            await self._child_host.delete_child(target.child_session_id)
+            await self._delete(target.child_session_id)
         except Exception:
             return
         async with self._graph_lock:
@@ -807,7 +983,12 @@ class SubagentController:
                 return await self._wait(action, request, receipt), {}
             case "agents.send_message":
                 request = MessageInput.model_validate(action.call.arguments)
-                return await self._send(action, request, receipt), {}
+                return (
+                    await self._send(
+                        action.action_id, request_digest(action), request, receipt
+                    ),
+                    {},
+                )
             case "agents.interrupt":
                 request = InterruptInput.model_validate(action.call.arguments)
                 return await self._interrupt(action, request, receipt), {}
@@ -827,12 +1008,9 @@ class SubagentController:
                         agents.append(listed_agent(child, "running"))
                     case IdleChild():
                         agents.append(listed_agent(child, "idle"))
-                    case ChildTombstone():
-                        agents.append(listed_agent(child, "stopped"))
-                    case (
-                        CreationFailedChild(failure=stored_failure)
-                        | CreationCleanupPendingChild(failure=stored_failure)
-                    ):
+                    case ChildTombstone() | CreationFailedChild():
+                        continue
+                    case CreationCleanupPendingChild(failure=stored_failure):
                         agents.append(
                             listed_agent(child, "failed", stored_failure.message)
                         )
@@ -853,6 +1031,7 @@ class SubagentController:
         receipt: SubagentOperationReceipt | None,
     ) -> tuple[dict[str, JsonValue], dict[str, JsonValue]]:
         async with self._name_locks[request.agent_name], self._turn_admission_lock:
+            evicted: ChildSessionRecord | None = None
             if receipt is None:
                 async with self._graph_lock:
                     binding = self._bindings.get(request.agent_type)
@@ -863,30 +1042,19 @@ class SubagentController:
                             )
                         ), {}
                     state = self._subagents()
-                    if request.agent_name in state.children:
-                        return error_output(
-                            failure(
-                                "subagent_name_conflict",
-                                f"Subagent name is already reserved: {request.agent_name}",
-                                retryable=False,
-                            )
-                        ), {}
-                    if len(state.children) >= self._limits.max_lifetime_names:
-                        return error_output(
-                            failure(
-                                "subagent_name_limit",
-                                "Subagent lifetime name limit reached",
-                                retryable=False,
-                            )
-                        ), {}
+                    conflict = self._name_conflict(state, request.agent_name)
+                    if conflict is not None:
+                        return error_output(conflict), {}
                     if live_child_count(state) >= self._limits.max_children:
-                        return error_output(
-                            failure(
-                                "subagent_child_limit",
-                                "Subagent child limit reached",
-                                retryable=True,
-                            )
-                        ), {}
+                        evicted = _longest_waiting_child(state)
+                        if evicted is None:
+                            return error_output(
+                                failure(
+                                    "subagent_child_limit",
+                                    "Subagent child limit reached",
+                                    retryable=True,
+                                )
+                            ), {}
                     if running_child_count(state) >= self._limits.max_concurrent_turns:
                         return error_output(
                             failure(
@@ -897,7 +1065,9 @@ class SubagentController:
                             )
                         ), {}
                     child_id = child_session_id(
-                        self._runtime.session_id, action.action_id
+                        self._runtime.session_id,
+                        action.action_id,
+                        state.next_operation_sequence,
                     )
                     command = ChildGenerationRef(
                         generation=1, turn_id=f"{child_id}:turn:1"
@@ -911,6 +1081,9 @@ class SubagentController:
                         agent_name=request.agent_name,
                         admission_sequence=state.next_operation_sequence,
                         agent_type=request.agent_type,
+                        instructions=(
+                            request.instructions if request.agent_type is None else None
+                        ),
                         child_session_id=child_id,
                         spawn_action_id=action.action_id,
                         spawn_request_digest=request_digest(action),
@@ -919,12 +1092,18 @@ class SubagentController:
                         state=ReservedChild(),
                     )
                     _add_receipt(state, action, request.agent_name, target)
+                    if evicted is not None:
+                        # Closed in the spawn's own commit; its store stays for
+                        # usage and transcripts until the Session tree is deleted.
+                        state.children[evicted.agent_name].state = ChildTombstone()
                     await self._commit(state)
                 receipt_state: ActiveSubagentReceiptState = PreparedReceipt(
                     target=target
                 )
             else:
                 receipt_state = _active_receipt(receipt)
+            if evicted is not None:
+                await self._unload_evicted_child(evicted)
             output = await self._resume_spawn(action, request, receipt_state)
             annotations = (
                 self._spawn_annotations(request.agent_name, action.call_id)
@@ -932,6 +1111,17 @@ class SubagentController:
                 else {}
             )
             return output, annotations
+
+    async def _unload_evicted_child(self, child: ChildSessionRecord) -> None:
+        # Only frees memory: the child is already closed, so the spawn goes on.
+        try:
+            await self._unload(ChildSessionHandle(session_id=child.child_session_id))
+        except Exception:
+            logger.warning(
+                "Could not unload subagent %s closed to make room for a new one",
+                child.agent_name,
+                exc_info=True,
+            )
 
     async def _resume_spawn(
         self,
@@ -1007,7 +1197,7 @@ class SubagentController:
             )
             await self._commit(state)
         try:
-            await self._child_host.delete_child(target.child_session_id)
+            await self._delete(target.child_session_id)
         except Exception:
             pass
         else:
@@ -1092,16 +1282,28 @@ class SubagentController:
 
     async def _send(
         self,
-        action: RustRuntimeBuiltinToolCallAction,
+        operation_key: str,
+        digest: str,
         request: MessageInput,
         receipt: SubagentOperationReceipt | None,
+        *,
+        allow_steer: bool = True,
+        content_meta: JsonObject | None = None,
     ) -> dict[str, JsonValue]:
-        async with self._name_locks[request.agent_name], self._turn_admission_lock:
+        async with self._send_locks(request.agent_name):
             if receipt is None:
                 async with self._graph_lock:
                     child = self._require_child(request.agent_name)
                     if not child_is_sendable(child):
                         return error_output(child_unavailable_failure(child))
+                    if not allow_steer and isinstance(child.state, RunningChild):
+                        return error_output(
+                            failure(
+                                "subagent_busy",
+                                "Subagent is running a Turn",
+                                retryable=True,
+                            )
+                        )
                     if not isinstance(child.state, RunningChild) and (
                         running_child_count(self._subagents())
                         >= self._limits.max_concurrent_turns
@@ -1123,28 +1325,33 @@ class SubagentController:
                         and not isinstance(child.state, RunningChild)
                     ):
                         # A child that is not running adopts the current binding
-                        # before it takes a message. One that restore settled from
-                        # running resumes its stored Turn under it.
+                        # before it takes a message, as after a plugin re-pin.
                         await self._adopt_bindings(
                             state,
                             self._bindings,
                             [request.agent_name],
                             tolerate_host_errors=True,
                         )
-                    _add_receipt(state, action, request.agent_name, target)
+                    _add_operation_receipt(
+                        state, operation_key, digest, request.agent_name, target
+                    )
                     await self._commit(state)
                 receipt_state: ActiveSubagentReceiptState = PreparedReceipt(
                     target=target
                 )
             else:
                 receipt_state = _active_receipt(receipt)
-            return await self._resume_send(action, request, receipt_state)
+            return await self._resume_send(
+                operation_key, request, receipt_state, content_meta=content_meta
+            )
 
     async def _resume_send(
         self,
-        action: RustRuntimeBuiltinToolCallAction,
+        operation_key: str,
         request: MessageInput,
         receipt_state: ActiveSubagentReceiptState,
+        *,
+        content_meta: JsonObject | None = None,
     ) -> dict[str, JsonValue]:
         replay = _terminal_receipt_output(receipt_state)
         if replay is not None:
@@ -1170,7 +1377,8 @@ class SubagentController:
                 handle,
                 message=request.message,
                 known_generation=_require_current_generation(child),
-                operation_key=action.action_id,
+                operation_key=operation_key,
+                content_meta=content_meta,
             )
             resolved = admission.target
             if not isinstance(resolved, SendStartTarget | SendSteerTarget):
@@ -1183,9 +1391,7 @@ class SubagentController:
                     active=resolved.command
                 )
                 _set_receipt_state(
-                    state,
-                    action.action_id,
-                    ChildCommandAcceptedReceipt(target=resolved),
+                    state, operation_key, ChildCommandAcceptedReceipt(target=resolved)
                 )
                 await self._commit(state)
             target = resolved
@@ -1194,11 +1400,11 @@ class SubagentController:
                 "subagent_recovery_unsafe", "Accepted send has no target"
             )
         await self._child_host.acknowledge_child_command(
-            handle, operation_key=action.action_id
+            handle, operation_key=operation_key
         )
         result = success_output()
         await self._finish_receipt(
-            action.action_id, SucceededReceipt(target=target, result=result)
+            operation_key, SucceededReceipt(target=target, result=result)
         )
         self._ensure_watcher(request.agent_name, target.command)
         return result
@@ -1268,7 +1474,8 @@ class SubagentController:
                 raise UnsafeSubagentRecovery(
                     "subagent_recovery_unsafe", "Interrupt target changed"
                 )
-            handle = await self._open_current_child(agent_name)
+            # A restored child's turn is ended, not carried on first.
+            handle = await self._open_current_child(agent_name, start_new_actions=False)
             if isinstance(receipt_state, PreparedReceipt):
                 admission = await self._child_host.interrupt_child(
                     handle, target=target, operation_key=operation_key, reason=reason
@@ -1309,6 +1516,9 @@ class SubagentController:
                     raise RuntimeError("new close operation requires its Core Action")
                 async with self._graph_lock:
                     child = self._require_child(request.agent_name)
+                    if request.agent_name not in self._subagents().children:
+                        # Retired to the closed log: already closed.
+                        return success_output()
                     if isinstance(child.state, ChildTombstone):
                         target: CloseIdleTarget | CloseRunningTarget = CloseIdleTarget(
                             child_session_id=child.child_session_id
@@ -1408,8 +1618,8 @@ class SubagentController:
                 "subagent_recovery_unsafe", "Close did not reach cleanup"
             )
         if handle is not None:
-            await self._child_host.unload_child(handle)
-        await self._child_host.delete_child(child.child_session_id)
+            await self._unload(handle)
+        await self._delete(child.child_session_id)
         result = success_output()
         async with self._graph_lock:
             state = self._subagents()
@@ -1503,6 +1713,9 @@ class SubagentController:
         async with self._graph_lock:
             state = self._subagents()
             child = state.children[agent_name]
+            current = _current_generation(child)
+            if current is not None and outcome.generation < current:
+                return
             existing = _stored_outcome(child, outcome.generation)
             if existing is not None:
                 if existing != outcome:
@@ -1541,7 +1754,7 @@ class SubagentController:
                     )
             elif isinstance(outcome, FailedChildTurnOutcome):
                 child.state = TurnFailedChild(
-                    outcome=outcome, reusable=outcome.failure.retryable
+                    outcome=outcome, reusable=outcome.failure.code != CHILD_WATCH_FAILED
                 )
             else:
                 child.state = IdleChild(last_outcome=outcome)
@@ -1579,15 +1792,13 @@ class SubagentController:
             raise
         except Exception as exc:
             add_subagent_recovery_failure(
-                failure_code="subagent_child_watch_failed", phase="child_watch"
+                failure_code=CHILD_WATCH_FAILED, phase="child_watch"
             )
             outcome = FailedChildTurnOutcome(
                 generation=generation.generation,
                 turn_id=generation.turn_id,
                 completed_at_unix_ms=_now_milliseconds(),
-                failure=failure(
-                    "subagent_child_watch_failed", str(exc), retryable=False
-                ),
+                failure=failure(CHILD_WATCH_FAILED, str(exc), retryable=False),
             )
             await self._record_outcome(agent_name, outcome)
             await self.deliver_pending_notifications()
@@ -1623,38 +1834,33 @@ class SubagentController:
                 exc_info=(type(error), error, error.__traceback__),
             )
 
-    async def _rebind_quiescent_children(self, agent_names: frozenset[str]) -> None:
-        """Move the named children onto their type's current binding.
+    async def _adopt_current_bindings(self) -> None:
+        """Move every restored child onto its type's current binding.
 
-        Only a child whose own store holds no Turn in flight is moved: nothing
-        it recovers was admitted under its stored binding, so adopting the
-        current one is what a live reconfiguration does. Any other child keeps
-        its stored digests. A Host error leaves that child as stored rather than
-        blocking the root, and the next open retries it.
+        A child continues under the current binding the way a resumed root
+        continues under the current configuration: a Turn the stop cut is ended
+        by the child's own recovery, not by its parent. Only a child that cannot
+        take a binding, because its type is gone or its Host cannot write it, is
+        settled here, since nothing can reopen it to recover its own work.
         """
         async with self._graph_lock:
             previous = self._subagents()
             state = previous.model_copy(deep=True)
-            stale: list[str] = []
-            for name in sorted(agent_names):
-                child = state.children.get(name)
-                binding = (
-                    None if child is None else self._bindings.get(child.agent_type)
-                )
-                if child is None or binding is None or _binding_matches(binding, child):
-                    continue
-                try:
-                    quiescent = await self._child_host.child_is_quiescent(
-                        child.child_session_id
-                    )
-                except Exception:
-                    logger.warning("Could not inspect subagent %s", name, exc_info=True)
-                    continue
-                if quiescent:
-                    stale.append(name)
+            stale = [
+                name
+                for name, child in state.children.items()
+                if _may_have_child_store(child.state)
+                and (binding := self._bindings.get(child.agent_type)) is not None
+                and not _binding_matches(binding, child)
+            ]
             await self._adopt_bindings(
                 state, self._bindings, stale, tolerate_host_errors=True
             )
+            unbindable = _unbindable_recoverable_children(state, self._bindings)
+            if unbindable:
+                state = _settle_children_for_restore(
+                    state, unbindable, observed_at=_now_milliseconds()
+                )
             if state != previous:
                 await self._commit(state)
 
@@ -1707,41 +1913,24 @@ class SubagentController:
                 self._subagents().children.values(),
                 key=lambda item: item.child_session_id,
             ):
-                if isinstance(
-                    child.state,
-                    ReservedChild
-                    | CreationFailedChild
-                    | CreationCleanupPendingChild
-                    | DeletingIdleChild
-                    | ChildTombstone,
-                ):
+                # Only a running child has a Turn to reattach. Every other child
+                # opens on first use, so a resume does not open, and discover the
+                # integrations of, each subagent the Session ever had.
+                if not isinstance(child.state, RunningChild | DeletingRunningChild):
                     continue
-                # An idle or failed child has no Turn for preflight to reattach,
-                # so nothing about it may prevent the root Session from resuming.
-                # It keeps its stored record; an open operation that names it is
-                # recovered through that operation's receipt, which re-checks the
-                # child store.
-                historical = isinstance(child.state, IdleChild | TurnFailedChild)
-                try:
-                    binding = self._binding(child)
-                except UnsafeSubagentRecovery:
-                    if historical:
-                        continue
-                    raise
                 try:
                     handle = await self._open_child(
-                        child, binding, start_new_actions=False, require_existing=True
+                        child,
+                        self._binding(child),
+                        start_new_actions=False,
+                        require_existing=True,
                     )
                 except Exception as exc:
-                    if not historical:
-                        raise
-                    add_subagent_recovery_failure(
-                        failure_code=getattr(exc, "code", type(exc).__name__),
-                        phase="child_preflight_skipped",
-                    )
-                    logger.warning(
-                        "Could not restore subagent %s", child.agent_name, exc_info=True
-                    )
+                    if isinstance(child.state, RunningChild):
+                        await self._skip_unrestorable_child(child, child.state, exc)
+                    else:
+                        # Its close, part of the parent's turn, settles it.
+                        _log_unrestorable_child(child, exc)
                     continue
                 opened.append(handle)
         except BaseException as exc:
@@ -1751,18 +1940,81 @@ class SubagentController:
                     phase="child_preflight",
                 )
             for handle in reversed(opened):
-                await self._child_host.unload_child(handle)
+                await self._unload(handle)
             raise
 
+    async def _skip_unrestorable_child(
+        self, child: ChildSessionRecord, running: RunningChild, error: Exception
+    ) -> None:
+        """Let the root resume without a child whose store cannot be reopened.
+
+        The store is left as it is. The parent model learns the Turn is lost
+        and can spawn a replacement.
+        """
+        _log_unrestorable_child(child, error)
+        await self._record_outcome(
+            child.agent_name,
+            FailedChildTurnOutcome(
+                generation=running.active.generation,
+                turn_id=running.active.turn_id,
+                completed_at_unix_ms=_now_milliseconds(),
+                failure=failure(
+                    CHILD_WATCH_FAILED,
+                    f"Subagent {child.agent_name} could not be restored after the"
+                    " restart, so its unfinished work is lost and it can no longer"
+                    " take messages. Spawn a new subagent to redo the work."
+                    f" Cause: {error}",
+                    retryable=False,
+                ),
+            ),
+        )
+
+    @asynccontextmanager
+    async def _send_locks(self, agent_name: str) -> AsyncIterator[None]:
+        """Hold a send's locks once the child is past its pre_agent hooks."""
+        # Waits outside the locks, so a waiting child holds up no sibling or interrupt.
+        while True:
+            await self._wait_until_child_takes_messages(agent_name)
+            async with self._name_locks[agent_name], self._turn_admission_lock:
+                handle = await self._open_sendable_child(agent_name)
+                if handle is None or not (
+                    await self._child_host.child_runs_pre_agent_hooks(handle.session_id)
+                ):
+                    yield
+                    return
+
+    async def _wait_until_child_takes_messages(self, agent_name: str) -> None:
+        # Opening schedules the recovery of a Turn the child restored, so the
+        # wait that follows covers it.
+        handle = await self._open_sendable_child(agent_name)
+        if handle is not None:
+            await self._child_host.wait_until_child_takes_messages(handle.session_id)
+
+    async def _open_sendable_child(self, agent_name: str) -> ChildSessionHandle | None:
+        child = self._subagents().children.get(agent_name)
+        if child is None or not child_is_sendable(child):
+            return None
+        try:
+            return await self._open_current_child(agent_name)
+        except UnsafeSubagentRecovery:
+            return None
+
     async def _open_current_child(
-        self, agent_name: str, *, require_existing: bool | None = None
+        self,
+        agent_name: str,
+        *,
+        require_existing: bool | None = None,
+        start_new_actions: bool = True,
     ) -> ChildSessionHandle:
         # Reconfiguration changes Host metadata as well as the parent record.
         # Keep both stable through opening, then release before waiting on a Turn.
         async with self._graph_lock:
             child = self._require_child(agent_name)
             return await self._open_child(
-                child, self._binding(child), require_existing=require_existing
+                child,
+                self._binding(child),
+                start_new_actions=start_new_actions,
+                require_existing=require_existing,
             )
 
     async def _open_child(
@@ -1773,21 +2025,47 @@ class SubagentController:
         start_new_actions: bool = True,
         require_existing: bool | None = None,
     ) -> ChildSessionHandle:
-        return await self._child_host.create_or_restore_child(
-            identity=SubagentSessionIdentity(
-                session_id=child.child_session_id,
-                root_session_id=self._runtime.identity.root_session_id,
-                parent_session_id=self._runtime.session_id,
-            ),
-            binding=binding,
-            spawn_key=child.spawn_action_id,
-            start_new_actions=start_new_actions,
-            require_existing=(
-                not isinstance(child.state, ReservedChild)
-                if require_existing is None
-                else require_existing
-            ),
-        )
+        if self._closing:
+            raise RuntimeError("subagent controller is closed")
+        async with self._child_host_call():
+            handle = await self._child_host.create_or_restore_child(
+                identity=SubagentSessionIdentity(
+                    session_id=child.child_session_id,
+                    root_session_id=self._runtime.identity.root_session_id,
+                    parent_session_id=self._runtime.session_id,
+                ),
+                binding=binding,
+                instructions=child.instructions,
+                spawn_key=child.spawn_action_id,
+                start_new_actions=start_new_actions,
+                require_existing=(
+                    not isinstance(child.state, ReservedChild)
+                    if require_existing is None
+                    else require_existing
+                ),
+            )
+            self._loaded_children.add(handle.session_id)
+        return handle
+
+    @asynccontextmanager
+    async def _child_host_call(self) -> AsyncIterator[None]:
+        self._child_host_calls += 1
+        try:
+            yield
+        finally:
+            self._child_host_calls -= 1
+            async with self._child_host_idle:
+                self._child_host_idle.notify_all()
+
+    async def _unload(self, handle: ChildSessionHandle) -> None:
+        async with self._child_host_call():
+            await self._child_host.unload_child(handle)
+            self._loaded_children.discard(handle.session_id)
+
+    async def _delete(self, child_session_id: str) -> None:
+        async with self._child_host_call():
+            await self._child_host.delete_child(child_session_id)
+            self._loaded_children.discard(child_session_id)
 
     def _binding(self, child: ChildSessionRecord) -> ResolvedChildSessionBinding:
         binding = self._bindings.get(child.agent_type)
@@ -1805,6 +2083,8 @@ class SubagentController:
     def _require_child(self, agent_name: str) -> ChildSessionRecord:
         child = self._subagents().children.get(agent_name)
         if child is None:
+            child = self._closed_log.record(agent_name)
+        if child is None:
             raise ExpectedSubagentError(
                 failure(
                     "subagent_not_found",
@@ -1820,7 +2100,44 @@ class SubagentController:
             raise RuntimeError("subagent controller state is not initialized")
         return state.model_copy(deep=True)
 
+    def _name_conflict(
+        self, state: SubagentRuntimeState, agent_name: str
+    ) -> SubagentFailure | None:
+        child = state.children.get(agent_name)
+        if child is not None and not _is_closed(child):
+            return failure(
+                "subagent_name_conflict",
+                f"Subagent name is already reserved: {agent_name}",
+                retryable=False,
+            )
+        if child is None and self._closed_log.record(agent_name) is None:
+            return None
+        return failure(
+            "subagent_name_conflict",
+            "Subagent name belongs to a closed subagent; choose another name: "
+            f"{agent_name}",
+            retryable=False,
+        )
+
+    def known_child_records(self) -> tuple[ChildSessionRecord, ...]:
+        return known_child_records(self._subagents(), self._closed_log)
+
     async def _commit(self, subagents: SubagentRuntimeState) -> None:
+        retired = _retirable_children(subagents)
+        if retired:
+            # Write-ahead: a crash before the generation leaves the record in
+            # both places, and readers prefer the state's copy.
+            await asyncio.to_thread(self._closed_log.append, retired)
+            retired_names = {child.agent_name for child in retired}
+            subagents = subagents.model_copy(
+                update={
+                    "children": {
+                        name: child
+                        for name, child in subagents.children.items()
+                        if name not in retired_names
+                    }
+                }
+            )
         updated_subagents = _sorted_state(subagents)
         await self._runtime.update_runtime_state(
             lambda state: state.model_copy(
@@ -1891,35 +2208,23 @@ def _same_enforced_policy(
     return stored.model_dump(exclude=excluded) == current.model_dump(exclude=excluded)
 
 
-def _policy_can_be_rebound(state: SubagentRuntimeState) -> bool:
-    """Whether policy drift can be adopted without recovering child-side work."""
-    if state.operation_receipts:
-        return False
-    quiescent = _quiescent_children(state)
-    return all(
-        name in quiescent
-        or isinstance(child.state, CreationFailedChild | ChildTombstone)
-        for name, child in state.children.items()
-    )
+def _is_closed(child: ChildSessionRecord) -> bool:
+    return isinstance(child.state, ChildTombstone | CreationFailedChild)
 
 
-def _quiescent_children(state: SubagentRuntimeState) -> frozenset[str]:
-    """Children whose own store holds no Turn their parent may have started.
+def _retirable_children(state: SubagentRuntimeState) -> list[ChildSessionRecord]:
+    named = {receipt.agent_name for receipt in state.operation_receipts.values()}
+    named.update(item.agent_name for item in state.notifications.pending)
+    return [
+        child
+        for child in state.children.values()
+        if _is_closed(child) and child.agent_name not in named
+    ]
 
-    Taken before restore settles anything: settling marks an interrupted child
-    idle in the parent record only. An open operation receipt also excludes its
-    child, because the child can admit a command before the parent records it.
-    """
-    in_flight = {
-        receipt.agent_name
-        for receipt in state.operation_receipts.values()
-        if not isinstance(_active_receipt(receipt), SucceededReceipt | FailedReceipt)
-    }
-    return frozenset(
-        name
-        for name, child in state.children.items()
-        if isinstance(child.state, IdleChild | TurnFailedChild)
-        and name not in in_flight
+
+def _may_have_child_store(state: ChildLifecycleState) -> bool:
+    return not isinstance(
+        state, CreationFailedChild | CreationCleanupPendingChild | ChildTombstone
     )
 
 
@@ -1948,15 +2253,27 @@ def _unbindable_recoverable_children(
     state: SubagentRuntimeState,
     bindings: Mapping[str | None, ResolvedChildSessionBinding],
 ) -> frozenset[str]:
-    """Running/mid-close children whose pinned digests no longer match a binding.
+    """Children with work to recover whose digests match no current binding.
 
-    ``open`` settles exactly these up front (a real revocation, or the one-time
-    digest-formula change) so preflight neither wedges nor leaves their receipts
-    for a later ``_binding`` to reject; bindable siblings keep recovering.
+    A child has work to recover while it runs, is being created or closed, or
+    an operation that reaches it is still open. Closing an idle child reaches
+    only its store, so it needs no binding. Settling these lets the root resume
+    instead of failing preflight, and keeps their receipts from reaching a
+    ``_binding`` that would reject them.
     """
+    open_operations = {
+        receipt.agent_name
+        for receipt in state.operation_receipts.values()
+        if not isinstance(
+            active := _active_receipt(receipt), SucceededReceipt | FailedReceipt
+        )
+        and not isinstance(active.target, CloseIdleTarget)
+    }
     unbindable: set[str] = set()
     for name, child in state.children.items():
-        if not isinstance(child.state, RunningChild | DeletingRunningChild):
+        if name not in open_operations and not isinstance(
+            child.state, ReservedChild | RunningChild | DeletingRunningChild
+        ):
             continue
         binding = bindings.get(child.agent_type)
         if binding is None or not _binding_matches(binding, child):
@@ -1973,8 +2290,7 @@ def _settle_children_for_restore(
     exited, so none of it is live: transition the named running children to an
     interrupted idle outcome and terminate their open operation receipts, so
     recovery replays those to a terminal result instead of re-driving child work.
-    Siblings not named are left untouched and recover normally -- pass every
-    child to settle the whole graph (policy drift), or just the unbindable ones.
+    Siblings not named are left untouched and recover normally.
     """
     children = {
         name: (
@@ -2002,6 +2318,14 @@ def _settle_children_for_restore(
     return state.model_copy(
         update={"children": children, "operation_receipts": receipts}, deep=True
     )
+
+
+def _log_unrestorable_child(child: ChildSessionRecord, error: Exception) -> None:
+    add_subagent_recovery_failure(
+        failure_code=getattr(error, "code", type(error).__name__),
+        phase="child_preflight_skipped",
+    )
+    logger.warning("Could not restore subagent %s", child.agent_name, exc_info=error)
 
 
 def _settle_child_for_restore(
@@ -2081,8 +2405,10 @@ def _add_operation_receipt(
 
 
 def _host_operation_digest(operation: str, agent_name: str) -> str:
-    payload = {"name": f"host.{operation}", "arguments": {"agentName": agent_name}}
-    return hashlib.sha256(rfc8785.dumps(payload)).hexdigest()
+    return sha256_json({
+        "name": f"host.{operation}",
+        "arguments": {"agentName": agent_name},
+    })
 
 
 def _set_receipt_state(
@@ -2180,6 +2506,30 @@ def _stored_outcome(
     ):
         return child.state.outcome
     return None
+
+
+def _longest_waiting_child(state: SubagentRuntimeState) -> ChildSessionRecord | None:
+    """The finished child idle the longest, skipping any an operation or result still needs."""
+    busy = {
+        receipt.agent_name
+        for receipt in state.operation_receipts.values()
+        if not isinstance(_active_receipt(receipt), SucceededReceipt | FailedReceipt)
+    }
+    busy.update(item.agent_name for item in state.notifications.pending)
+    waiting: list[tuple[int, int, ChildSessionRecord]] = []
+    for child in state.children.values():
+        if child.agent_name in busy:
+            continue
+        if isinstance(child.state, IdleChild):
+            finished_at = child.state.last_outcome.completed_at_unix_ms
+        elif isinstance(child.state, TurnFailedChild):
+            finished_at = child.state.outcome.completed_at_unix_ms
+        else:
+            continue
+        waiting.append((finished_at, child.admission_sequence, child))
+    if not waiting:
+        return None
+    return min(waiting, key=lambda item: item[:2])[2]
 
 
 def _target_generation(target: CloseIdleTarget | CloseRunningTarget) -> int | None:
@@ -2290,4 +2640,4 @@ def _close_receipt_for_generation(
     return None
 
 
-__all__ = ["ChildInterruptResult", "SubagentController"]
+__all__ = ["ChildInterruptResult", "ChildMessageResult", "SubagentController"]

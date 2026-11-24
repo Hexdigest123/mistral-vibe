@@ -43,6 +43,9 @@ def _handler() -> HostRequestHandler:
         HarnessFilesManager(sources=("user",)),
         builtin_plugin_roots=[],
         org_config=fake_process_services().org_config,
+        worktrees=fake_process_services().worktrees,
+        experiments=fake_process_services().experiments,
+        model_catalog=fake_process_services().model_catalog,
     )
 
 
@@ -262,6 +265,7 @@ async def test_what_an_interrupted_save_leaves_is_not_shown(config_dir: Path) ->
     staging.mkdir()
     (staging / "SKILL.md").write_text("---\nname: triage\ndescription: d\n---\n")
     (skills / "triage" / ".notes.md.0123456789abcdef").write_text("half")
+    (skills / "triage" / ".vibe-0123456789abcdef.tmp").write_text("half")
 
     listed = await _handler().dispatch("skills/local/list", {})
     read = await _read("triage")
@@ -780,6 +784,9 @@ async def test_a_projects_own_config_decides_its_skills(tmp_path: Path) -> None:
         HarnessFilesManager(sources=("user", "project")),
         builtin_plugin_roots=[],
         org_config=fake_process_services().org_config,
+        worktrees=fake_process_services().worktrees,
+        experiments=fake_process_services().experiments,
+        model_catalog=fake_process_services().model_catalog,
     )
 
     listed = await handler.dispatch(
@@ -814,6 +821,9 @@ async def test_the_users_skills_ignore_the_project_the_server_runs_in(
         HarnessFilesManager(sources=("user", "project")),
         builtin_plugin_roots=[],
         org_config=fake_process_services().org_config,
+        worktrees=fake_process_services().worktrees,
+        experiments=fake_process_services().experiments,
+        model_catalog=fake_process_services().model_catalog,
     )
 
     result = await handler.dispatch("skills/local/read", {"name": "code-review"})
@@ -839,6 +849,9 @@ async def test_an_untrusted_projects_config_is_not_read(tmp_path: Path) -> None:
         HarnessFilesManager(sources=("user", "project")),
         builtin_plugin_roots=[],
         org_config=fake_process_services().org_config,
+        worktrees=fake_process_services().worktrees,
+        experiments=fake_process_services().experiments,
+        model_catalog=fake_process_services().model_catalog,
     )
 
     listed = await handler.dispatch("skills/local/list", {"projectRoot": str(project)})

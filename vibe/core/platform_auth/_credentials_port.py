@@ -1,13 +1,20 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import unquote_to_bytes, urlsplit, urlunsplit
 
-type PlatformCredentialKind = Literal["api_key", "oauth_access_token"]
+type PlatformCredentialKind = Literal["api_key", "oauth_access_token", "oidc_id_token"]
+
+# A user token refused again right after a successful refresh. The platform
+# answers the same bare 401 when the client's sign-in is retired (update Vibe)
+# and when the user lost access (sign in again), so the message offers both.
+UNAUTHORIZED_AFTER_REFRESH_MESSAGE = (
+    "Vibe couldn't authenticate you. Update Vibe or sign in again."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +43,9 @@ class PlatformCredentialSnapshot:
 
     ``cache_namespace`` is a stable, non-secret provider identity. ``revision``
     is opaque to consumers, collision-resistant within that namespace, and must
-    change whenever the effective credential changes.
+    change whenever the effective credential changes. ``principal`` is a
+    non-secret key for the account and tenant the credential acts for: stable
+    across token refreshes, so caches key on it instead of on the token.
     """
 
     kind: PlatformCredentialKind
@@ -45,6 +54,7 @@ class PlatformCredentialSnapshot:
     revision: str
     expires_at: datetime | None = None
     source: str | None = None
+    principal: str | None = None
 
     def __post_init__(self) -> None:
         if not self.cache_namespace:
@@ -59,6 +69,16 @@ class PlatformCredentialSnapshot:
             kind=self.kind, cache_namespace=self.cache_namespace, revision=self.revision
         )
 
+    @property
+    def cache_key(self) -> str:
+        """What a credential-keyed cache uses: the principal, else the revision."""
+        return f"{self.cache_namespace}:{self.principal or self.revision}"
+
+    @property
+    def follows_redirects(self) -> bool:
+        """Only API keys may follow a redirect; a user token stays on its origin."""
+        return self.kind == "api_key"
+
 
 @dataclass(frozen=True, slots=True)
 class PlatformCredentialRequired:
@@ -69,6 +89,10 @@ class PlatformCredentialRequired:
         "invalid",
         "reauthentication_required",
         "transient",
+        # A user token was refused again right after a successful refresh.
+        "unauthorized_after_refresh",
+        # The client owns the sign-in but lent none to this connection.
+        "credential_unavailable",
     ]
     observed_revision: str | None = None
 
@@ -88,6 +112,25 @@ class PlatformCredentialProvider(Protocol):
         observed: PlatformCredentialIdentity,
         reason: Literal["http_unauthorized"],
     ) -> PlatformCredentialResult: ...
+
+
+@runtime_checkable
+class CachedPrincipal(Protocol):
+    """What a provider knows without network or refresh, for hot paths."""
+
+    def has_credential(self) -> bool:
+        """Whether a credential is held at all (a key, a stored sign-in)."""
+        ...
+
+    def cached_principal(self) -> str | None:
+        """The principal ``resolve`` would report; ``None`` when not known
+        yet, and the caller then reads and writes no cache.
+        """
+        ...
+
+
+type PlatformCredentialFactory = Callable[[str], PlatformCredentialProvider]
+"""The provider for a Mistral provider's ``api_key_env_var``."""
 
 
 def _normalize_base_url(value: str) -> str:
@@ -126,6 +169,9 @@ def _path_has_ambiguous_segments(raw_path: str | bytes) -> bool:
 
 
 __all__ = [
+    "UNAUTHORIZED_AFTER_REFRESH_MESSAGE",
+    "CachedPrincipal",
+    "PlatformCredentialFactory",
     "PlatformCredentialIdentity",
     "PlatformCredentialKind",
     "PlatformCredentialProvider",

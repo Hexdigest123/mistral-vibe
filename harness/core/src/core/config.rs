@@ -7,6 +7,7 @@ use crate::core::capabilities::PluginContextDefinition;
 use crate::core::features::background_processes;
 use crate::core::features::compaction::CompactionPolicy;
 use crate::core::features::file_system;
+use crate::core::features::instructions;
 use crate::core::features::large_output;
 pub(crate) use crate::core::features::notifications::Settings as NotificationSettings;
 pub(crate) use crate::core::features::output_limit_recovery::Settings as OutputLimitRecovery;
@@ -28,6 +29,17 @@ pub(crate) struct ProvidedToolDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
     pub exposure: ProvidedToolExposure,
+    /// The function name a direct tool has in the model's flat tool list. Absent
+    /// means `name`. It never changes the stable tool ID, so permission rules and
+    /// hooks keep matching when a Runtime renames the direct function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_name: Option<String>,
+}
+
+impl ProvidedToolDefinition {
+    pub(crate) fn direct_function_name(&self) -> &str {
+        self.direct_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -81,6 +93,11 @@ impl ToolGroupDefinition {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TurnSettings {
     pub max_iterations: Option<u32>,
+    /// How many tool calls in a row, counting identical parallel calls one by one, may fail the
+    /// same tool call the same way before Core completes the Turn with `repeated_tool_failure`.
+    /// `None` sets no limit. Omitted when unset, so settings without it serialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_identical_tool_failures: Option<u32>,
     #[serde(default, skip_serializing_if = "OutputLimitRecovery::is_disabled")]
     pub output_limit_recovery: OutputLimitRecovery,
 }
@@ -96,6 +113,15 @@ pub(crate) struct ContextSettings {
     /// model's `model_facts.input_modalities`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_model_input_modalities: Option<Vec<InputModality>>,
+    /// The context window of the model that writes compaction summaries, when
+    /// the host uses a separate model for them. Absent means the agent
+    /// model's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model_window: Option<CompactionModelWindow>,
+    /// The bound on the live instructions, which every compaction carries.
+    /// Absent means the defaults.
+    #[serde(default, skip_serializing_if = "instructions::Settings::is_default")]
+    pub instructions: instructions::Settings,
 }
 
 impl ContextSettings {
@@ -114,11 +140,15 @@ impl ContextSettings {
 
     fn validate(&self) -> Result<(), CoreError> {
         self.model_facts.validate()?;
+        self.instructions.validate()?;
         if let Some(modalities) = &self.compaction_model_input_modalities {
             validate_input_modalities(
                 "settings.context.compaction_model_input_modalities",
                 modalities,
             )?;
+        }
+        if let Some(window) = &self.compaction_model_window {
+            window.validate()?;
         }
         Ok(())
     }
@@ -148,6 +178,29 @@ pub(crate) struct ModelFacts {
     /// The kinds of input the model reads. Text is always one of them.
     pub input_modalities: Vec<InputModality>,
     pub image_cost: ImageCostRule,
+}
+
+/// The window of a separate compaction model: what a summary request may hold.
+/// The compaction threshold stays the agent model's, in `ModelFacts`.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompactionModelWindow {
+    pub context_window: u64,
+    /// The budget of a summary request: the largest threshold the window
+    /// allows.
+    pub summary_budget: u64,
+}
+
+impl CompactionModelWindow {
+    fn validate(&self) -> Result<(), CoreError> {
+        if self.summary_budget == 0 || self.summary_budget >= self.context_window {
+            return Err(CoreError::invalid_configuration(
+                "settings.context.compaction_model_window",
+                "0 < summary_budget < context_window must hold",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A kind of input a model reads.
@@ -304,6 +357,11 @@ pub(crate) struct HarnessSettings {
 #[serde(deny_unknown_fields)]
 pub(crate) struct HarnessConfig {
     pub task_id: String,
+    /// Sets the completion and compaction Action IDs of this Core apart from
+    /// those of an earlier Core of the same task. Omitted, they derive from
+    /// `task_id` alone. A restore supplies the namespace the Core was created with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id_namespace: Option<String>,
     #[serde(default)]
     pub system_instructions: String,
     pub settings: HarnessSettings,
@@ -335,6 +393,12 @@ pub(crate) fn validate_settings(settings: &HarnessSettings) -> Result<(), CoreEr
         return Err(CoreError::invalid_configuration(
             "settings.turn.max_iterations",
             "settings.turn.max_iterations must be greater than zero",
+        ));
+    }
+    if settings.turn.max_identical_tool_failures == Some(0) {
+        return Err(CoreError::invalid_configuration(
+            "settings.turn.max_identical_tool_failures",
+            "settings.turn.max_identical_tool_failures must be greater than zero",
         ));
     }
     settings.turn.output_limit_recovery.validate()?;
@@ -637,6 +701,25 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_model_window_must_leave_room_for_a_summary_budget() {
+        for (context_window, summary_budget) in [(10_000, 0), (10_000, 10_000), (10_000, 12_000)] {
+            let mut config = config();
+            config.settings.context.compaction_model_window = Some(CompactionModelWindow {
+                context_window,
+                summary_budget,
+            });
+
+            assert!(matches!(
+                initial_state(config).unwrap_err(),
+                CoreError::InvalidConfiguration {
+                    field: "settings.context.compaction_model_window",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
     fn compaction_model_input_modalities_are_optional_on_the_wire() {
         let mut config = config();
         let value = serde_json::to_value(&config).unwrap();
@@ -734,6 +817,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
             output_schema: None,
             exposure: ProvidedToolExposure::Direct,
+            direct_name: None,
         };
         let mut duplicate_config = config();
         duplicate_config.capabilities.tool_groups = vec![

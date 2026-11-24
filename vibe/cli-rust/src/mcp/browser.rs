@@ -8,13 +8,15 @@ use super::rows::{self, Row, SourceAction};
 use super::{reconcile_selection, Event};
 use crate::app::App;
 use crate::option_list::Click;
+use crate::search_field::{self, Press};
 use crate::selection::RegionId;
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::MouseEvent;
 
 /// Esc: close the browser.
 pub fn close(app: &mut App) {
     app.mcp.open = false;
     app.mcp.search = crate::search_field::Search::default();
+    app.mcp.tool_search = crate::search_field::Search::default();
     app.mcp.viewing_name = None;
     app.mcp.viewing_kind = None;
 }
@@ -26,6 +28,7 @@ pub fn back(app: &mut App) {
     }
     app.mcp.viewing_name = None;
     app.mcp.viewing_kind = None;
+    app.mcp.tool_search = crate::search_field::Search::default();
     app.mcp.list.reset();
     reconcile_selection(app);
 }
@@ -46,6 +49,7 @@ pub fn select(app: &mut App) {
         _ => return,
     };
     app.mcp.search.focused = false;
+    app.mcp.tool_search = crate::search_field::Search::default();
     app.mcp.viewing_name = Some(row.name);
     app.mcp.viewing_kind = Some(row.kind);
     app.mcp.list.reset();
@@ -61,10 +65,7 @@ pub(super) fn request_action(app: &mut App) {
     let Some(tx) = app.events.clone() else {
         return;
     };
-    app.commit_started();
-    if tx.try_send(Event::ActionRequested.into()).is_err() {
-        app.commit_finished();
-    }
+    let _ = tx.try_send(Event::ActionRequested.into());
 }
 
 /// Start the viewed source's pending action, unless the user left that view meanwhile.
@@ -104,16 +105,14 @@ pub fn navigate(app: &mut App, down: bool) {
 /// action selects it, like Enter, once the list has focus.
 pub fn mouse(app: &mut App, event: MouseEvent) {
     let at = (event.column, event.row);
-    let on_search = app.mcp.viewing_name.is_none() && app.mcp.search.area.contains(at.into());
-    let pressed = event.kind == MouseEventKind::Down(MouseButton::Left);
     let click =
         crate::mouse::option_gesture(app, event, RegionId::BottomApp, |app| &mut app.mcp.list);
-    if on_search && pressed {
+    let shown = super::detail::searchable(&app.mcp);
+    let on_option = app.mcp.list.index_at(at).is_some();
+    let field = super::search::field(app);
+    if search_field::press(field, &event, shown, on_option) == Press::Field {
         super::search::focus(app);
         return;
-    }
-    if pressed && app.mcp.list.index_at(at).is_some() {
-        app.mcp.search.focused = false;
     }
     let Some(Click::Confirm(row)) = click else {
         return;

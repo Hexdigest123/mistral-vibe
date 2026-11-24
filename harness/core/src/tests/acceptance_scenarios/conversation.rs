@@ -3,7 +3,8 @@ use crate::core::Message;
 
 /// *Prepare*: Hosts explicitly declare whether they can import parent conversation.
 /// *Do*: Call spawn through real program execution with valid and invalid contexts.
-/// *Assert*: Unsupported and malformed contexts dispatch no child creation effect.
+/// *Assert*: Unsupported and malformed contexts dispatch no child creation effect, and
+/// the rejected call is committed with its argument error.
 #[test]
 fn conversation_spawn_schema_matches_host_support_and_rejects_invalid_contexts() {
     let valid_contexts = [
@@ -52,7 +53,7 @@ fn conversation_spawn_schema_matches_host_support_and_rejects_invalid_contexts()
             .unwrap();
             let mut runtime = SynchronousRuntime::new(settings);
             let first = runtime.start_turn("parent", "delegate");
-            let mut args = json!({"name":"child", "message":"work"});
+            let mut args = json!({"name":"child", "message":"work", "instructions":"Work."});
             if let Some(value) = context {
                 args["context"] = value.clone();
             }
@@ -74,11 +75,42 @@ fn conversation_spawn_schema_matches_host_support_and_rejects_invalid_contexts()
                     .only_action();
                 assert_eq!(spawn["call"]["arguments"], args);
             } else {
+                let completion = run_typescript_completion(action_id(&first), "spawn", &source);
+                let rejected = runtime.preview_observations(completion.clone())[2].clone();
+                assert_eq!(rejected["type"], "tool_result_committed");
+                // The arguments come back from the program, where numbers are floats.
+                let call = &rejected["call"];
+                assert_eq!(
+                    (&call["type"], &call["name"]),
+                    (&json!("runtime_builtin"), &json!("agents.spawn"))
+                );
+                assert_eq!(
+                    (&call["arguments"]["name"], &call["arguments"]["message"]),
+                    (&args["name"], &args["message"])
+                );
+                let error = &rejected["result"]["error"];
+                assert_eq!(rejected["result"]["type"], "failure");
+                assert_eq!(error["code"], "invalid_arguments");
+                assert_eq!(error["retryable"], false);
+                assert!(
+                    error["message"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("Invalid arguments for tools.agents.spawn")
+                );
+                assert_eq!(
+                    rejected["result"]["content"],
+                    json!([{"type": "text", "text": error["message"]}])
+                );
                 runtime.apply(
-                    run_typescript_completion(action_id(&first), "spawn", &source),
+                    completion,
                     running("parent")
                         .dispatch(llm_call(1))
-                        .observe(tool_execution_started("parent", "spawn"))
+                        .observe(assistant_program_committed(
+                            "parent", &first, "spawn", &source,
+                        ))
+                        .observe(core_tool_execution_started("parent", "spawn"))
+                        .observe(rejected)
                         .observe_tool_execution_finished(
                             "spawn",
                             run_typescript_success(json!("rejected")),
@@ -313,7 +345,7 @@ fn compact(runtime: &mut SynchronousRuntime, summary: &str) {
         idle().observe(json!({
             "type":"context_compacted", "turn_id":null,
             "action_id":action["action_id"], "compaction_id":action["compaction_id"],
-            "attempt":1, "trigger":"manual", "summary":summary, "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+            "attempt":1, "trigger":"manual", "summary":summary, "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         })),
     );
 }
@@ -639,15 +671,84 @@ fn conversation_context_injected_before_a_turn_belongs_to_that_turn() {
     // Assert
     assert_eq!(
         messages(&pending),
-        vec![model_user_text("database for this task: LOCAL-42")]
+        vec![model_context_text("database for this task: LOCAL-42")]
     );
     assert_eq!(
         messages(&runtime.export_conversation(forked(json!(1)))),
         vec![
-            model_user_text("database for this task: LOCAL-42"),
+            model_context_text("database for this task: LOCAL-42"),
             model_user_text("delegate the database check"),
         ]
     );
+}
+
+/// *Prepare*: An idle parent given a context message, then an agent-result notification.
+/// *Do*: Start a Turn.
+/// *Assert*: The notification comes first and the context message stays right before the
+/// user message it came with, in the model context and in the model input the Runtime holds.
+#[test]
+fn context_waiting_for_a_turn_stays_next_to_its_user_message_after_notifications() {
+    // Prepare
+    let mut runtime = SynchronousRuntime::new(config());
+    let first = runtime.start_turn("old", "read the archive");
+    runtime.finish_turn_with_text("old", &first, "archive requested");
+    runtime.apply(
+        json!({
+            "type": "context_message",
+            "content": [{"type": "text", "text": "database for this task: LOCAL-42"}],
+        }),
+        idle(),
+    );
+    let notification = json!({
+        "id": "archive-result",
+        "source": {
+            "type": "agent_result",
+            "sender_agent_path": "/root/research",
+            "termination": {"outcome": "completed", "output": {"archive": "checked"}},
+        },
+        "level": "info",
+        "message": "Archive research completed",
+    });
+    runtime.apply(
+        json!({"type": "notification", "notification": notification}),
+        idle().observe(json!({"type": "notification_received", "notification": notification})),
+    );
+
+    // Do
+    let action = runtime
+        .apply(
+            user_message("current", "check the database", "queue"),
+            running("current")
+                .dispatch(llm_call(0))
+                .observe(turn_started("current", "check the database"))
+                .observe(notification_delivered("current", notification)),
+        )
+        .only_action();
+
+    // Assert
+    let current_turn = vec![
+        json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Agent result from /root/research:\n"},
+                {"type": "text", "text": "Status: completed\nOutput: {\"archive\":\"checked\"}"},
+            ],
+        }),
+        model_context_text("database for this task: LOCAL-42"),
+        model_user_text("check the database"),
+    ];
+    assert_eq!(
+        messages(&runtime.export_conversation(forked(json!(1)))),
+        current_turn
+    );
+    // Core moved a message it had already added, so it resends every message.
+    let mut model_input = vec![
+        model_system(),
+        model_user_text("read the archive"),
+        model_assistant_text("archive requested"),
+    ];
+    model_input.extend(current_turn);
+    runtime.assert_last_model_message_update(&action, "replace", &model_input);
 }
 
 /// *Prepare*: A parent whose Core injects an agent-result notification before a Turn that

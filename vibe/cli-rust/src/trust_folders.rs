@@ -1,6 +1,8 @@
 //! Workspace-trust gate shown before the session opens.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::UiInstant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
@@ -30,7 +32,11 @@ pub struct TrustFolders {
     /// Answers the handshake task waits on before it opens the session.
     pub tx: Option<mpsc::Sender<String>>,
     /// Decisions are ignored until then; `None` accepts them at once.
-    pub accepts_at: Option<Instant>,
+    pub accepts_at: Option<UiInstant>,
+    /// The mid-session request the gate answers; `None` at startup.
+    pub pending: Option<crate::trust_gate::Pending>,
+    /// The decision a mid-session gate took, for `trust_gate` to act on.
+    pub answer: Option<&'static str>,
 }
 
 impl TrustFolders {
@@ -80,7 +86,7 @@ pub fn open(app: &mut App, details: WorkspaceTrustDetails) {
     app.trust.scroll = 0;
     app.trust.scroll_max = 0;
     let grace = crate::utils::timeout_or_env("VIBE_TEST_TRUST_GRACE_MS", GRACE_PERIOD);
-    app.trust.accepts_at = Some(Instant::now() + grace);
+    app.trust.accepts_at = Some(crate::clock::now() + grace);
     app.trust.open = true;
 }
 
@@ -95,7 +101,7 @@ fn build_options(trust: &TrustFolders) -> Vec<(&'static str, String)> {
 }
 
 /// Ctrl+C / Ctrl+Q, the only keys the pre-session window answers.
-fn is_quit(key: KeyEvent) -> bool {
+pub(crate) fn is_quit(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SHIFT)
         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
@@ -196,19 +202,30 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
 
 /// Answer the handshake and close the gate, so the session can open.
 fn decide(app: &mut App, option: usize) {
-    if app.trust.accepts_at.is_some_and(|at| Instant::now() < at) {
+    if app
+        .trust
+        .accepts_at
+        .is_some_and(|at| crate::clock::now() < at)
+    {
         return;
     }
-    let Some((decision, _)) = app.trust.options.get(option) else {
+    let Some(&(decision, _)) = app.trust.options.get(option) else {
         return;
     };
-    if let Some(tx) = app.trust.tx.take() {
+    if app.trust.pending.is_some() {
+        app.trust.answer = Some(decision);
+    } else if let Some(tx) = app.trust.tx.take() {
         // Nothing is left to open the session, so fail loudly rather than hang.
-        if tx.try_send((*decision).to_owned()).is_err() {
+        if tx.try_send(decision.to_owned()).is_err() {
             app.session.startup_error = Some("trust gate lost the handshake".to_owned());
             app.set_status(Status::Failed);
         }
     }
+    close(app);
+}
+
+/// Close the gate and drop what it showed.
+pub fn close(app: &mut App) {
     app.selection = Default::default();
     app.trust.open = false;
     app.trust.details = None;

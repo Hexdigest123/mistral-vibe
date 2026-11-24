@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import tomllib
 
@@ -13,13 +12,17 @@ from vibe.app_server._effect_output_cap import (
     TRUNCATION_MARKER,
 )
 from vibe.app_server._history_projection import project_message_history
-from vibe.app_server._projection import project_config_view, project_skill_summaries
+from vibe.app_server._projection import (
+    project_config_view,
+    project_installed_skill_summaries,
+    project_skill_summaries,
+)
 from vibe.app_server.models import (
     AgentStatsSnapshot,
     CompletedEffectState,
     PublicEffectEntry,
 )
-from vibe.core.skills.models import SkillInfo, SkillScope, SkillSource
+from vibe.core.skills.models import InstalledSkill, SkillInfo, SkillScope, SkillSource
 from vibe.core.types import FunctionCall, LLMMessage, Role, ToolCall
 
 
@@ -53,11 +56,48 @@ def test_persisted_huge_tool_output_is_capped() -> None:
     )
 
 
-def test_config_view_reports_the_configured_default_agent() -> None:
-    config = project_config_view(build_test_vibe_config(default_agent="ask"))
+def test_config_view_reports_the_configured_default_agent_and_policy() -> None:
+    config = project_config_view(
+        build_test_vibe_config(default_agent="reviewer", default_approval_policy="ask")
+    )
 
-    assert config.default_agent == "ask"
-    assert config.model_dump(mode="json", by_alias=True)["defaultAgent"] == "ask"
+    wire = config.model_dump(mode="json", by_alias=True)
+    assert (config.default_agent, config.default_approval_policy) == ("reviewer", "ask")
+    assert (wire["defaultAgent"], wire["defaultApprovalPolicy"]) == ("reviewer", "ask")
+
+
+@pytest.mark.parametrize(
+    ("api_base", "telemetry", "enabled"),
+    [
+        ("https://api.mistral.ai/v1", True, True),
+        ("https://api.customer.mistral.ai/v1", True, True),
+        ("https://api.asml.example/v1", True, False),
+        ("https://api.mistral.ai/v1", False, False),
+    ],
+)
+def test_config_view_gates_the_rust_crash_reporter(
+    api_base: str, telemetry: bool, enabled: bool
+) -> None:
+    from vibe.core.config import ProviderConfig
+    from vibe.core.types import Backend
+
+    config = project_config_view(
+        build_test_vibe_config(
+            enable_telemetry=telemetry,
+            providers=[
+                ProviderConfig(
+                    name="mistral",
+                    api_base=api_base,
+                    api_key_env_var="MISTRAL_API_KEY",
+                    backend=Backend.MISTRAL,
+                )
+            ],
+        )
+    )
+
+    payload = config.model_dump(mode="json", by_alias=True)
+    assert payload["crashReportsEnabled"] is enabled
+    assert "enableTelemetry" not in payload
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -70,6 +110,62 @@ def test_config_view_projects_cursor_blink(enabled: bool) -> None:
     assert type(config).model_validate(legacy_payload).cursor_blink is True
 
 
+@pytest.mark.parametrize("disabled", [True, False])
+def test_config_view_projects_disable_selection_animation(disabled: bool) -> None:
+    config = project_config_view(
+        build_test_vibe_config(disable_selection_animation=disabled)
+    )
+
+    payload = config.model_dump(mode="json", by_alias=True)
+    assert payload["disableSelectionAnimation"] is disabled
+    del payload["disableSelectionAnimation"]
+    assert type(config).model_validate(payload).disable_selection_animation is False
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_vim_keybindings(enabled: bool) -> None:
+    config = project_config_view(build_test_vibe_config(vim_keybindings=enabled))
+
+    assert config.model_dump(mode="json", by_alias=True)["vimKeybindings"] is enabled
+    legacy_payload = config.model_dump(mode="json", by_alias=True)
+    del legacy_payload["vimKeybindings"]
+    assert type(config).model_validate(legacy_payload).vim_keybindings is False
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_show_dangerous_directory_warning(enabled: bool) -> None:
+    config = project_config_view(
+        build_test_vibe_config(show_dangerous_directory_warning=enabled)
+    )
+
+    payload = config.model_dump(mode="json", by_alias=True)
+    assert payload["showDangerousDirectoryWarning"] is enabled
+    del payload["showDangerousDirectoryWarning"]
+    assert type(config).model_validate(payload).show_dangerous_directory_warning
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_collapse_turn_details(enabled: bool) -> None:
+    config = project_config_view(build_test_vibe_config(collapse_turn_details=enabled))
+
+    payload = config.model_dump(mode="json", by_alias=True)
+    assert payload["collapseTurnDetails"] is enabled
+    del payload["collapseTurnDetails"]
+    assert type(config).model_validate(payload).collapse_turn_details is False
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_enable_sticky_prompt(enabled: bool) -> None:
+    config = project_config_view(build_test_vibe_config(enable_sticky_prompt=enabled))
+
+    assert (
+        config.model_dump(mode="json", by_alias=True)["enableStickyPrompt"] is enabled
+    )
+    legacy_payload = config.model_dump(mode="json", by_alias=True)
+    del legacy_payload["enableStickyPrompt"]
+    assert type(config).model_validate(legacy_payload).enable_sticky_prompt is True
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 def test_config_view_projects_enable_mouse_capture(enabled: bool) -> None:
     config = project_config_view(build_test_vibe_config(enable_mouse_capture=enabled))
@@ -78,6 +174,18 @@ def test_config_view_projects_enable_mouse_capture(enabled: bool) -> None:
     assert payload["enableMouseCapture"] is enabled
     del payload["enableMouseCapture"]
     assert type(config).model_validate(payload).enable_mouse_capture is True
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_enable_file_autocomplete(enabled: bool) -> None:
+    config = project_config_view(
+        build_test_vibe_config(enable_file_autocomplete=enabled)
+    )
+
+    payload = config.model_dump(mode="json", by_alias=True)
+    assert payload["enableFileAutocomplete"] is enabled
+    del payload["enableFileAutocomplete"]
+    assert type(config).model_validate(payload).enable_file_autocomplete is True
 
 
 def test_config_view_projects_the_tls_trust_policy() -> None:
@@ -110,6 +218,66 @@ def test_skill_summaries_carry_the_origin_the_slash_menu_tags(
     payload = summary.model_dump(mode="json", by_alias=True)
     assert (payload["source"], payload["scope"]) == (source.value, scope.value)
     assert payload["userInvocable"] is True
+
+
+@pytest.mark.parametrize(
+    ("source", "enabled", "disabled", "own", "expected"),
+    [
+        (SkillSource.LOCAL, [], [], None, (True, False)),
+        (SkillSource.PLUGIN, [], ["deploy"], None, (True, True)),
+        (SkillSource.LOCAL, ["other"], [], None, (False, True)),
+        (SkillSource.LOCAL, ["deploy"], [], None, (True, True)),
+        (SkillSource.LOCAL, [], ["dep*"], None, (False, True)),
+        (SkillSource.LOCAL, [], ["deploy"], ["deploy"], (False, False)),
+        (SkillSource.LOCAL, [], ["deploy"], [], (False, True)),
+    ],
+    ids=[
+        "plain",
+        "plugin",
+        "outside-the-allowlist",
+        "inside-the-allowlist",
+        "disabled-by-a-pattern",
+        "disabled-by-name-in-the-writable-layer",
+        "disabled-by-name-in-another-layer",
+    ],
+)
+def test_installed_rows_are_locked_where_the_browser_cannot_switch_them(
+    source: SkillSource,
+    enabled: list[str],
+    disabled: list[str],
+    own: list[str] | None,
+    expected: tuple[bool, bool],
+) -> None:
+    skill = SkillInfo(
+        name="deploy",
+        description="Ship it.",
+        prompt="",
+        source=source,
+        scope=SkillScope.GLOBAL,
+    )
+    config = build_test_vibe_config(enabled_skills=enabled, disabled_skills=disabled)
+
+    [row] = project_installed_skill_summaries(
+        [InstalledSkill(info=skill, active=True)], config, own
+    )
+
+    assert (row.enabled, row.locked) == expected
+
+
+def test_a_skill_picked_for_the_session_offers_no_toggle() -> None:
+    skill = SkillInfo(
+        name="deploy",
+        description="Ship it.",
+        prompt="",
+        source=SkillSource.REGISTRY,
+        scope=SkillScope.SESSION,
+    )
+
+    [row] = project_installed_skill_summaries(
+        [InstalledSkill(info=skill, active=True)], build_test_vibe_config()
+    )
+
+    assert (row.enabled, row.locked) == (True, True)
 
 
 def test_snapshot_session_cost_discounts_cached_tokens() -> None:
@@ -171,26 +339,25 @@ def _mistral_model(alias: str) -> dict[str, str]:
 async def test_config_view_groups_models_by_their_highest_priority_source(
     config_dir: Path,
 ) -> None:
-    """Admin, GrowthBook, catalog (in catalog order), session, then local models.
+    """Admin, catalog (in catalog order), session, then local models.
 
     A model several layers define is one row, in the group of its highest
     defining layer. A setting without ``name`` and ``provider`` defines
-    nothing: a user or admin tweak never moves a catalog or GrowthBook model,
+    nothing: a user or admin tweak never moves a catalog model,
     and the thinking level a pick writes for the session never moves the
-    picked model.
+    picked model. The built-in default model is not listed: the catalog
+    provides models, so it is not available anymore (VIBE-5548).
     """
     from vibe.core.config import build_default_orchestrator
     from vibe.core.config.layers.admin import AdminConfigLayer
-    from vibe.core.config.layers.growthbook import GrowthbookLayer
     from vibe.core.config.layers.model_catalog import apply_model_catalog
-    from vibe.core.experiments.active import ExperimentName
     from vibe.core.model_catalog import parse_model_catalog_response
 
     orchestrator = await build_default_orchestrator({
         "models": [
             _mistral_model("session-model"),
             # What a /model pick writes for the session.
-            {"alias": "mistral-medium-3.5", "thinking": "off"},
+            {"alias": "mistral-medium-latest", "thinking": "off"},
         ]
     })
     admin = orchestrator.get_layer(AdminConfigLayer.NAME)
@@ -200,13 +367,6 @@ async def test_config_view_groups_models_by_their_highest_priority_source(
             _mistral_model("admin-model"),
             {"alias": "zai-glm-5-3", "temperature": 0.1},
         ]
-    })
-    growthbook = orchestrator.get_layer(GrowthbookLayer.NAME)
-    assert isinstance(growthbook, GrowthbookLayer)
-    growthbook.set_variants({
-        ExperimentName.CLI_EXTRA_MODELS.value: json.dumps([
-            _mistral_model("growthbook-model")
-        ])
     })
     catalog = parse_model_catalog_response({
         "models": [
@@ -223,12 +383,10 @@ async def test_config_view_groups_models_by_their_highest_priority_source(
     config_file = config_dir / "config.toml"
     user_config = tomllib.loads(config_file.read_text(encoding="utf-8"))
     user_config.update(
-        # Unpinned: the fixture's pin names a model this list replaces.
-        active_model="",
+        active_model="local-model",
         models=[
             _mistral_model("local-model"),
             {"name": "zai-glm-5-3", "temperature": 0.9},
-            {"alias": "growthbook-model", "temperature": 0.5},
         ],
     )
     config_file.write_text(tomli_w.dumps(user_config), encoding="utf-8")
@@ -239,17 +397,17 @@ async def test_config_view_groups_models_by_their_highest_priority_source(
 
     assert [(model.alias, model.source) for model in view.models] == [
         ("admin-model", "admin"),
-        ("growthbook-model", "growthbook"),
         ("zai-glm-5-3", "catalog"),
         ("mistral-large-3", "catalog"),
         ("mistral-medium-latest", "catalog"),
         ("session-model", "project"),
         ("local-model", "local"),
-        ("mistral-medium-3.5", "local"),
     ]
+    # The built-in default is not available while the catalog lists models.
+    assert "mistral-medium-3.5" not in config.models
     # Display only: the settings still apply.
     assert config.models["zai-glm-5-3"].temperature == 0.1
-    assert config.models["mistral-medium-3.5"].thinking == "off"
+    assert config.models["mistral-medium-latest"].thinking == "off"
     assert view.active_model.source == "local"
     serialized = view.model_dump(mode="json", by_alias=True)
     assert serialized["models"][0]["source"] == "admin"
@@ -272,6 +430,7 @@ async def test_config_view_lists_a_host_supplied_user_config_as_local() -> None:
 
     assert [(model.alias, model.source) for model in view.models] == [
         ("host-model", "local"),
+        ("mistral-large-4-0", "local"),
         ("mistral-medium-3.5", "local"),
     ]
 
@@ -430,6 +589,31 @@ def test_config_view_reports_file_image_delivery_per_model(active_model: str) ->
     ]
 
 
+def test_config_view_reports_the_models_that_require_an_upgrade() -> None:
+    from vibe.core.config import ModelConfig
+    from vibe.core.config.models import ModelRequirement
+
+    config = build_test_vibe_config(
+        models=[
+            ModelConfig(name="free-model", provider="mistral", alias="free"),
+            ModelConfig(
+                name="paid-model",
+                provider="mistral",
+                alias="paid",
+                requires=ModelRequirement(kind="higher_plan"),
+            ),
+        ],
+        active_model="free",
+    )
+
+    serialized = project_config_view(config).model_dump(mode="json", by_alias=True)
+
+    assert {model["alias"]: model["requires"] for model in serialized["models"]} == {
+        "free": None,
+        "paid": {"kind": "higher_plan"},
+    }
+
+
 def test_config_view_does_not_advertise_file_delivery_without_runtime_support() -> None:
     from vibe.core.config import ModelConfig
 
@@ -485,7 +669,7 @@ def test_config_view_image_support_widens_for_a_backend_that_can_fall_back() -> 
 
 
 @pytest.mark.asyncio
-async def test_apply_cached_experiment_variants_sets_routed_model(
+async def test_apply_cached_experiment_variants_sets_the_cached_variant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # End-to-end for the warm-cache startup path.
@@ -495,20 +679,20 @@ async def test_apply_cached_experiment_variants_sets_routed_model(
     from vibe.core.experiments.active import ExperimentName
     from vibe.core.experiments.models import EvalResponse
 
-    monkeypatch.setattr(cache, "_cache_key", lambda _config: "user-abc")
+    monkeypatch.setattr(
+        cache, "_cache_key", lambda _config, _credentials=None: "user-abc"
+    )
     orchestrator = await build_default_orchestrator()
-    routing = ExperimentName.CLI_MODEL_ROUTING.value
+    behavior = ExperimentName.SYSTEM_PROMPT_BEHAVIOR.value
     response = EvalResponse.model_validate({
-        "features": {
-            routing: {"rules": [{"force": '{"active_model": "magistral-medium"}'}]}
-        }
+        "features": {behavior: {"rules": [{"force": "Cached behavior."}]}}
     })
     cache.store_cached_eval_response(orchestrator.config, response)
-    assert not orchestrator.config.routed_default_model
+    assert not orchestrator.config.system_prompt_behavior
 
     await _apply_cached_experiment_variants(orchestrator)
 
-    assert orchestrator.config.routed_default_model == "magistral-medium"
+    assert orchestrator.config.system_prompt_behavior == "Cached behavior."
 
 
 @pytest.mark.asyncio
@@ -519,12 +703,14 @@ async def test_apply_cached_experiment_variants_noop_on_cold_cache(
     from vibe.core.config import build_default_orchestrator
     from vibe.core.experiments import cache
 
-    monkeypatch.setattr(cache, "_cache_key", lambda _config: "user-abc")
+    monkeypatch.setattr(
+        cache, "_cache_key", lambda _config, _credentials=None: "user-abc"
+    )
     orchestrator = await build_default_orchestrator()
 
     await _apply_cached_experiment_variants(orchestrator)
 
-    assert not orchestrator.config.routed_default_model
+    assert not orchestrator.config.system_prompt_behavior
 
 
 @pytest.mark.asyncio
@@ -550,7 +736,7 @@ async def test_a_cached_system_prompt_variant_is_not_applied_when_experiments_ar
 
     monkeypatch.setattr(
         "vibe.core.telemetry.send.mistral_credential_cache_key",
-        lambda _config: "user-abc",
+        lambda _config, _credentials=None: "user-abc",
     )
     interactive = await build_default_orchestrator({"enable_telemetry": True})
     default_prompt = interactive.config.system_prompt_id
@@ -571,3 +757,17 @@ async def test_a_cached_system_prompt_variant_is_not_applied_when_experiments_ar
     await _apply_cached_experiment_variants(evaluation)
 
     assert evaluation.config.system_prompt_id == default_prompt
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_experimental_enable_storage_usage(enabled: bool) -> None:
+    config = project_config_view(
+        build_test_vibe_config(experimental_enable_storage_usage=enabled)
+    )
+
+    payload = config.model_dump(mode="json", by_alias=True)
+    assert payload["experimentalEnableStorageUsage"] is enabled
+    del payload["experimentalEnableStorageUsage"]
+    assert (
+        type(config).model_validate(payload).experimental_enable_storage_usage is False
+    )

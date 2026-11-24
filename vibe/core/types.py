@@ -17,11 +17,14 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    ValidationError,
     model_validator,
 )
 
 from vibe.core.experiments.models import EvalResponse
-from vibe.core.session.artifacts import SessionArtifact
+from vibe.core.session.artifacts import SessionArtifact, WorktreeArtifact
+from vibe.core.skills.models import ManifestEntry
+from vibe.observability.logging import logger
 from vibe.user_content import UserDisplayContent, UserResource
 from vibe.utils.tool_presentation import ToolCallPresentation, ToolResultPresentation
 
@@ -63,6 +66,41 @@ class WorktreeContext(BaseModel):
     created_at: int
 
 
+# A "cloud" id names a cloud project the starter did not resolve to a local one (the
+# flag was off, say): readers must still resolve it through a local project's backing.
+# "none" (no id) stamps a projectless session, which runs in a scratch folder.
+class SessionProject(BaseModel):
+    # A field a newer version adds must not invalidate the whole meta.json.
+    model_config = ConfigDict(extra="ignore")
+
+    kind: Literal["local", "cloud", "none"]
+    id: str | None = None
+
+
+class OwedReply(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    to_session_id: str
+    turn_id: str
+    hops: int = 1
+    # Saved as soon as the turn ends, so a send retried later, or after a
+    # restart, still reports that turn and not what the session did since.
+    text: str | None = None
+
+
+def _readable_skill_pins(raw: Any) -> Any:
+    """An unreadable pick is dropped, so it never makes the session unreadable."""
+    if not isinstance(raw, list):
+        return raw
+    pins: list[ManifestEntry] = []
+    for item in raw:
+        try:
+            pins.append(ManifestEntry.model_validate(item))
+        except ValidationError:
+            logger.warning("Dropping an unreadable session skill pick: %r", item)
+    return pins
+
+
 class SessionMetadata(BaseModel):
     session_id: str
     parent_session_id: str | None = None
@@ -102,11 +140,36 @@ class SessionMetadata(BaseModel):
     # (the resolved alias) and ``model_name`` (the provider model name) before
     # their first user turn; older snapshots remain valid.
     config: dict[str, JsonValue] | None = None
+    # How the app server last drove this session's local runtime: through the
+    # Session API or by calling the runtime directly. Fixed when the session
+    # opens, so a resume after the switch changed records the new path. ``None``
+    # for sessions written before this field existed.
+    runtime_path: Literal["session_api", "direct"] | None = None
+    # The runtime that owns this session, fixed at creation. ``None`` for older
+    # sessions, which are local. Opens read it with ``_session_runtime_owner``.
+    runtime: Literal["local", "target"] | None = None
     import_provenance: dict[str, JsonValue] | None = None
     created_worktree: WorktreeContext | None = None
+    # The project the session was started in, written once; None for unstamped sessions.
+    project: SessionProject | None = None
     # Durable external work products (PRs/MRs) observed during this session.
     # Absent from sessions written before this field existed; defaults to [].
     artifacts: list[SessionArtifact] = Field(default_factory=list)
+    worktrees: list[WorktreeArtifact] = Field(default_factory=list)
+    owed_replies: list[OwedReply] = Field(default_factory=list)
+    # Notes for the model a change made while no process held the session,
+    # such as a move to another directory; its next turn sends and clears them.
+    pending_context_notes: list[str] = Field(default_factory=list)
+    # The git repository and the checkout (main or linked worktree) the
+    # session's folder belongs to, recorded when the folder is set so a session
+    # still groups and reads by them once the folder is gone.
+    repository_root: str | None = None
+    checkout_root: str | None = None
+    # Registry skills picked for this session only (``skills/import`` with scope
+    # ``session``); reopening the session restores them.
+    skill_pins: Annotated[
+        list[ManifestEntry], BeforeValidator(_readable_skill_pins)
+    ] = Field(default_factory=list)
 
 
 class FunctionCall(BaseModel):

@@ -52,12 +52,14 @@
         "activeModelPinned": false,
         "awaitingExperimentModel": false,
         "defaultModelAlias": "mistral-medium-3.5",
-        "defaultAgent": "accept-edits",
+        "defaultAgent": "default",
+        "defaultApprovalPolicy": "accept-edits",
         "theme": "ansi-dark",
         "logLevel": null,
         "disableWelcomeBannerAnimation": true,
-        "showGreeting": true,
+        "cursorBlink": false,
         "autocopyToClipboard": true,
+        "enableFileAutocomplete": true,
         "fileWatcherForAutocomplete": false,
         "askConfirmationOnExit": true,
         "voiceModeEnabled": true,
@@ -68,6 +70,7 @@
         "enableUpdateChecks": true,
         "enableNotifications": true,
         "experimentalEnableTabStatus": true,
+        "enablePrMonitoring": true,
         "vibeCodeEnabled": true,
         "models": [
           {
@@ -148,11 +151,16 @@
           ],
           "model": "mistral-medium-3.5",
           "agent": {
+            "name": "default",
+            "displayName": "Default",
+            "description": "Default agent",
+            "agentType": "agent"
+          },
+          "approvalPolicy": {
             "name": "accept-edits",
             "displayName": "Accept Edits",
             "description": "Auto-approves file edits only",
-            "safety": "destructive",
-            "agentType": "agent"
+            "safety": "destructive"
           },
           "tokenUsage": {
             "inputTokens": 0,
@@ -178,7 +186,8 @@
           "status": {"type": "idle"},
           "createdAt": 1787821243000,
           "updatedAt": 1787821245000,
-          "cwd": "/workspace"
+          "cwd": "/workspace",
+          "repositoryRoot": "/workspace"
         },
         {
           "id": "00000000-0000-4000-8000-000000000001",
@@ -196,6 +205,10 @@
       "previousCursor": null
     },
     "session/delete": {},
+    "projects/list": {"projects": []},
+    "session/pin": {"pinnedAt": 1787821246000},
+    "session/archive": {"archivedAt": 1787821246000},
+    "session/markAsSeen": {},
     "session/read": {
       "lastEventId": 1,
       "state": {
@@ -278,12 +291,14 @@
           "activeModelPinned": false,
           "awaitingExperimentModel": false,
           "defaultModelAlias": "mistral-medium-3.5",
-          "defaultAgent": "accept-edits",
+          "defaultAgent": "default",
+          "defaultApprovalPolicy": "accept-edits",
           "theme": "ansi-dark",
           "logLevel": null,
           "disableWelcomeBannerAnimation": true,
-          "showGreeting": true,
+          "cursorBlink": false,
           "autocopyToClipboard": true,
+          "enableFileAutocomplete": true,
           "fileWatcherForAutocomplete": false,
           "askConfirmationOnExit": true,
           "voiceModeEnabled": true,
@@ -294,6 +309,7 @@
           "enableUpdateChecks": true,
           "enableNotifications": true,
           "experimentalEnableTabStatus": true,
+          "enablePrMonitoring": true,
           "vibeCodeEnabled": true,
           "models": [
             {
@@ -347,47 +363,55 @@
           "validationWarnings": []
         },
         "activeAgent": {
-          "name": "accept-edits",
-          "displayName": "Accept Edits",
-          "description": "Auto-approves file edits only",
-          "safety": "destructive",
+          "name": "default",
+          "displayName": "Default",
+          "description": "Default agent",
           "agentType": "agent"
         },
         "agents": [
           {
-            "name": "ask",
-            "displayName": "Ask",
-            "description": "Requires approval for tool executions",
-            "safety": "neutral",
-            "agentType": "agent"
-          },
-          {
-            "name": "accept-edits",
-            "displayName": "Accept Edits",
-            "description": "Auto-approves file edits only",
-            "safety": "destructive",
-            "agentType": "agent"
-          },
-          {
-            "name": "smart-approve",
-            "displayName": "Smart Approve",
-            "description": "Classifies each tool call and auto-runs the safe ones, prompting only for risky ones",
-            "safety": "smart",
-            "agentType": "agent"
-          },
-          {
-            "name": "auto-approve",
-            "displayName": "Auto Approve",
-            "description": "Auto-approves all tool executions",
-            "safety": "yolo",
+            "name": "default",
+            "displayName": "Default",
+            "description": "Default agent",
             "agentType": "agent"
           },
           {
             "name": "explore",
             "displayName": "Explore",
             "description": "Read-only subagent for codebase exploration",
-            "safety": "safe",
             "agentType": "subagent"
+          }
+        ],
+        "activeApprovalPolicy": {
+          "name": "accept-edits",
+          "displayName": "Accept Edits",
+          "description": "Auto-approves file edits only",
+          "safety": "destructive"
+        },
+        "approvalPolicies": [
+          {
+            "name": "ask",
+            "displayName": "Ask",
+            "description": "Requires approval for tool executions",
+            "safety": "neutral"
+          },
+          {
+            "name": "accept-edits",
+            "displayName": "Accept Edits",
+            "description": "Auto-approves file edits only",
+            "safety": "destructive"
+          },
+          {
+            "name": "smart-approve",
+            "displayName": "Smart Approve",
+            "description": "Classifies each tool call and auto-runs the safe ones, prompting only for risky ones",
+            "safety": "smart"
+          },
+          {
+            "name": "auto-approve",
+            "displayName": "Auto Approve",
+            "description": "Auto-approves all tool executions",
+            "safety": "yolo"
           }
         ],
         "skills": [],
@@ -475,12 +499,7 @@
         "status": "unavailable",
         "plan": null,
         "planOffer": null,
-        "rateLimitAction": null,
-        "teleportEligible": false,
-        "teleportAction": {
-          "kind": "upgrade_to_pro",
-          "url": "https://chat.mistral.ai/code/extensions?focus=key"
-        }
+        "rateLimitAction": null
       }
     },
     "identity/read": {
@@ -1105,7 +1124,7 @@
         {
           "name": "experimental_enable_registry_skills",
           "kind": "bool",
-          "description": "Experimental: pull workspace skills from the Mistral AI Registry (api.mistral.ai) and make them available alongside local skills. Requires a Mistral provider and API key. Local skills take precedence on name collision.",
+          "description": "Experimental: pull shared workspace skills from Mistral (api.mistral.ai) and make them available alongside local skills. Requires a Mistral provider and API key. On a name collision the project's skills win over global ones, skill_paths included, and within a scope a local skill wins over a shared one. Builtin skills are named vibe:<name>, so they never collide.",
           "value": false,
           "path": "/experimental_enable_registry_skills",
           "popular": false,
@@ -1279,12 +1298,12 @@
           ]
         },
         {
-          "name": "show_greeting",
+          "name": "autocopy_to_clipboard",
           "kind": "bool",
-          "description": "Show greeting at startup (Mistral providers only, once per 24h).",
+          "description": "",
           "value": true,
-          "path": "/show_greeting",
-          "popular": false,
+          "path": "/autocopy_to_clipboard",
+          "popular": true,
           "enumChoices": [],
           "valueLabels": {},
           "layerValues": [
@@ -1295,12 +1314,12 @@
           ]
         },
         {
-          "name": "autocopy_to_clipboard",
+          "name": "enable_file_autocomplete",
           "kind": "bool",
-          "description": "",
+          "description": "Offer @ file mentions with repository file completion. Disable to skip building the file index and watching the filesystem for it.",
           "value": true,
-          "path": "/autocopy_to_clipboard",
-          "popular": true,
+          "path": "/enable_file_autocomplete",
+          "popular": false,
           "enumChoices": [],
           "valueLabels": {},
           "layerValues": [
@@ -1443,22 +1462,6 @@
             {
               "layer": "default",
               "value": "cli"
-            }
-          ]
-        },
-        {
-          "name": "compaction_prompt_id",
-          "kind": "str",
-          "description": "",
-          "value": "compact",
-          "path": "/compaction_prompt_id",
-          "popular": false,
-          "enumChoices": [],
-          "valueLabels": {},
-          "layerValues": [
-            {
-              "layer": "default",
-              "value": "compact"
             }
           ]
         },
@@ -1794,12 +1797,14 @@
           "activeModelPinned": false,
           "awaitingExperimentModel": false,
           "defaultModelAlias": "mistral-medium-3.5",
-          "defaultAgent": "accept-edits",
+          "defaultAgent": "default",
+          "defaultApprovalPolicy": "accept-edits",
           "theme": "gruvbox",
           "logLevel": null,
           "disableWelcomeBannerAnimation": true,
-          "showGreeting": true,
+          "cursorBlink": false,
           "autocopyToClipboard": true,
+          "enableFileAutocomplete": true,
           "fileWatcherForAutocomplete": false,
           "askConfirmationOnExit": true,
           "voiceModeEnabled": true,
@@ -1810,6 +1815,7 @@
           "enableUpdateChecks": true,
           "enableNotifications": true,
           "experimentalEnableTabStatus": true,
+          "enablePrMonitoring": true,
           "vibeCodeEnabled": true,
           "models": [
             {
@@ -1863,47 +1869,55 @@
           "validationWarnings": []
         },
         "activeAgent": {
-          "name": "accept-edits",
-          "displayName": "Accept Edits",
-          "description": "Auto-approves file edits only",
-          "safety": "destructive",
+          "name": "default",
+          "displayName": "Default",
+          "description": "Default agent",
           "agentType": "agent"
         },
         "agents": [
           {
-            "name": "ask",
-            "displayName": "Ask",
-            "description": "Requires approval for tool executions",
-            "safety": "neutral",
-            "agentType": "agent"
-          },
-          {
-            "name": "accept-edits",
-            "displayName": "Accept Edits",
-            "description": "Auto-approves file edits only",
-            "safety": "destructive",
-            "agentType": "agent"
-          },
-          {
-            "name": "smart-approve",
-            "displayName": "Smart Approve",
-            "description": "Classifies each tool call and auto-runs the safe ones, prompting only for risky ones",
-            "safety": "smart",
-            "agentType": "agent"
-          },
-          {
-            "name": "auto-approve",
-            "displayName": "Auto Approve",
-            "description": "Auto-approves all tool executions",
-            "safety": "yolo",
+            "name": "default",
+            "displayName": "Default",
+            "description": "Default agent",
             "agentType": "agent"
           },
           {
             "name": "explore",
             "displayName": "Explore",
             "description": "Read-only subagent for codebase exploration",
-            "safety": "safe",
             "agentType": "subagent"
+          }
+        ],
+        "activeApprovalPolicy": {
+          "name": "accept-edits",
+          "displayName": "Accept Edits",
+          "description": "Auto-approves file edits only",
+          "safety": "destructive"
+        },
+        "approvalPolicies": [
+          {
+            "name": "ask",
+            "displayName": "Ask",
+            "description": "Requires approval for tool executions",
+            "safety": "neutral"
+          },
+          {
+            "name": "accept-edits",
+            "displayName": "Accept Edits",
+            "description": "Auto-approves file edits only",
+            "safety": "destructive"
+          },
+          {
+            "name": "smart-approve",
+            "displayName": "Smart Approve",
+            "description": "Classifies each tool call and auto-runs the safe ones, prompting only for risky ones",
+            "safety": "smart"
+          },
+          {
+            "name": "auto-approve",
+            "displayName": "Auto Approve",
+            "description": "Auto-approves all tool executions",
+            "safety": "yolo"
           }
         ],
         "skills": [],

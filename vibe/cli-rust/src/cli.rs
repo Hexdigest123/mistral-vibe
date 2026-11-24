@@ -76,11 +76,18 @@ pub struct Cli {
     #[arg(long = "max-turns", overrides_with = "max_turns")]
     pub max_turns: Option<u32>,
 
-    /// Maximum cost in dollars (headless mode only).
-    #[arg(long = "max-price", overrides_with = "max_price")]
+    /// Maximum cumulative cost in dollars of the run's root session and
+    /// subagents (headless mode only). A model priced at 0 is free; a limit of 0
+    /// stops the run before the next call once any call has cost money.
+    #[arg(
+        long = "max-price",
+        overrides_with = "max_price",
+        allow_negative_numbers = true
+    )]
     pub max_price: Option<f64>,
 
-    /// Maximum total prompt + completion tokens (headless mode only).
+    /// Maximum cumulative prompt + completion tokens of the run's root session
+    /// and subagents (headless mode only).
     #[arg(long = "max-tokens", overrides_with = "max_tokens")]
     pub max_tokens: Option<u64>,
 
@@ -117,24 +124,45 @@ pub struct Cli {
     #[arg(long = "output-dir", value_name = "DIR", overrides_with = "output_dir")]
     pub output_dir: Option<PathBuf>,
 
-    /// Agent to use (builtin: ask, accept-edits, smart-approve, auto-approve,
-    /// or custom from ~/.vibe/agents/NAME.toml). Defaults to the 'default_agent'
-    /// config setting.
+    /// Agent to use (e.g. lean, or custom from ~/.vibe/agents/NAME.toml).
+    /// Defaults to the 'default_agent' config setting. Approval policy names
+    /// are still accepted for compatibility.
     #[arg(long = "agent", value_name = "NAME", overrides_with = "agent")]
     pub agent: Option<String>,
 
-    /// Model alias to use instead of 'active_model' (headless mode only, new
-    /// sessions). Not saved as the default.
+    /// Approval policy to use (ask, accept-edits, smart-approve, auto-approve,
+    /// or custom). Defaults to the 'default_approval_policy' config setting.
+    #[arg(
+        long = "approval-policy",
+        value_name = "NAME",
+        overrides_with = "approval_policy"
+    )]
+    pub approval_policy: Option<String>,
+
+    /// Model alias to use instead of 'active_model' (new sessions only). Not
+    /// saved as the default.
     #[arg(long = "model", value_name = "ALIAS", overrides_with = "model")]
     pub model: Option<String>,
 
-    /// Approves all tool calls without prompting for the selected agent.
+    /// Thinking level of the model (off, low, medium, high, xhigh, max, or a
+    /// level the model lists; any other word is sent as written), new sessions
+    /// only. Not saved.
+    #[arg(long = "thinking", value_name = "LEVEL", overrides_with = "thinking")]
+    pub thinking: Option<String>,
+
+    /// Approves all tool calls without prompting: a new session on a built-in
+    /// mode starts the auto-approve agent instead.
     #[arg(long = "auto-approve", visible_alias = "yolo", action = ArgAction::SetTrue, overrides_with = "auto_approve")]
     pub auto_approve: bool,
 
     /// Classify each tool call and auto-run the safe ones, prompting only for
     /// risky ones.
-    #[arg(long = "smart-approve", action = ArgAction::SetTrue, overrides_with = "smart_approve")]
+    #[arg(
+        long = "smart-approve",
+        action = ArgAction::SetTrue,
+        overrides_with = "smart_approve",
+        conflicts_with = "approval_policy"
+    )]
     pub smart_approve: bool,
 
     /// Enable specific tools (headless: disables all others). Repeat the flag.
@@ -160,10 +188,6 @@ pub struct Cli {
     /// Additional working directory for file access. Repeat the flag.
     #[arg(long = "add-dir")]
     pub add_dir: Vec<PathBuf>,
-
-    /// Feature flag for teleport (hidden).
-    #[arg(long = "teleport", action = ArgAction::SetTrue, hide = true, conflicts_with = "prompt", overrides_with = "teleport")]
-    pub teleport: bool,
 
     /// Run the session's tools through the agent server on this Unix socket (experimental, hidden).
     #[arg(long = "agent-socket", value_name = "PATH", hide = true)]
@@ -344,6 +368,13 @@ pub enum StartupResume {
     Continue,
 }
 
+/// The new session's model and thinking level, applied to it only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartModel {
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+}
+
 /// The session a headless run works in: `-c` as `--continue` does, `--resume <id>` that exact one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum HeadlessSession {
@@ -366,7 +397,9 @@ pub struct HeadlessOptions {
     pub output_dir: Option<PathBuf>,
     pub system_prompt: Option<String>,
     pub model: Option<String>,
+    pub thinking: Option<String>,
     pub agent: Option<String>,
+    pub approval_policy: Option<String>,
     pub auto_approve: bool,
     pub enabled_tools: Vec<String>,
     pub disabled_tools: Vec<String>,
@@ -378,12 +411,14 @@ pub struct HeadlessOptions {
 }
 
 /// The execution-control config resolved from the CLI flags, sent to the
-/// app-server in `agentConfig`. `--auto-approve`/`--yolo` is a session-wide
-/// bypass and never swaps the agent.
+/// app-server in `agentConfig`. The server resolves `--auto-approve`/`--yolo`
+/// against the session's agent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionControl {
     /// Resolved agent name; `None` lets the server use `default_agent`.
     pub agent: Option<String>,
+    /// Resolved approval policy; `None` lets the server use `default_approval_policy`.
+    pub approval_policy: Option<String>,
     /// Approve every tool call (`--auto-approve` / `--yolo`).
     pub auto_approve: bool,
 }
@@ -510,9 +545,9 @@ impl Cli {
         }
     }
 
-    /// Build headless options from the parsed CLI + stdin prompt. Agent and
-    /// auto-approve go through `execution_control()` so `--smart-approve`
-    /// resolves the agent in headless mode too. The error is the message a
+    /// Build headless options from the parsed CLI + stdin prompt. Agent, policy
+    /// and auto-approve go through `execution_control()` so `--smart-approve`
+    /// resolves the policy in headless mode too. The error is the message a
     /// usage error reports.
     pub fn headless_options(
         &self,
@@ -523,9 +558,7 @@ impl Cli {
             return Err("No prompt provided for programmatic mode".to_owned());
         }
         let session = self.headless_session()?;
-        if self.model.is_some() && session != HeadlessSession::New {
-            return Err("--model only applies to a new session".to_owned());
-        }
+        let start_model = self.start_model()?;
         let system_prompt = self
             .system_prompt_file
             .as_deref()
@@ -542,8 +575,10 @@ impl Cli {
             time_limit: self.time_limit,
             output_dir: self.output_dir.clone(),
             system_prompt,
-            model: self.model.clone(),
+            model: start_model.model,
+            thinking: start_model.thinking,
             agent: execution_control.agent,
+            approval_policy: execution_control.approval_policy,
             auto_approve: execution_control.auto_approve,
             enabled_tools: self.enabled_tools.clone(),
             disabled_tools: self.disabled_tools.clone(),
@@ -556,7 +591,7 @@ impl Cli {
         })
     }
 
-    /// The shared session flags for interactive mode: `--agent`,
+    /// The shared session flags for interactive mode: `--agent`, `--approval-policy`,
     /// `--auto-approve` / `--yolo`, and `--smart-approve` (resolved via
     /// `execution_control()`), the tool filters, `--trust`, `--add-dir`, and
     /// the resolved `--worktree` request. Budget flags stay headless-only.
@@ -570,6 +605,7 @@ impl Cli {
         Ok(AgentConfig {
             cwd,
             agent: execution_control.agent,
+            approval_policy: execution_control.approval_policy,
             auto_approve: execution_control.auto_approve,
             enabled_tools: self.enabled_tools.clone(),
             disabled_tools: self.disabled_tools.clone(),
@@ -583,6 +619,22 @@ impl Cli {
             workspace_roots: crate::utils::paths::resolve_add_dirs(&self.add_dir)?,
             worktree,
             terminal_key,
+        })
+    }
+
+    /// `--model` / `--thinking`, which only a new session takes.
+    pub fn start_model(&self) -> Result<StartModel, String> {
+        if self.startup_resume() != StartupResume::None {
+            if self.model.is_some() {
+                return Err("--model only applies to a new session".to_owned());
+            }
+            if self.thinking.is_some() {
+                return Err("--thinking only applies to a new session".to_owned());
+            }
+        }
+        Ok(StartModel {
+            model: self.model.clone(),
+            thinking: self.thinking.clone(),
         })
     }
 
@@ -611,16 +663,17 @@ impl Cli {
         }
     }
 
-    /// Resolve `--agent` / `--auto-approve` / `--smart-approve` into the
-    /// wire-facing execution control. `--smart-approve` selects the
-    /// `smart-approve` agent unless an explicit `--agent` wins.
+    /// Resolve `--agent` / `--approval-policy` / `--auto-approve` / `--smart-approve`
+    /// into the wire-facing execution control. `--smart-approve` selects the
+    /// `smart-approve` policy.
     pub fn execution_control(&self) -> ExecutionControl {
-        let agent = self
-            .agent
+        let approval_policy = self
+            .approval_policy
             .clone()
             .or_else(|| self.smart_approve.then(|| "smart-approve".to_owned()));
         ExecutionControl {
-            agent,
+            agent: self.agent.clone(),
+            approval_policy,
             auto_approve: self.auto_approve,
         }
     }

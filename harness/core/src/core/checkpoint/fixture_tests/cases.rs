@@ -5,14 +5,15 @@ use crate::core::features::compaction::{
     CompactionBudgets, CompactionProjection, CompactionProjectionFit, CompactionTrigger,
     PendingCompaction,
 };
-use crate::core::features::notifications::NotificationState;
 use crate::core::features::programmatic_tool_calling::{
     PendingProgramOperation, ProgramExecution, ProgramFunctionRecord, ProgramOperationRecord,
 };
 use crate::core::features::skills;
 use crate::core::hooks::hook_action_id;
+use crate::core::pending_input::{PendingEntry, PendingInput};
 use crate::core::tools::execution::external_call::{ExternalCallStage, PendingExternalCall};
 use crate::core::tools::external::RuntimeBuiltinToolName;
+use crate::core::wire::user_message::OutputType;
 use crate::core::{
     ActivePhase, ActiveTurn, AssistantPart, AssistantRole, AssistantSemanticPart, CandidateMessage,
     CompletionCandidate, CompletionFinishReason, CompletionPurpose, ContentBlock, ExternalTool,
@@ -36,6 +37,10 @@ pub(super) fn fixture_cases() -> Vec<FixtureCase> {
         FixtureCase {
             file_name: "active-awaiting-agent-completion.json",
             state: awaiting_completion_state(CompletionPurpose::Agent),
+        },
+        FixtureCase {
+            file_name: "active-awaiting-agent-completion-output-type.json",
+            state: awaiting_typed_completion_state(),
         },
         FixtureCase {
             file_name: "active-awaiting-compaction-completion.json",
@@ -151,16 +156,9 @@ fn idle_history_notifications_state() -> HarnessState {
         message: "background process completed".to_string(),
         content: vec![text_block("notification attachment")],
     };
-    state.notifications = NotificationState::try_from_parts_with_delivery(
-        vec![crate::core::features::notifications::AdmittedNotification {
-            notification: pending,
-            preceding_steers: 0,
-        }],
-        true,
-        vec![
-            "notification-pending".to_string(),
-            "notification-received".to_string(),
-        ],
+    state.pending_input = PendingInput::try_from_parts(
+        vec![PendingEntry::Notification(pending)],
+        vec!["notification-received".to_string()],
     )
     .unwrap();
     state
@@ -183,6 +181,22 @@ fn awaiting_completion_state(purpose: CompletionPurpose) -> HarnessState {
     }
 }
 
+fn awaiting_typed_completion_state() -> HarnessState {
+    let mut state = awaiting_state(None);
+    state
+        .active_mut()
+        .expect("the awaiting state has an active turn")
+        .output_type = Some(OutputType {
+        name: "City".to_string(),
+        schema: json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        }),
+    });
+    state
+}
+
 fn awaiting_compaction_state(phase: CompactionFixturePhase) -> HarnessState {
     awaiting_state(Some(phase))
 }
@@ -203,9 +217,9 @@ fn awaiting_state(compaction: Option<CompactionFixturePhase>) -> HarnessState {
                 "current raw request",
             )));
         let in_context = fixture_projection(&state, "");
-        let tools = state.resolved_tools.top_level_tools();
+        let tools = state.resolved_tools().top_level_tools();
         let budget = fixture_budgets(&state).request;
-        let prompts = &state.config.settings.prompts.compaction;
+        let prompts = &state.config().settings.prompts.compaction;
         match phase {
             CompactionFixturePhase::InContext => in_context,
             CompactionFixturePhase::Standalone => in_context
@@ -241,9 +255,12 @@ fn awaiting_state(compaction: Option<CompactionFixturePhase>) -> HarnessState {
         turn_id,
         iterations,
         phase,
-        pending_steer: Vec::new(),
+        pending_context: Vec::new(),
         model_input_ready: false,
         output_limit_retries: 0,
+        output_type: None,
+        delivered_steering: 0,
+        input_reduced: false,
     });
     // An earlier reply measured the estimate as short by a quarter.
     state.estimate_correction =
@@ -280,9 +297,12 @@ fn pre_agent_hook_state() -> HarnessState {
                 user_content: vec![text_block("start work")],
             },
         },
-        pending_steer: Vec::new(),
+        pending_context: Vec::new(),
         model_input_ready: false,
         output_limit_retries: 0,
+        output_type: None,
+        delivered_steering: 0,
+        input_reduced: false,
     });
     state
 }
@@ -316,9 +336,12 @@ fn completion_hook_state(point: HookPoint) -> HarnessState {
         turn_id: "turn-hook".to_string(),
         iterations: 2,
         phase: ActivePhase::AwaitingHook { pending },
-        pending_steer: Vec::new(),
+        pending_context: Vec::new(),
         model_input_ready: false,
         output_limit_retries: 0,
+        output_type: None,
+        delivered_steering: 0,
+        input_reduced: false,
     });
     state
 }
@@ -363,12 +386,33 @@ fn tool_batch_state() -> HarnessState {
         phase: ActivePhase::AwaitingToolBatch {
             batch: ToolBatch { executions },
         },
-        pending_steer: vec![StoredMessage::visible(Message::user_text(
-            "steer after the current batch",
-        ))],
+        pending_context: Vec::new(),
         model_input_ready: false,
         output_limit_retries: 0,
+        output_type: None,
+        delivered_steering: 0,
+        input_reduced: false,
     });
+    state.pending_input = PendingInput::try_from_parts(
+        vec![
+            PendingEntry::Steering(StoredMessage::visible(Message::user_text(
+                "steer after the current batch",
+            ))),
+            PendingEntry::Notification(Notification {
+                id: "notification-after-steering".to_string(),
+                source: NotificationSource::BackgroundProcess {
+                    process_id: "process-2".to_string(),
+                    status: ProcessTerminalStatus::Completed,
+                    exit_code: Some(0),
+                },
+                level: NotificationLevel::Info,
+                message: "background process completed".to_string(),
+                content: Vec::new(),
+            }),
+        ],
+        Vec::new(),
+    )
+    .unwrap();
     state
 }
 
@@ -398,15 +442,18 @@ fn skill_read_state() -> HarnessState {
                 executions: vec![execution],
             },
         },
-        pending_steer: Vec::new(),
+        pending_context: Vec::new(),
         model_input_ready: false,
         output_limit_retries: 0,
+        output_type: None,
+        delivered_steering: 0,
+        input_reduced: false,
     });
     state
 }
 
 fn fixture_budgets(state: &HarnessState) -> CompactionBudgets {
-    CompactionBudgets::from_settings(&state.config.settings.context, state.estimate_correction)
+    CompactionBudgets::from_settings(&state.config().settings.context, state.estimate_correction)
 }
 
 fn fixture_projection(state: &HarnessState, extra_instructions: &str) -> CompactionProjection {
@@ -414,9 +461,9 @@ fn fixture_projection(state: &HarnessState, extra_instructions: &str) -> Compact
         state.context.messages(),
         state.generated_system_message(),
         extra_instructions,
-        state.resolved_tools.top_level_tools(),
+        state.resolved_tools().top_level_tools(),
         fixture_budgets(state).request,
-        &state.config.settings.prompts.compaction,
+        &state.config().settings.prompts.compaction,
     )
     .expect("fixture compaction projection can be estimated");
     let CompactionProjectionFit::Fitted(projection) = projection else {
@@ -460,11 +507,10 @@ fn direct_pending_execution() -> ToolExecution {
     let call_id = "direct-pending";
     ToolExecution {
         call: model_tool_call(call_id, "read_file", json!({ "path": "pending.txt" })),
-        state: ToolExecutionState::Direct(PendingExternalCall::pending(external_read_call(
-            call_id,
-            ToolOrigin::TopLevel,
-            "pending.txt",
-        ))),
+        state: ToolExecutionState::Direct(PendingExternalCall::pending(
+            external_read_call(call_id, ToolOrigin::TopLevel, "pending.txt"),
+            None,
+        )),
     }
 }
 
@@ -473,19 +519,22 @@ fn direct_skill_pending_execution() -> ToolExecution {
     let arguments = json!({ "name": "zeta-review" });
     ToolExecution {
         call: model_tool_call(call_id, "skill", arguments.clone()),
-        state: ToolExecutionState::Direct(PendingExternalCall::pending(ExternalToolCall {
-            action_id: crate::core::tools::external::effect_id_for_operation(
-                ToolOrigin::TopLevel,
-                call_id,
-            ),
-            call_id: call_id.to_string(),
-            origin: ToolOrigin::TopLevel,
-            call: ExternalTool::RuntimeBuiltin {
-                name: skills::ToolName::Read.runtime_tool(),
-                invocation_name: "skill".to_string(),
-                arguments,
+        state: ToolExecutionState::Direct(PendingExternalCall::pending(
+            ExternalToolCall {
+                action_id: crate::core::tools::external::effect_id_for_operation(
+                    ToolOrigin::TopLevel,
+                    call_id,
+                ),
+                call_id: call_id.to_string(),
+                origin: ToolOrigin::TopLevel,
+                call: ExternalTool::RuntimeBuiltin {
+                    name: skills::ToolName::Read.runtime_tool(),
+                    invocation_name: "skill".to_string(),
+                    arguments,
+                },
             },
-        })),
+            None,
+        )),
     }
 }
 
@@ -499,6 +548,7 @@ fn direct_post_hook_execution() -> ToolExecution {
                 hook_action_id: hook_action_id(&call.action_id, HookPoint::PostToolCall),
                 hook_binding_ids: vec!["hook-direct-post".to_string()],
                 result: successful_tool_result("raw direct result"),
+                duration_ms: 0,
             },
             call,
         }),
@@ -587,7 +637,7 @@ fn program_execution(message_count: usize) -> ToolExecution {
             id: pending_call.call_id.clone(),
             function: program_function("read_file", json!({ "path": "pending.txt" })),
             pending: Box::new(PendingProgramOperation {
-                external: PendingExternalCall::pending(pending_call),
+                external: PendingExternalCall::pending(pending_call, None),
                 requested_sleep_seconds: None,
             }),
         },
@@ -603,6 +653,7 @@ fn program_execution(message_count: usize) -> ToolExecution {
                         ),
                         hook_binding_ids: vec!["hook-program-post".to_string()],
                         result: successful_tool_result("raw program result"),
+                        duration_ms: 0,
                     },
                     call: post_call,
                 },

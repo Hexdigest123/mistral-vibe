@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Action, Timeline
+from e2e.app_server.scenario import Action, Timeline, advance
 from scenarios.onboarding.onboarding_oidc_complete import (
     client_args as client_args,
     expected_actions as oidc_actions,
@@ -10,8 +10,6 @@ from scenarios.onboarding.onboarding_oidc_complete import (
     request_methods as request_methods,
 )
 
-capture_startup = False
-capture_steps = set()
 exit_after_last_step = True
 expected_actions = [
     Action(
@@ -32,4 +30,5 @@ timeline: Timeline = [
     "\x1b",
     "\r",
     "\x1b[A\r",
+    advance(2000),
 ]

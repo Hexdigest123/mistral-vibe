@@ -9,6 +9,8 @@ adapter records.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -48,7 +50,7 @@ from vibe.app_server.local import (
 )
 from vibe.app_server.protocol import ClientCapabilities, ClientInfo, SessionOptions
 from vibe.app_server.run_export import HeadlessUsageError
-from vibe.core.agents.models import BuiltinAgentName
+from vibe.core.agents.models import ApprovalPolicyName
 from vibe.core.config.harness_files import HarnessFilesManager
 
 pytestmark = [
@@ -72,7 +74,7 @@ async function main() {{
   }} catch (error) {{
     processes = "failed: " + error.message;
   }}
-  await tools.agents.spawn({{name: "reader", message: {json.dumps(_CHILD_TASK)}}});
+  await tools.agents.spawn({{name: "reader", instructions: "Follow the message.", message: {json.dumps(_CHILD_TASK)}}});
   // Spawn does not wait. Keep this Turn open until the child's Turn ends, so
   // the child runs before the headless run finishes.
   let child;
@@ -110,14 +112,12 @@ _SLOW_CHILD_TASK = "SLOW_CHILD_TASK"
 
 _SPAWN_PROGRAM = f"""
 async function main() {{
-  return await tools.agents.spawn({{name: "reader", message: {json.dumps(_SLOW_CHILD_TASK)}}});
+  return await tools.agents.spawn({{name: "reader", instructions: "Follow the message.", message: {json.dumps(_SLOW_CHILD_TASK)}}});
 }}
 """
 
-# The child pauses first, so the parent is already waiting when it finishes.
 _SLOW_CHILD_PROGRAM = """
 async function main() {
-  await tools.self.sleep({seconds: 1});
   return await tools.file_system.read_file({path: "sub/notes.txt"});
 }
 """
@@ -439,7 +439,7 @@ async def test_a_parent_that_waits_gets_its_subagents_answer(
     """
     # Prepare
     scripted = ScriptedModel(_WAITING_SCRIPTS)
-    monkeypatch.setattr(EXECUTE_COMPLETION, scripted)
+    monkeypatch.setattr(EXECUTE_COMPLETION, _child_ends_after_parent_waits(scripted))
     sandbox = RecordingSandbox(project) if sandboxed else None
     monkeypatch.setenv("XDG_STATE_HOME", str(project.parent / "state"))
     host = LocalHarnessHost()
@@ -462,6 +462,37 @@ async def test_a_parent_that_waits_gets_its_subagents_answer(
     )
 
 
+def _child_ends_after_parent_waits(
+    scripted: ScriptedModel,
+) -> Callable[..., Awaitable[Any]]:
+    """The child's last model call is held until the parent's model asked for
+    ``wait``. A result that lands before that request goes into it, so the
+    wait would find no input and run to its timeout.
+    """
+    parent_waits = asyncio.Event()
+
+    async def complete(
+        action: Any, messages: list[Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        dumped = [
+            message.model_dump(mode="json", by_alias=True) for message in messages
+        ]
+        is_parent = any(
+            message.get("role") == "user"
+            and _WAITING_PARENT_TASK in json.dumps(message)
+            for message in dumped
+        )
+        tool_results = sum(1 for message in dumped if message.get("role") == "tool")
+        if not is_parent and tool_results:
+            await parent_waits.wait()
+        result = await scripted(action, messages, *args, **kwargs)
+        if is_parent and tool_results == 1:
+            parent_waits.set()
+        return result
+
+    return complete
+
+
 def _program_result(scripted: ScriptedModel) -> dict[str, Any]:
     """What the parent's ``run_typescript`` program returned."""
     [result] = [
@@ -480,7 +511,7 @@ def _options(project: Path, sandbox: RecordingSandbox | None) -> LocalHarnessOpt
         ),
         session_options=SessionOptions(
             cwd=None if sandbox is not None else str(project),
-            agent=BuiltinAgentName.AUTO_APPROVE,
+            approval_policy=ApprovalPolicyName.AUTO_APPROVE,
             trust_workspace=sandbox is None,
             headless=True,
         ),
@@ -513,3 +544,46 @@ def _appended(result: RustPostToolCallHookResult) -> list[str]:
         for block in result.output.tool_result.content[1:]
         if isinstance(block, RustTextContentBlock)
     ]
+
+
+@pytest.mark.asyncio
+async def test_an_auto_approve_sandboxed_start_keeps_other_session_grants(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """*Prepare*: Another session's trust grant on the sandbox's workspace.
+    *Do*: Start a sandboxed session there with auto-approve, which rebuilds its
+    context for the auto-approve policy.
+    *Assert*: It runs that policy and the other session's grant stays: a
+    sandboxed build grants no trust, so the rebuild has none to revoke.
+    """
+    # Prepare
+    from vibe.core.trusted_folders import trusted_folders_manager
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(project.parent / "state"))
+    monkeypatch.setattr(trusted_folders_manager, "_session_trusted", [])
+    trusted_folders_manager.trust_for_session(project)
+    options = _options(project, RecordingSandbox(project))
+    options = replace(
+        options,
+        session_options=options.session_options.model_copy(
+            update={
+                "approval_policy": None,
+                "auto_approve": True,
+                "trust_workspace": True,
+            }
+        ),
+    )
+    host = LocalHarnessHost()
+
+    # Do
+    session = await host.start(options)
+    try:
+        policy = session.resources.agents.active_policy.name
+        grants = trusted_folders_manager._session_trusted.count(str(project.resolve()))
+    finally:
+        await session.close()
+        await host.close()
+
+    # Assert
+    assert policy == ApprovalPolicyName.AUTO_APPROVE
+    assert grants == 1

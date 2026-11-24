@@ -1,12 +1,12 @@
-//! `/model` picker state: a Default row plus one row per model, fzf-searchable by name, alias and
-//! provider (fork feature, AGENTS.md). A pick chains straight into `/thinking`, which writes both.
+//! `/model` picker state: a Default row plus one row per model, fzf-searchable by name, alias,
+//! id and provider (fork feature, AGENTS.md). A pick chains straight into `/thinking`, which writes both.
 
 use std::sync::Arc;
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use serde_json::Value;
 
-use crate::app::{App, ModelOption, ToastSeverity};
+use crate::app::{App, ModelOption, Severity};
 use crate::config_write::Scope;
 use crate::event_handler;
 use crate::option_list::OptionList;
@@ -15,8 +15,33 @@ use crate::server::Client;
 use crate::thinking_picker::{self, ModelPick, THINKING_LEVELS};
 use crate::utils::fzf;
 
+pub mod catalog_check;
+pub use catalog_check::CHECKING_LABEL;
+
 /// Alias persisted for the Default (unpinned) row.
 pub const UNPINNED_ACTIVE_MODEL: &str = "";
+
+/// Label of the Default row, and its search text.
+pub const DEFAULT_LABEL: &str = "Default";
+/// Row shown when the filter matches nothing.
+pub const NO_MATCHES_LABEL: &str = "No matching models";
+
+/// One visible row of the picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Row {
+    /// The unpinned Default entry.
+    Default,
+    /// A model of `ModelPicker::models`.
+    Model(usize),
+    /// The filter matched nothing; cannot take the highlight.
+    Note,
+}
+
+impl Row {
+    pub fn selectable(&self) -> bool {
+        !matches!(self, Self::Note)
+    }
+}
 
 /// A `/config` field write's server answer, applied on the main thread.
 pub enum Event {
@@ -24,15 +49,18 @@ pub enum Event {
     Written(Value),
     /// The write failed; the message names the field and the server's reason.
     Failed(String),
+    /// The catalog check opening the picker answered, whatever its outcome.
+    Checked,
 }
 
-pub(crate) const FAILED_TOAST_SECS: u64 = 8;
-
-/// Apply the server's answer and release the commit that was in flight.
+/// Apply the server's answer.
 pub fn apply_event(app: &mut App, event: Event) {
     match event {
         Event::Written(runtime) => event_handler::apply_runtime_value(app, &runtime),
-        Event::Failed(message) => app.show_toast(message, ToastSeverity::Error, FAILED_TOAST_SECS),
+        Event::Failed(message) => crate::notices::inline(app, Severity::Error, &message),
+        Event::Checked => {
+            app.model_picker.checks_in_flight = app.model_picker.checks_in_flight.saturating_sub(1);
+        }
     }
 }
 
@@ -44,7 +72,10 @@ pub fn select(app: &mut App, client: &Arc<Client>, scope: Scope) {
         return;
     }
     let alias = selected_alias(app);
+    let searched = !query(app).is_empty();
     app.model_picker.open = false;
+    app.model_picker.search = search_field::Search::default();
+    app.model_picker.matches.clear();
     let target = match alias.as_str() {
         UNPINNED_ACTIVE_MODEL => app.model_picker.default_alias.clone(),
         _ => alias.clone(),
@@ -56,6 +87,7 @@ pub fn select(app: &mut App, client: &Arc<Client>, scope: Scope) {
             alias,
             target: String::new(),
             scope,
+            searched,
         };
         thinking_picker::commit_model(app, client, &pick);
         return;
@@ -64,6 +96,7 @@ pub fn select(app: &mut App, client: &Arc<Client>, scope: Scope) {
         alias,
         target,
         scope,
+        searched,
     };
     thinking_picker::open_for_model(app, pick, thinking, levels);
 }
@@ -73,6 +106,14 @@ pub fn open(app: &mut App) {
     search_field::clear(&mut app.model_picker.search);
     app.model_picker.list = OptionList::new(current_index(app));
     app.model_picker.open = true;
+}
+
+/// Open the picker highlighted on the current choice, and check the catalog
+/// for models a plan upgrade unlocked.
+pub fn open_with_catalog_check(app: &mut App, client: &Arc<Client>) {
+    open(app);
+    crate::model_selection::opened(app, crate::model_selection::Picker::Model);
+    catalog_check::start(app, client);
 }
 
 /// Route a key through the search field first; returns whether it consumed the key.
@@ -92,6 +133,22 @@ pub fn paste(app: &mut App, text: &str) {
     if search_field::paste(&mut app.model_picker.search, text) {
         refilter(app);
     }
+}
+
+/// Same, under the shared search-field name used by the other pickers.
+pub fn paste_search(app: &mut App, text: &str) {
+    paste(app, text);
+}
+
+/// Route a key through the search field first; same as `search_key`.
+pub fn handle_search_key(app: &mut App, key: &KeyEvent) -> bool {
+    search_key(app, key)
+}
+
+/// Focus the search field from a click on the search row.
+pub fn focus_search(app: &mut App) {
+    app.model_picker.search.focused = true;
+    app.model_picker.list.reset_viewport();
 }
 
 /// A press on the search field focuses it; one on a row leaves the field. True when consumed.
@@ -143,6 +200,33 @@ fn haystack(model: &ModelOption) -> String {
 
 fn query(app: &App) -> &str {
     app.model_picker.search.query.trim()
+}
+
+/// The visible rows: with an empty query the Default row then every model in
+/// config order; with a query the matches, best first, or a single note row.
+pub fn rows(app: &App) -> Vec<Row> {
+    match query(app).is_empty() {
+        true => std::iter::once(Row::Default)
+            .chain((0..app.model_picker.models.len()).map(Row::Model))
+            .collect(),
+        false => match app.model_picker.matches.is_empty() {
+            true => vec![Row::Note],
+            false => app
+                .model_picker
+                .matches
+                .iter()
+                .map(|&i| Row::Model(i))
+                .collect(),
+        },
+    }
+}
+
+/// The current choice's row: Default when unpinned, else the pinned model's.
+pub fn current_row(app: &App) -> Option<Row> {
+    match app.model_picker.is_pinned {
+        false => Some(Row::Default),
+        true => model_index(app).map(Row::Model),
+    }
 }
 
 /// The model shown on row `i`, or `None` for the Default row (only listed without a query).
@@ -215,6 +299,8 @@ pub fn selected_alias(app: &App) -> String {
 /// Close the picker without persisting (Esc / cancel).
 pub fn cancel(app: &mut App) {
     app.model_picker.open = false;
+    app.model_picker.search = search_field::Search::default();
+    app.model_picker.matches.clear();
 }
 
 /// Refresh the model snapshot from a `runtime/read`/`runtime/updated` value
@@ -223,6 +309,8 @@ pub fn apply_runtime(app: &mut App, response: &Value) {
     let Some(config) = crate::server::RuntimeSnapshot::config(response) else {
         return;
     };
+    let highlighted = app.model_picker.open.then(|| selected_alias(app));
+    app.model_picker.has_locked_models = config.models.iter().any(|m| m.requires.is_some());
     let models: Vec<ModelOption> = config.models.into_iter().filter_map(model_option).collect();
     let alias = config.default_model_alias;
     app.model_picker.default_display_name = models
@@ -234,13 +322,44 @@ pub fn apply_runtime(app: &mut App, response: &Value) {
     app.model_picker.is_pinned = config.active_model_pinned;
     app.model_picker.default_alias = alias;
     rank(app);
-    if app.model_picker.list.selected() >= option_count(app) {
+    if app.model_picker.open {
+        keep_highlight(app, highlighted.as_deref());
+    } else if app.model_picker.list.selected() >= option_count(app) {
         app.model_picker.list = OptionList::new(0);
     }
 }
 
+/// After the list changed under the open picker, highlight the row that was
+/// highlighted, or the nearest one.
+fn keep_highlight(app: &mut App, alias: Option<&str>) {
+    let count = option_count(app);
+    let index = match query(app).is_empty() {
+        true => match alias {
+            None => None,
+            Some(a) if a == UNPINNED_ACTIVE_MODEL => Some(0),
+            Some(a) => app
+                .model_picker
+                .models
+                .iter()
+                .position(|m| m.alias == a)
+                .map(|i| i + 1),
+        },
+        false => app
+            .model_picker
+            .matches
+            .iter()
+            .position(|&i| app.model_picker.models[i].alias == alias.unwrap_or_default()),
+    };
+    let selected = app.model_picker.list.selected();
+    match index {
+        Some(index) => app.model_picker.list.highlight(index),
+        None if selected >= count => app.model_picker.list.select(count.saturating_sub(1)),
+        None => {}
+    }
+}
+
 fn model_option(model: crate::server::ModelView) -> Option<ModelOption> {
-    if model.alias.is_empty() {
+    if model.alias.is_empty() || model.requires.is_some() {
         return None;
     }
     // Older servers omit the per-model set; fall back to the canonical five (ADR 0014).

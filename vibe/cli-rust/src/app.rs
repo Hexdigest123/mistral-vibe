@@ -1,9 +1,10 @@
 //! UI state; the `ui` module renders a pure view over it.
 
+use crate::clock::UiInstant;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::post_ready::AccountReads;
 use crate::server::{UserQuestion, UserQuestionRequest};
@@ -29,7 +30,7 @@ use crate::turn_summary::Narrator;
 use crate::ui;
 use crate::ui::banner::Banner;
 use crate::ui::loading::LoadingAnim;
-use crate::utils::file_index::FileIndex;
+use crate::utils::file_index::FileIndexHandle;
 use crate::utils::history_manager::HistoryManager;
 use crate::utils::startup_cache::StartupConfig;
 use crate::utils::transcript_cache::{QueueSpacer, TranscriptCache};
@@ -43,7 +44,7 @@ pub enum Status {
     Ready,
     /// A turn is running since `since` (drives the elapsed counter).
     Generating {
-        since: Instant,
+        since: UiInstant,
     },
 }
 
@@ -100,32 +101,14 @@ pub struct SelectionState {
     pub had_selection_at_press: bool,
 }
 
-/// An inline status line, shown until `until`.
-pub struct Notice {
-    pub text: String,
-    pub severity: ToastSeverity,
-    pub until: Instant,
-}
+use crate::ui::notice::Notice;
 
-/// Toast severity, selecting the left-border color.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ToastSeverity {
+/// Notice severity, selecting its color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
     Information,
     Warning,
     Error,
-}
-
-/// A short-lived warning/error toast overlay.
-pub struct Toast {
-    /// Identity within this process, so a selection can follow the toast it was
-    /// anchored in while the rack shifts it around.
-    pub id: u64,
-    pub text: String,
-    pub severity: ToastSeverity,
-    pub duration: Duration,
-    pub until: Option<Instant>,
-    /// Evictions reported with this toast at overflow time.
-    pub omitted: usize,
 }
 
 /// A prompt the client still owns end to end, used by the `/clear <prompt>` seed.
@@ -163,14 +146,19 @@ pub struct ChatInput {
     pub pasted_images: crate::image_placeholders::PastedImages,
     /// Long pastes collapsed in the input, so sent prompts can keep them collapsed.
     pub collapsed_pastes: crate::collapsed_pastes::CollapsedPastes,
-    /// The paste just collapsed, which pasting it again shows in full until the next edit.
-    pub expandable_paste: Option<std::sync::Arc<str>>,
+    /// The paste just collapsed or turned into mentions, which pasting it again
+    /// undoes until the next edit.
+    pub expandable_paste: Option<crate::long_paste::Offer>,
+    /// Text removed by the last kill (Ctrl+K, Ctrl+U, Ctrl+W...), which Ctrl+Y yanks back.
+    pub kill_buffer: String,
     /// The composer as history recall found it, mentions and mode included,
     /// given back whole when Down leaves the recalled entries.
     pub recall_draft: Option<crate::edit_history::Snapshot>,
+    /// The draft Ctrl+S set aside, given back after the next submit.
+    pub stash: Option<crate::composer_stash::Stash>,
     /// When the last key reached the chat input, so a bottom-app that wants to
     /// replace it can wait for a pause first.
-    pub last_keystroke: Option<Instant>,
+    pub last_keystroke: Option<UiInstant>,
 }
 
 impl ChatInput {
@@ -185,6 +173,10 @@ pub struct Session {
     pub session_id: Option<String>,
     /// The in-progress turn's id (from `turn/started`), needed to interrupt it.
     pub active_turn_id: Option<String>,
+    /// An interrupt before any answer: once the turn completes, rewind it and refill the input.
+    pub taking_back: bool,
+    /// That take-back's rewind is sent and not answered yet, so the input holds its submissions.
+    pub take_back_sent: bool,
     /// Completion held while a promoted prompt awaits its local enqueue result.
     pub deferred_completion: Option<(String, crate::terminal_notifier::NotificationContext)>,
     /// A manual shell command submitted before startup became ready.
@@ -192,7 +184,7 @@ pub struct Session {
     /// The in-progress manual shell operation, needed to reject queued input.
     pub shell_operation_id: Option<String>,
     /// When the manual shell operation started, for the loader elapsed time.
-    pub shell_started_at: Option<Instant>,
+    pub shell_started_at: Option<UiInstant>,
     /// Whether the shell run frame has been handed to the app-server writer.
     pub shell_request_started: bool,
     /// RPC settled before the final shell effect reached the transcript.
@@ -202,6 +194,10 @@ pub struct Session {
     pub status: Status,
     /// Working directory resolved once at startup; sent on `session/start` and shown in the footer.
     pub cwd: Option<String>,
+    /// The folder the last `cwd::follow` left, for `/cd -`.
+    pub previous_cwd: Option<String>,
+    /// The latest `/cd`'s number: an older one asks no trust and shows no failure.
+    pub cd_ticket: u64,
     /// The app-server-prepared worktree the session moved into (`--worktree`),
     /// tracked from the `worktree` transcript effect; follows the footer.
     pub worktree: Option<crate::worktree::WorktreeInfo>,
@@ -211,9 +207,12 @@ pub struct Session {
     pub prepared_worktree: Option<crate::worktree::WorktreeInfo>,
     /// Context budget `(current_tokens, max_tokens)`; `(_, 0)` renders as empty.
     pub tokens: (u64, u64),
-    /// The session's PR/MR artifacts, latest first; the footer shows the
-    /// latest as a link, or a modal listing them all when there are several.
+    /// The session's PR/MR artifacts, latest first; the rail's PR item opens a window listing them.
     pub artifacts: Vec<crate::server::PublicSessionArtifact>,
+    /// The session `artifacts` was read for; a switch away re-reads the list.
+    pub artifacts_session: Option<String>,
+    /// Artifacts whose status changed since the modal was last open; the bar marks them.
+    pub artifacts_unseen: std::collections::HashSet<String>,
     pub stats: crate::server::SessionStats,
     pub startup_config: StartupConfig,
     pub startup_error: Option<String>,
@@ -221,12 +220,10 @@ pub struct Session {
     pub startup_resume: StartupResume,
     /// The interactive CLI flags, resent on every resume.
     pub agent_config: crate::server::AgentConfig,
+    /// `--model` / `--thinking`, sent with the startup session only.
+    pub start_model: crate::cli::StartModel,
     /// The positional `vibe <prompt>` argument, sent once startup has converged.
     pub initial_prompt: Option<String>,
-    /// `--teleport`: teleport the initial prompt instead of sending it.
-    pub teleport_on_start: bool,
-    /// A `session/resume` has landed, so the handshake's own session is stale.
-    pub resumed: bool,
     /// The workspace-trust gate opened during this startup.
     pub trust_prompted: bool,
     /// The `--resume` picker opened during this startup.
@@ -235,15 +232,11 @@ pub struct Session {
     pub startup_telemetry: Option<std::collections::BTreeMap<String, Value>>,
     /// Telemetry queued before the session id exists, flushed by `set_session_id`.
     pub held_telemetry: Vec<crate::telemetry::TelemetryEvent>,
-    /// Whether the last turn was interrupted, so `/retry` can continue it.
+    /// Whether the last turn failed or was interrupted, so `/retry` can re-run it.
     pub can_retry: bool,
-    /// The active turn's latest assistant row.
-    pub turn_assistant_id: Option<String>,
-    /// Armed on retryable failures.
+    /// The rows a successful `/retry` replaces.
     pub retry_presentation: Option<crate::commands::retry::RetryPresentation>,
-    /// A retried turn's output merging into the interrupted assistant row.
-    pub retry_continuation: Option<crate::commands::retry::RetryContinuation>,
-    /// Silent incomplete_stream continuations spent.
+    /// Silent incomplete_stream retries spent.
     pub incomplete_stream_retries: u32,
     /// The mounted what's-new entry, dropped on the first submit.
     pub whats_new: Option<crate::startup::banners::WhatsNew>,
@@ -252,6 +245,12 @@ pub struct Session {
     pub usage_baseline: Option<crate::server::TokenUsage>,
     /// The latest `runtime` value, for views that read it after the event.
     pub runtime: Value,
+    /// The session's running background processes, from its latest state.
+    pub background_tasks: Vec<crate::server::PublicBackgroundProcess>,
+    /// What a running `wait` waits for, when the subagents and tasks name it.
+    pub wait_target: Option<String>,
+    /// The session's scheduled loops, soonest first, from its latest state and updates.
+    pub loops: Vec<crate::server::ScheduledLoop>,
 }
 
 /// Transcript rendering state: content, scroll, per-entry caches, and chrome.
@@ -270,48 +269,57 @@ pub struct View {
     pub markdown_cache: ui::markdown::MarkdownCache,
     /// Unfolded entry ids and `tool-group:<first member id>` keys, including a lone call's future group.
     pub expanded: HashSet<String>,
+    /// The `collapse_turn_details` config value: a settled turn's steps fold into a `Worked for` group.
+    pub collapse_turn_details: bool,
     /// The Ctrl+O bulk fold state applied to every group and collapsible
     /// result body at once.
     pub tools_collapsed: bool,
+    /// `/raw`: agent messages show their Markdown source instead of rendered Markdown.
+    pub raw: bool,
     /// Per-frame hit map `(top, bottom, header, id)` in screen rows, used to route a click to its entry.
     pub entry_hitmap: Vec<(u16, u16, Option<u16>, String)>,
     /// Markdown links painted in the current frame, used for hover and click routing.
     pub link_hitmap: Vec<ui::markdown::Link>,
-    /// Per-frame `(top, bottom, gutter_width)` of every edit-diff view on screen.
-    /// Its gutter is chrome, so selection and copy start after it.
-    pub diff_hitmap: Vec<(u16, u16, u16)>,
+    /// Wide graphemes of the last frame, whose uncovered columns the next frame repaints.
+    pub wide_cells: crate::wide_cells::WideCells,
+    /// Per-frame border and edit-diff gutter columns of bordered entries: chrome, so selection and copy start after them.
+    pub chrome_hitmap: Vec<crate::selection::RowChrome>,
+    /// Per-frame `[top, bottom)` screen rows of `/raw` agent messages: no chrome, selected from the first column.
+    pub raw_hitmap: Vec<(u16, u16)>,
     /// Markdown table cells from the current layout, in document coordinates.
     pub table_hitmap: Vec<TableCellHit>,
+    /// Banner cat area painted in the current frame; a click on it replays its round.
+    pub banner_cat_area: Option<Rect>,
     /// Latest terminal mouse position, used to paint markdown-link hover state.
     pub mouse_position: Option<(u16, u16)>,
     /// Pointer shape last sent to the terminal, so hover only writes on change.
     pub pointer_shape: crate::pointer::Shape,
     /// The selectable region painted last frame, published by the visible screen.
     pub selection_region: Region,
-    /// Text rectangle of each toast painted last frame, keyed by toast id and
-    /// ordered newest last. Bounded by the stack the rack fits on screen.
-    pub toast_text_areas: Vec<(u64, Rect)>,
-    /// The active model's name in the bottom bar painted last frame, which a click opens `/model` on.
-    pub footer_model_area: Rect,
-    /// The toast text region a selection is anchored in, or the default region
-    /// while no toast owns one.
-    pub toast_selection_region: Region,
+    /// The active model's name on the composer's top border painted last frame, which a click opens `/model` on.
+    pub model_area: Rect,
+    /// The context gauge in the bottom bar painted last frame, which a click opens `/context` on.
+    pub footer_tokens_area: Rect,
     /// The loading-area row a drag can select, published by whichever screen
     /// paints it.
     pub loading_selection_region: Region,
+    /// The goal row a drag can select, published by whichever screen paints it.
+    pub goal_selection_region: Region,
+    /// The rail window's content a drag can select.
+    pub rail_window_selection_region: Region,
     /// The box content a drag can select while a bottom app replaces the input box.
     pub bottom_app_selection_region: Region,
     /// Bottom-app box `(y, x0, x1)` cells painted as chrome (question option
     /// prefixes, scrollbars), so a selection never highlights or copies them.
     pub bottom_app_selection_chrome: Vec<RowSpan>,
+    /// A box split in halves: the columns of its left and right half a selection keeps to, by the half its anchor is in.
+    pub bottom_app_selection_halves: Option<(Rect, Rect)>,
     /// Bottom-app box rows that continue a wrapped line, so a copy rejoins them.
     pub bottom_app_selection_folds: crate::selection::Folds,
     /// The bottom app drawn last frame and its box rect, which own the box selection.
     pub bottom_app: Option<(crate::ui::bottom_app::Kind, Rect)>,
-    /// The PR/MR link painted in the bottom bar last frame, for click routing.
-    pub bottom_bar_link: Option<ui::bottom_bar::BarLink>,
-    /// Wrapped rows of each toast painted last frame, keyed by toast id.
-    pub toast_folds: Vec<(u64, crate::selection::Folds)>,
+    /// The links painted in the bottom bar last frame (the cwd's copy icon, the PR/MR link), for click routing.
+    pub bottom_bar_links: Vec<ui::bottom_bar::BarLink>,
     /// Inclusive `(y, x0, x1)` cells inside the region that belong to no widget,
     /// so a drag never selects them: padding around and between widgets.
     pub selection_chrome: Vec<(u16, u16, u16)>,
@@ -336,6 +344,8 @@ pub struct View {
     pub command_loading: bool,
     /// Shared phase for the 100 ms pulse on active reasoning and tool entries.
     pub pulse_frame: usize,
+    /// The wave that crosses a copied selection.
+    pub copy_light: crate::ui::copy_light::CopyLight,
     /// Current phase of the software block cursor's blink (toggled every 0.5s).
     pub cursor_on: bool,
     /// Chat input caret cell painted this frame, where dead-key and IME previews should draw.
@@ -346,6 +356,12 @@ pub struct View {
     /// Entry index the next frame must bring to the top of the viewport,
     /// consumed by the render.
     pub scroll_to_entry: Option<usize>,
+    /// Entry index and painted rows of the prompt pinned over the transcript top last frame.
+    pub sticky_prompt: Option<(usize, u16)>,
+    /// Entry index and screen row of the steer pinned under that prompt last frame.
+    pub sticky_steer: Option<(usize, u16)>,
+    /// The `enable_sticky_prompt` config value.
+    pub sticky_prompt_enabled: bool,
     /// Entry an expand/collapse toggle holds steady, consumed by the next render.
     pub scroll_anchor: Option<crate::utils::scroll::ScrollAnchor>,
     /// Per-frame `(index, viewport-relative top, height)` of each painted entry, bounded by the viewport.
@@ -361,31 +377,37 @@ impl Default for View {
         let mut loading = LoadingAnim::default();
         loading.set_label(ui::loading::INITIALIZING_LOADING_STATUS);
         Self {
-            transcript: Transcript::default(),
+            transcript: Transcript::main(),
             scroll: 0,
             scroll_target: 0,
             last_total: 0,
             transcript_cache: TranscriptCache::default(),
             markdown_cache: ui::markdown::MarkdownCache::default(),
             expanded: HashSet::new(),
+            collapse_turn_details: false,
             tools_collapsed: true,
+            raw: false,
             entry_hitmap: Vec::new(),
             link_hitmap: Vec::new(),
-            diff_hitmap: Vec::new(),
+            wide_cells: Default::default(),
+            chrome_hitmap: Vec::new(),
+            raw_hitmap: Vec::new(),
             table_hitmap: Vec::new(),
+            banner_cat_area: None,
             mouse_position: None,
             pointer_shape: crate::pointer::Shape::default(),
             selection_region: Region::default(),
-            toast_text_areas: Vec::new(),
-            footer_model_area: Rect::default(),
-            toast_selection_region: Region::default(),
+            model_area: Rect::default(),
+            footer_tokens_area: Rect::default(),
             loading_selection_region: Region::default(),
+            goal_selection_region: Region::default(),
+            rail_window_selection_region: Region::default(),
             bottom_app_selection_region: Region::default(),
             bottom_app_selection_chrome: Vec::new(),
+            bottom_app_selection_halves: None,
             bottom_app_selection_folds: crate::selection::Folds::default(),
             bottom_app: None,
-            bottom_bar_link: None,
-            toast_folds: Vec::new(),
+            bottom_bar_links: Vec::new(),
             selection_chrome: Vec::new(),
             selection_hangs: Vec::new(),
             selection_scrollbar: ui::scrollbar::State::default(),
@@ -397,10 +419,14 @@ impl Default for View {
             loading,
             command_loading: false,
             pulse_frame: 0,
+            copy_light: crate::ui::copy_light::CopyLight::default(),
             cursor_on: true,
             cursor_position: None,
             app_focus: true,
             scroll_to_entry: None,
+            sticky_prompt: None,
+            sticky_steer: None,
+            sticky_prompt_enabled: true,
             scroll_anchor: None,
             entry_rows: Vec::new(),
             at_top: false,
@@ -409,18 +435,14 @@ impl Default for View {
     }
 }
 
-/// Transient overlays: inline notice, toast, and quit confirm.
+/// Transient overlays: inline notice and quit confirm.
 #[derive(Default)]
 pub struct Overlays {
-    /// Active inline notice (e.g. "Copied to clipboard"), self-hiding after its timeout.
+    /// Active inline notice: a confirmation fades on its timer, a refusal stays until the next key.
     pub notice: Option<Notice>,
-    /// Stacked warning/error toasts, each self-hiding.
-    pub toasts: VecDeque<Toast>,
-    /// Identity handed to the next toast; only ever moves forward.
-    next_toast_id: u64,
     /// When the last unhandled Escape landed, so a second one within
     /// `DOUBLE_ESC_DELAY` clears the input or enters rewind mode.
-    pub last_escape: Option<Instant>,
+    pub last_escape: Option<UiInstant>,
 }
 
 /// Shared `/` and `@` completion popup state.
@@ -428,8 +450,10 @@ pub struct Overlays {
 pub struct Completion {
     /// User-invocable skills, shown as `/name` popup rows.
     pub skills: Vec<crate::skill::Skill>,
-    /// Files below `cwd`, maintained by a background watcher.
-    pub files: FileIndex,
+    /// Files below `cwd`, maintained by a background watcher the handle owns.
+    pub files: FileIndexHandle,
+    /// Directories listed on demand for `@/`, `@~/`, `@./` and `@../` queries.
+    pub dirs: crate::dir_complete::DirListings,
     /// Entries currently displayed by the shared `/` and `@` popup.
     pub entries: Vec<CompletionEntry>,
     /// Selected entry index in the completion popup (Up/Down, wrap-around).
@@ -438,14 +462,19 @@ pub struct Completion {
     pub scroll: usize,
     /// Set on keyboard selection: the next render scrolls just enough to reveal it.
     pub reveal: bool,
+    /// The arrows moved the highlight since the list last changed: Enter
+    /// takes the highlighted entry rather than what was typed.
+    pub picked: bool,
     /// Esc hides the current popup until the input changes again.
     pub dismissed: bool,
+    /// Subfolders listed for the `/cd ` popup.
+    pub cd_dirs: crate::dir_completion::Dirs,
 }
 
 /// Voice-mode state: config projection, recording lifecycle, and mic level.
 #[derive(Default)]
 pub struct Voice {
-    /// Whether voice mode is on; gates Ctrl+R.
+    /// Whether voice mode is on; gates Ctrl+T.
     pub mode_enabled: bool,
     /// Projected transcription config, `None` until `config/read` returns.
     pub transcription: Option<TranscriptionConfig>,
@@ -480,6 +509,8 @@ pub struct ConfigScreen {
     pub search: crate::search_field::Search,
     /// Nested editor opened by Enter on a writable settings field.
     pub edit: Option<ConfigEdit>,
+    /// A failure or refusal shown in place of the key hints until the next key.
+    pub status: Option<Notice>,
 }
 
 /// `/theme` picker state (a bottom-app).
@@ -497,15 +528,19 @@ pub struct ThemePicker {
     pub preview_at: Option<Instant>,
 }
 
-/// Agent modes: the runtime snapshot plus the Shift+Tab switch in flight.
+/// Agents and approval policies: the runtime snapshot plus the Shift+Tab switch in flight.
 #[derive(Default)]
 pub struct Agents {
     /// Every agent from the runtime snapshot, in the server's discovery order.
     pub all: Vec<crate::server::AgentSummary>,
     /// The server's active agent.
     pub active: crate::server::AgentSummary,
+    /// The approval policies Shift+Tab cycles, in the server's order.
+    pub policies: Vec<crate::server::ApprovalPolicySummary>,
+    /// The server's active approval policy.
+    pub active_policy: crate::server::ApprovalPolicySummary,
     /// Session-wide auto-approve (`--yolo` or config), which survives a switch,
-    /// as opposed to the YOLO agent's own.
+    /// as opposed to the YOLO policy's own.
     pub force_bypass_tool_permissions: bool,
     /// Name the last Shift+Tab asked for, painted before the server answers
     /// and re-used as the base of a coalesced press.
@@ -513,12 +548,12 @@ pub struct Agents {
     /// The last target the server refused; the next Shift+Tab cycles from it
     /// so a broken profile does not trap the cycle.
     pub refused: Option<String>,
-    /// Whether a `session/agent/update` is in flight.
+    /// Whether a `session/approvalPolicy/update` is in flight.
     pub switch_active: bool,
     /// Whether `/leanstall` or `/unleanstall` is in flight; input is rejected until it finishes.
     pub installing: bool,
     /// When the prompt spinner is due, or `None` once fired or cancelled.
-    pub spinner_at: Option<Instant>,
+    pub spinner_at: Option<UiInstant>,
     /// Whether the spinner has replaced the prompt marker.
     pub switching_indicator: bool,
     /// Spinner frame, advanced on the shared 100 ms tick.
@@ -543,8 +578,10 @@ pub struct ModelOption {
 pub struct ModelPicker {
     /// While set the picker replaces the input box: title, option list, hint.
     pub open: bool,
-    /// Highlighted option (0 = Default row, then one per model) and the viewport.
+    /// Highlighted visible row and the viewport.
     pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
+    /// The `/` fuzzy filter over the rows; empty shows every model.
+    pub search: crate::search_field::Search,
     /// Model snapshot from `runtime/read`, refreshed on `runtime/updated`.
     pub models: Vec<ModelOption>,
     /// The active model's alias (`activeModel.alias`).
@@ -555,19 +592,23 @@ pub struct ModelPicker {
     pub default_display_name: String,
     /// Alias the Default row resolves to (`defaultModelAlias`).
     pub default_alias: String,
-    /// The search field; a query hides the Default row and ranks models by match.
-    pub search: crate::search_field::Search,
     /// Indices into `models` matching the query, best first; unused without a query.
     pub matches: Vec<usize>,
+    /// The last runtime listed a model the plan locks (hidden from the rows).
+    pub has_locked_models: bool,
+    /// Catalog checks started by opening the picker that have not answered yet.
+    pub checks_in_flight: usize,
 }
 
-/// The artifacts modal state (a bottom-app): the session's PR/MR links.
+/// The PR window the rail opens: the session's PR/MR links.
 #[derive(Default)]
 pub struct ArtifactsModal {
-    /// While set the modal replaces the input box: title, link rows, hint.
-    pub open: bool,
-    /// Highlighted artifact (latest first) and the viewport.
-    pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
+    /// The config turns PR monitoring on, so `/pr` is offered.
+    pub enabled: bool,
+    /// Highlighted artifact (latest first) and the viewport; a row has several actions (Enter, `c`, `f`).
+    pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
+    /// Option rows from the last render; PageUp/PageDown move by its height.
+    pub list_area: ratatui::layout::Rect,
 }
 
 /// `/log-level` picker state (a bottom-app).
@@ -601,38 +642,6 @@ pub struct ThinkingPicker {
     pub levels: Vec<String>,
     /// A `/model` pick held until its chained thinking level is chosen or skipped.
     pub model_pick: Option<crate::thinking_picker::ModelPick>,
-}
-
-/// `/resume` picker state.
-#[derive(Default)]
-pub struct ResumePicker {
-    pub open: bool,
-    pub sessions: Vec<crate::resume_picker::Session>,
-    /// Filters `sessions` (fork feature, AGENTS.md); rows follow `resume_picker::search::shown`.
-    pub search: crate::search_field::Search,
-    pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
-    /// Folder the listed sessions belong to, from the server-filtered list. It
-    /// is the attached session's cwd too.
-    pub cwd: Option<String>,
-    pub delete_confirm: Option<String>,
-    /// Id of the session whose `session/delete` is in flight; keys are blocked
-    /// until it answers.
-    pub deleting: Option<String>,
-    /// Set once a preview replaced the transcript, so returning to the current
-    /// session reloads it.
-    pub previewing: bool,
-    pub preview_request: u64,
-    /// A `session/resume` is in flight; the app is busy but shows no spinner.
-    pub resuming: bool,
-    /// Sessions whose lease another process holds, drawn with a lock.
-    pub locked: std::collections::HashSet<String>,
-    /// Sessions a lease notification already decided; a late snapshot keeps them.
-    pub lease_notified: std::collections::HashSet<String>,
-    /// The lease watch ended, so a late snapshot must not restore locks.
-    pub lease_ended: bool,
-    /// Whether the lease watch subscription already fired this process.
-    pub subscribed: bool,
-    pub transcript: Option<crate::transcript::Snapshot>,
 }
 
 /// Rewind bottom-app state, including whether rewind mode is on.
@@ -680,16 +689,20 @@ pub struct QuestionApp {
     pub other_cursor: usize,
     /// First visible wrapped row of the free-text field once it overflows.
     pub other_scroll: usize,
+    /// `e` unlocked the submitted free-text answer, until the cursor leaves the row.
+    pub other_unlocked: bool,
     /// Per-frame screen geometry of the free-text field, to map a click to the caret.
     pub other_field: Option<crate::question_app::OtherField>,
     /// When the app opened, so buffered keys cannot answer it instantly.
-    pub mount_time: Option<Instant>,
+    pub mount_time: Option<UiInstant>,
 }
 
 /// `/mcp` browser state (a bottom-app).
 #[derive(Default)]
 pub struct MCPApp {
     pub search: crate::search_field::Search,
+    /// The viewed source's tool search, cleared whenever a source opens.
+    pub tool_search: crate::search_field::Search,
     /// While set the browser replaces the input box: title, option list, hint.
     pub open: bool,
     /// Latest `mcp/read` projection, refreshed by `mcp/refresh` and `mcp/toggle`.
@@ -699,7 +712,7 @@ pub struct MCPApp {
     /// A refresh is in flight; further refreshes are coalesced into it.
     pub refreshing: bool,
     /// When the open browser next re-discovers sources in the background.
-    pub refresh_at: Option<Instant>,
+    pub refresh_at: Option<UiInstant>,
     /// Source whose tools are listed, or `None` in the source list view.
     pub viewing_name: Option<String>,
     pub viewing_kind: Option<crate::server::MCPSourceKind>,
@@ -716,12 +729,63 @@ pub struct MCPApp {
 pub struct WhoamiCache {
     model: Option<String>,
     reads: AccountReads,
+    /// When the account was last read or asked for, to space the usage gauge's re-reads.
+    read_at: Option<Instant>,
+    /// The model the latest read was asked for, so a model switch asks once
+    /// and an answer for an older ask is dropped.
+    asked: Option<String>,
+    /// When the latest read failed, so a retry waits a little instead of asking every frame.
+    failed_at: Option<Instant>,
 }
 
 impl WhoamiCache {
+    /// Keep `reads` for the `model` they were asked under, unless a later ask superseded it.
     pub fn store(&mut self, model: String, reads: AccountReads) {
+        if self.asked.as_ref().is_some_and(|asked| *asked != model) {
+            return;
+        }
+        self.asked = Some(model.clone());
         self.model = Some(model);
         self.reads = reads;
+        self.failed_at = None;
+        self.read_at.get_or_insert_with(crate::clock::real_now);
+    }
+
+    /// Forget a failed ask for `model` at `at`, so the next frame asks again
+    /// once the retry delay passes; the last stored reads stay.
+    pub fn failed(&mut self, model: &str, at: Instant) {
+        if self.asked.as_deref() != Some(model) || self.model.as_deref() == Some(model) {
+            return;
+        }
+        self.asked = self.model.clone();
+        self.failed_at = Some(at);
+    }
+
+    pub fn failed_at(&self) -> Option<Instant> {
+        self.failed_at
+    }
+
+    /// Record that the account is being read for `model` (startup, `/whoami`).
+    pub fn ask(&mut self, model: String) {
+        self.asked = Some(model);
+    }
+
+    pub fn read_at(&self) -> Option<Instant> {
+        self.read_at
+    }
+
+    pub fn mark_read(&mut self, at: Instant, model: String) {
+        self.read_at = Some(at);
+        self.asked = Some(model);
+    }
+
+    /// Whether any read was asked for; until the post-ready fetch asks, it owns the account.
+    pub fn has_asked(&self) -> bool {
+        self.asked.is_some()
+    }
+
+    pub fn asked_for(&self, model: &str) -> bool {
+        self.asked.as_deref() == Some(model)
     }
 
     pub fn hit(&self, model: &str) -> Option<&AccountReads> {
@@ -784,15 +848,19 @@ pub struct App {
     pub credential_client: Option<Arc<crate::server::Client>>,
     pub terminal_notifier: crate::terminal_notifier::TerminalNotifier,
     pub chat_input: ChatInput,
+    pub vim: crate::vim::Vim,
     pub session: Session,
     pub agents: Agents,
     pub view: View,
     pub selection: SelectionState,
     pub overlays: Overlays,
     pub completion: Completion,
+    /// The Ctrl+R prompt-history search the composer holds, if any.
+    pub reverse_search: Option<crate::reverse_search::ReverseSearch>,
     pub paste_image: crate::paste_image::State,
     pub voice: Voice,
     pub voice_app: crate::voice_app::VoiceApp,
+    pub branch_app: crate::branch_app::BranchApp,
     pub proxy_setup: crate::proxy_setup::ProxySetupApp,
     pub config_screen: ConfigScreen,
     pub release_notes: crate::release_notes::State,
@@ -801,18 +869,30 @@ pub struct App {
     pub log_level_picker: LogLevelPicker,
     pub thinking_picker: ThinkingPicker,
     pub artifacts_modal: ArtifactsModal,
-    pub resume_picker: ResumePicker,
-    pub vibe_code_project: crate::vibe_code_project::State,
-    /// The running `/teleport` operation, if any.
-    pub teleport: Option<crate::teleport::Operation>,
+    /// The full-screen Sessions page.
+    pub sessions_page: crate::sessions_page::SessionsPage,
+    pub loops: crate::loops::LoopsApp,
+    /// The `/storage` panel.
+    pub storage: crate::storage_panel::State,
     /// The latest written todo list, never seeded from history.
     pub todo_tracker: crate::todo_tracker::TodoTracker,
     pub todo_sidebar: crate::todo_tracker::TodoSidebar,
+    /// The status rail on the loading row and its keyboard focus.
+    pub rail: crate::rail::Rail,
+    /// The background tasks panel the rail's tasks item opens.
+    pub tasks_panel: crate::tasks_panel::TasksPanel,
+    /// The session goal, its panels and the resume choice.
+    pub goal: crate::goal::State,
     pub rewind: Rewind,
     pub approval: crate::approval::State,
     pub question_app: QuestionApp,
     pub mcp: MCPApp,
     pub plugins: crate::plugins::State,
+    /// The `/trusted-folders` bottom app.
+    pub trusted_folders: crate::trusted_folders::State,
+    pub skills_browser: crate::skills_browser::State,
+    /// The `/context` bottom app.
+    pub context_app: crate::context_app::State,
     pub mcp_oauth: MCPOAuthApp,
     pub connector_auth: ConnectorAuthApp,
     /// The pre-session workspace-trust gate.
@@ -839,9 +919,6 @@ pub struct App {
     /// Whether a `/compact` request is in flight, so the UI shows the spinner
     /// and the `session/compacted` notification can settle it.
     pub compacting: bool,
-    /// Picker commits and slash commands whose server round-trip is still in
-    /// flight; the app is not idle while one is pending.
-    pub pending_commits: Arc<AtomicU32>,
     /// Slash commands submitted while the session is still starting, replayed
     /// once `apply_ready` settles.
     pub pending_commands: Vec<String>,
@@ -849,29 +926,56 @@ pub struct App {
     pub suspend_requested: bool,
     /// Ctrl+G requested the external editor; the event loop hands it the terminal.
     pub external_editor_requested: bool,
+    /// A file to open in the external editor as it is, such as a skill's `SKILL.md`.
+    pub external_editor_file: Option<std::path::PathBuf>,
     /// App-server child exited unexpectedly (stdout EOF during steady state).
     pub server_closed: bool,
     /// Sub-agents view state: child sessions, the status list, the viewed child.
     pub subagents: crate::subagents::Subagents,
     /// Older history paged in once the transcript is scrolled to its top.
     pub older_history: crate::older_history::OlderHistory,
-    /// Config validation warnings already toasted.
+    /// Config validation warnings already shown.
     pub shown_config_warnings: HashSet<String>,
+    /// The startup warnings box, filled until the first turn.
+    pub startup_notices: crate::notices::StartupNotices,
+    /// The last key was Ctrl+X over the tmux `mouse off` warning, so `h` now hides it.
+    pub tmux_hint_armed: bool,
     /// The `/debug` console: a right-docked live view of the session logs.
     pub debug_console: crate::debug_console::DebugConsole,
+    /// The popup previewing the file a hovered transcript link points to.
+    pub code_preview: crate::code_preview::CodePreview,
 }
 
 impl App {
+    /// Whether `session_id` is the attached session.
+    pub fn is_session(&self, session_id: &str) -> bool {
+        self.session.session_id.as_deref() == Some(session_id)
+    }
+
     pub fn set_session_id(&mut self, session_id: String) {
         if self.session.session_id.as_deref() != Some(session_id.as_str()) {
             self.session.deferred_completion = None;
+            self.branch_app = Default::default();
             crate::program_status::reset_shell(self);
             self.terminal_notifier.clear_outcome();
-            self.vibe_code_project = Default::default();
-            crate::teleport::reset(self);
+            // The retry offer names the previous session's turn and rows.
+            crate::commands::retry::cancel(self);
             // A session switch starts a new log: drop the old session's lines
             // and paging offset so the console repopulates from the new one.
             crate::debug_console::clear_session(&mut self.debug_console);
+            // The old session's PRs/MRs go with it; `artifacts::follow_session` reads the new ones.
+            self.session.artifacts.clear();
+            self.session.artifacts_session = None;
+            self.session.artifacts_unseen.clear();
+            crate::artifacts_modal::close(self);
+            // The old session's background work is not the new one's.
+            self.session.background_tasks.clear();
+            self.tasks_panel.close_output();
+            self.session.wait_target = None;
+            self.session.loops.clear();
+            crate::loops::close(self);
+            self.session.taking_back = false;
+            self.session.take_back_sent = false;
         }
         // The console's poll task reads the current id on every tick.
         if let Some(session_tx) = &self.debug_console.session_tx {
@@ -907,52 +1011,18 @@ impl App {
         self.view.loading = LoadingAnim::default();
     }
 
-    /// True when no turn is running and startup has settled -- the app is waiting
-    /// on the user. Drives the replay-mode idle marker (see main.rs); `Failed` is
-    /// terminal and counts as settled so a broken startup still emits a marker.
-    pub fn is_idle(&self) -> bool {
-        // The gate parks startup on the user, so its frame is already final.
-        if self.trust.open {
-            return true;
-        }
-        self.is_settled()
-            // A pending child-transcript refresh owes the frame a re-fetch.
-            && self.subagents.refresh_at.is_none()
-            && matches!(self.session.status, Status::Ready | Status::Failed)
-            // An accepted prompt the server has not promoted yet is still work
-            // in flight.
-            && self.queue.is_empty()
-            // A teleport reports progress by notification, like a turn.
-            && !crate::teleport::busy(self)
-    }
-
-    /// True once client-owned work has landed: startup finished, no request of
-    /// ours in flight, no config screen loading, no armed theme preview (the
-    /// frame is stable while its debounce runs, but the theme has not applied).
-    /// A running turn does not count, so this is what a `settle_busy` capture
-    /// waits for.
+    /// True once state the replay harness cannot see has landed: startup
+    /// finished, no config screen loading, no coalescing window armed. A running
+    /// turn does not count: the harness releases its events itself.
     pub fn is_settled(&self) -> bool {
         // An open gate counts as settled: nothing of ours is in flight.
         (self.trust.open || !matches!(self.session.status, Status::Starting))
             && (!self.config_screen.open || !self.config_screen.loading)
-            && self.theme_picker.preview_at.is_none()
-            && self.pending_commits.load(Ordering::Relaxed) == 0
             // A debounced theme preview repaints later; stay busy until it lands
             // so the captured frame shows the applied theme.
             && self.theme_picker.preview_at.is_none()
             // A scheduled child-transcript refresh owes the frame a re-fetch.
             && self.subagents.refresh_at.is_none()
-    }
-
-    /// Mark a picker commit as in flight, keeping the app busy until its answer
-    /// has been applied here on the main thread.
-    pub fn commit_started(&self) -> Arc<AtomicU32> {
-        self.pending_commits.fetch_add(1, Ordering::Relaxed);
-        self.pending_commits.clone()
-    }
-
-    pub fn commit_finished(&self) {
-        self.pending_commits.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Only the main input ignores the shared blink phase when blinking is disabled.
@@ -997,17 +1067,17 @@ impl App {
         self.view.mouse_regions.clear();
         crate::mouse::register_region(self, f.area(), crate::mouse::MouseTarget::Blocked);
         ui::draw(self, f);
+        crate::terminal_hyperlinks::mark(
+            self,
+            f.buffer_mut(),
+            crate::mouse::MouseTarget::Transcript,
+        );
+        self.view.wide_cells.refresh(f.buffer_mut());
     }
 }
 
-/// Seconds a voice error/notice line stays up, matching the copy notice.
+/// Seconds a voice notice line stays up, matching the copy notice.
 const VOICE_NOTICE_SECS: u64 = 4;
-
-/// Seconds a toast stays up.
-const TOAST_SECS: u64 = 5;
-
-/// Max toasts kept at once; overflow is reported with the newest toast.
-const MAX_TOASTS: usize = 64;
 
 impl App {
     /// True whenever a recording is in flight.
@@ -1020,7 +1090,7 @@ impl App {
         f32::from_bits(self.voice.peak.load(Ordering::Relaxed))
     }
 
-    /// Ctrl+R: start or stop recording.
+    /// Ctrl+T: start or stop recording.
     pub fn toggle_recording(&mut self) {
         match self.voice.transcribe_state {
             TranscribeState::Idle => self.start_recording(),
@@ -1041,6 +1111,9 @@ impl App {
             for id in self.view.transcript.expandable_ids() {
                 expanded.insert(id);
             }
+            if self.view.collapse_turn_details {
+                expanded.extend(self.view.transcript.details_keys());
+            }
         }
         // Every mounted section flips; the viewed child's transcript is only
         // swapped in at render time, so its ids and cache are handled here — in
@@ -1059,13 +1132,14 @@ impl App {
         self.view.scroll_anchor = crate::utils::scroll::bulk_toggle_anchor(
             self.view.scroll_target,
             &self.view.entry_rows,
+            self.view.sticky_prompt.map_or(0, |(_, rows)| rows),
         );
     }
 
     /// History (re)builds consult the bulk fold state: while expanded,
-    /// every rebuilt group and reasoning row mounts unfolded. Rebuilt tool
-    /// results keep their constructor's collapsed default, so only group keys
-    /// and reasoning ids join `expanded`. True rebuilds (resume, rewind) remount
+    /// every rebuilt group, reasoning row and loop prompt mounts unfolded. Rebuilt
+    /// tool results keep their collapsed default, so only group keys, reasoning
+    /// and loop prompt ids join `expanded`. True rebuilds (resume, rewind) remount
     /// every widget fresh, so their callers clear `expanded` first; the
     /// mid-turn snapshot path keeps live widget state and stays insert-only.
     pub fn expand_rebuilt_tools(&mut self) {
@@ -1077,7 +1151,10 @@ impl App {
             if let Some(group) = value.group.as_ref().filter(|group| group.first) {
                 expanded.insert(group.key.clone());
             }
-            if self.view.transcript.is_reasoning(value.id) {
+            if self.view.collapse_turn_details {
+                expanded.extend(self.view.transcript.details_key(value.id));
+            }
+            if value.fired_loop.is_some() || self.view.transcript.is_reasoning(value.id) {
                 expanded.insert(value.id.to_owned());
             }
         }
@@ -1101,7 +1178,7 @@ impl App {
                 self.voice.transcribe_state = TranscribeState::Recording;
                 self.voice.tracking.start();
             }
-            Err(msg) => self.show_toast(msg, ToastSeverity::Warning, TOAST_SECS),
+            Err(msg) => ui::notice::show_sticky(self, Severity::Warning, &msg),
         }
     }
 
@@ -1148,7 +1225,8 @@ impl App {
                     &mut self.chat_input.cursor,
                     &text,
                 );
-                self.chat_input.record_edit(before, true, Instant::now());
+                self.chat_input
+                    .record_edit(before, true, crate::clock::now());
                 crate::completion_manager::input_changed(self);
             }
             // A cancelled recording already reported; its late session is noise.
@@ -1171,11 +1249,8 @@ impl App {
                 );
                 self.voice.recording = None;
                 self.voice.transcribe_state = TranscribeState::Idle;
-                self.show_toast(
-                    format!("Voice transcription failed: {msg}"),
-                    ToastSeverity::Error,
-                    TOAST_SECS,
-                );
+                let message = format!("Voice transcription failed: {msg}");
+                crate::notices::inline(self, Severity::Error, &message);
             }
             VoiceEvent::Finished => {
                 crate::telemetry::record(
@@ -1190,43 +1265,6 @@ impl App {
     }
 
     fn show_voice_notice(&mut self, text: String) {
-        self.overlays.notice = Some(Notice {
-            text,
-            severity: ToastSeverity::Information,
-            until: Instant::now() + Duration::from_secs(VOICE_NOTICE_SECS),
-        });
-    }
-
-    /// Enqueue a toast for `seconds`, bounded.
-    pub fn show_toast(&mut self, text: String, severity: ToastSeverity, seconds: u64) {
-        let id = self.overlays.next_toast_id;
-        self.overlays.next_toast_id = id.wrapping_add(1);
-        self.overlays.toasts.push_back(Toast {
-            id,
-            text,
-            severity,
-            duration: Duration::from_secs(seconds),
-            until: None,
-            omitted: 0,
-        });
-        if self.overlays.toasts.len() <= MAX_TOASTS {
-            return;
-        }
-        let mut omitted = self
-            .overlays
-            .toasts
-            .iter()
-            .map(|toast| toast.omitted)
-            .fold(0usize, usize::saturating_add);
-        while self.overlays.toasts.len() > MAX_TOASTS {
-            self.overlays.toasts.pop_front();
-            omitted = omitted.saturating_add(1);
-        }
-        for toast in &mut self.overlays.toasts {
-            toast.omitted = 0;
-        }
-        if let Some(newest) = self.overlays.toasts.back_mut() {
-            newest.omitted = omitted;
-        }
+        ui::notice::show(self, Severity::Information, &text, VOICE_NOTICE_SECS);
     }
 }

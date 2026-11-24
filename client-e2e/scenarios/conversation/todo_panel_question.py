@@ -1,4 +1,4 @@
-"""The plan survives an `ask_user_question` taking the input box, row and panel both."""
+"""The plan survives an `ask_user_question` taking the input box, rail item and panel both."""
 
 from __future__ import annotations
 
@@ -12,10 +12,8 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline
 
-# The tool blocks on the callback, so every frame settles while still busy.
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1", "VIBE_TYPING_GRACE_PERIOD_MS": "0"}
+env = {"VIBE_TYPING_GRACE_PERIOD_MS": "0"}
 handshake = {"callback/result": {"accepted": True}}
-capture_startup = False
 
 _PROMPT = "plan the migration"
 # Terminals without a distinct Cmd key deliver the cmd+\\ remap as ESC \.
@@ -51,10 +49,5 @@ timeline: Timeline = [
     {"release": 2},
 ]
 
-# The panel keeps its column and the pinned row keeps its line, while the question
-# app owns the input box: `▶ 1/3 · Pick the database` is the row's summary.
-screen_contains = (
-    "Todos · 1/3 done",
-    "Which database should we use",
-    "1/3 · Pick the database",
-)
+# The panel keeps its column and the rail keeps its plan item while the question app owns the input box.
+screen_contains = ("Todos · 1/3 done", "Which database should we use", "≡ 1/3")

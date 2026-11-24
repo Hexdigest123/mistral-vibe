@@ -22,6 +22,7 @@ permission rule reads.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
@@ -37,12 +38,20 @@ from mistralai_vibe_local_harness.protocol import RustRuntimeBuiltinToolName
 from mistralai_vibe_local_harness.vibe import PathSpace, sandbox_path
 from mistralai_vibe_local_harness.vibe._permissions import PermissionOutcome
 from vibe.app_server._cron import CRON_TOOL_NAME
+from vibe.app_server._project_moves import (
+    LIST_PROJECTS_TOOL_NAME,
+    MOVE_TO_PROJECT_TOOL_NAME,
+    move_skips_approval,
+)
 from vibe.app_server._session_peers import (
     LIST_SESSIONS_TOOL_NAME,
+    MARK_SESSIONS_SEEN_TOOL_NAME,
     READ_SESSION_TOOL_NAME,
+    RENAME_SESSION_TOOL_NAME,
 )
 from vibe.core.config import VibeConfigSchema
 from vibe.core.config.orchestrator import ConfigOrchestrator
+from vibe.core.config.vibe_schema import stored_tool_allowlist_patterns
 from vibe.core.scratchpad import is_scratchpad_path
 from vibe.core.tools.base import BaseTool, BaseToolConfig
 from vibe.core.tools.builtins._shell_permission_analysis import redirect_writes
@@ -71,12 +80,16 @@ from vibe.permissions import OutsideWorkdirPolicy, RequiredPermission
 _SHELL_TOOL_SOURCES = frozenset({"bash", "powershell", "git_bash"})
 """The shell tools: everything a foreground shell call and a background start do."""
 
-# Cron only schedules this session's own prompts, and listing or reading
-# sessions changes nothing, so none of them asks by default.
+# Cron schedules this session's own prompts; session/project reads change
+# nothing. Marking seen and renaming only update session metadata. These tools
+# are allowed by default; explicit per-tool permissions still take precedence.
 _ALLOWED_BY_DEFAULT = frozenset({
     CRON_TOOL_NAME,
+    LIST_PROJECTS_TOOL_NAME,
     LIST_SESSIONS_TOOL_NAME,
+    MARK_SESSIONS_SEEN_TOOL_NAME,
     READ_SESSION_TOOL_NAME,
+    RENAME_SESSION_TOOL_NAME,
 })
 
 RUST_BUILTIN_TOOL_SOURCES: dict[RustRuntimeBuiltinToolName, frozenset[str]] = {
@@ -500,7 +513,19 @@ class UnifiedPermissionResolver:
         if builtin not in RUST_BUILTIN_TOOL_SOURCES:
             # The Runtime reserves the builtin namespaces for itself, so a name that is
             # not a builtin is a provided tool's ``group.tool`` route and nothing else.
-            return self._resolve_provided_tool(builtin)
+            outcome = self._resolve_provided_tool(builtin)
+            name = self._provided_names.resolve(builtin)
+            if (
+                outcome.decision == "ask"
+                and name == MOVE_TO_PROJECT_TOOL_NAME
+                # A configured `ask` asks even for a trusted folder.
+                and "permission" not in self._config.config.tools.get(name, {})
+                and await asyncio.to_thread(
+                    move_skips_approval, arguments.get("project_id")
+                )
+            ):
+                return PermissionOutcome(decision="allow")
+            return outcome
         if builtin in _PROCESS_UNGATED_BUILTINS:
             # Reads observe and a stop revokes a process this session started
             # under the start gate; see _PROCESS_UNGATED_BUILTINS.
@@ -652,6 +677,9 @@ class UnifiedPermissionResolver:
             if refusal := self._start_cwd_refusal(name, arguments.get("cwd")):
                 return PermissionOutcome(decision="deny", reason=refusal.reason)
         return PermissionOutcome(decision="ask")
+
+    def move_to(self, cwd: Path, workspace_roots: Sequence[Path]) -> None:
+        self._tools.move_to(cwd, workspace_roots)
 
     def _start_cwd_refusal(self, name: str, cwd: object) -> PermissionContext | None:
         """Refuse a start run from outside the working directory, if the policy does.
@@ -810,6 +838,10 @@ class UnifiedPermissionResolver:
         """Record what the user approved, scoped the way legacy scopes it."""
         if builtin not in RUST_BUILTIN_TOOL_SOURCES:
             name = self._provided_names.resolve(builtin)
+            if name == MOVE_TO_PROJECT_TOOL_NAME and not required_permissions:
+                # Approving one untrusted folder must not approve them all: the
+                # answer releases this move only.
+                return
             if required_permissions:
                 for rp in required_permissions:
                     self._store.add_rule(
@@ -896,16 +928,20 @@ class UnifiedPermissionResolver:
             )
         if not patterns:
             return
-        update = self._config.config.build_tool_allowlist_update(
-            name,
-            patterns,
-            current_allowlist=self._tools.get_tool_config(name).allowlist,
+        stored = stored_tool_allowlist_patterns(name, patterns)
+        path = f"/tools/{name}/allowlist"
+        # Merge into the file's list, not this session's copy; unset means the default.
+        mutation = await self._config.mutate_field(
+            path,
+            lambda persisted: (
+                persisted
+                if set(stored) <= set(persisted)
+                else sorted({*persisted, *stored})
+            ),
+            default=type(self._tools.get_tool_config(name))().allowlist,
         )
-        if update is None:
-            return
-        await self._config.set_field_or_warn(
-            f"/tools/{name}/allowlist", update["tools"][name]["allowlist"]
-        )
+        if mutation.failures:
+            logger.warning("Failed to persist %s: %s", path, mutation.failures[0])
 
 
 __all__ = [

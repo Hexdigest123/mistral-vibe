@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 
 def _model(alias: str, display_name: str, provider: str) -> dict[str, Any]:
@@ -49,13 +49,15 @@ timeline: Timeline = [
     "\r",
     "/",
     "coder openrouter",
+    take_snapshot(),
     "\x1b",
     "\x1b",
     "/",
     "gpt !mini",
+    take_snapshot(),
     "\x1b",
     "\x1b",
     "/",
     "^mistral large",
+    take_snapshot(),
 ]
-capture_steps = {3, 7, 11}

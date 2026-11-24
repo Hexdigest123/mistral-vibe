@@ -1,9 +1,12 @@
 """Holding a session's first turn for the GrowthBook eval.
 
 With no cached eval result, a session whose model is not set may be about to
-get it from an experiment: its first turn waits for the eval, for at most
-``EVAL_WAIT_CAP_SECONDS`` from when the session opened. Once an eval fails, or
-is still running when a cap expires, no later session in the process waits.
+get it from the catalog filter: its first turn waits for the eval, for at most
+``EVAL_WAIT_CAP_SECONDS`` from when the session opened. A pick of a model the
+config does not offer yet waits for it too, whatever the session's model.
+
+A failed eval, or one still running at the cap, is handled as described in
+``vibe.core.utils.fetch_wait``.
 """
 
 from __future__ import annotations
@@ -11,59 +14,52 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from vibe.core.config._self_hosted import experiments_allowed
 from vibe.core.config.layers.growthbook import GrowthbookLayer
 from vibe.core.experiments._constants import EVAL_WAIT_CAP_SECONDS
 from vibe.core.experiments.cache import load_cached_eval_response
 from vibe.core.experiments.manager import config_variants_from_response
-from vibe.core.telemetry.send import get_mistral_provider_and_api_key
-from vibe.core.utils.fetch_wait import FetchFailures, FetchWait
+from vibe.core.platform_auth._mistral import mistral_credentials
+from vibe.core.utils.fetch_wait import FetchWait
 
 if TYPE_CHECKING:
     from vibe.core.config import VibeConfigSchema
     from vibe.core.config.orchestrator import ConfigOrchestrator
-
-_failures = FetchFailures()
-
-
-def experiments_eval_failed() -> bool:
-    return _failures.failed
+    from vibe.core.platform_auth import PlatformCredentialFactory
 
 
-def mark_experiments_eval_failed() -> None:
-    _failures.mark()
-
-
-def reset_experiments_eval_failed() -> None:
-    """Forget a failed eval; for test isolation."""
-    _failures.reset()
-
-
-def experiments_eval_runs(config: VibeConfigSchema) -> bool:
-    """Whether a session on *config* sends an eval: telemetry, the A/B opt-in
-    and a Mistral credential are all needed.
+def experiments_eval_runs(
+    config: VibeConfigSchema, credentials: PlatformCredentialFactory | None = None
+) -> bool:
+    """Whether a session on *config* sends an eval: telemetry, the A/B opt-in,
+    a deployment that is not self-hosted and a Mistral credential are all
+    needed.
     """
-    if not (config.enable_telemetry and config.experiments.enable):
+    if not experiments_allowed(config):
         return False
-    return get_mistral_provider_and_api_key(config) is not None
+    return mistral_credentials(config, credentials) is not None
 
 
-def experiments_wait_needed(orchestrator: ConfigOrchestrator[VibeConfigSchema]) -> bool:
-    """Whether a session opening on *orchestrator* must hold its first turn for
-    the eval.
+def experiments_pending(
+    orchestrator: ConfigOrchestrator[VibeConfigSchema],
+    credentials: PlatformCredentialFactory | None = None,
+) -> bool:
+    """Whether the variants of a session opening on *orchestrator* may still
+    change: an eval runs, and none is held.
 
-    ``active_model`` is empty when nothing pins a model, so the session would
-    run the default model, which the routing experiment may replace.
+    Only a session left on the default model, or a pick of a model the config
+    does not offer yet, has something to wait for: each waiter checks that.
     """
-    config = orchestrator.config
-    if not experiments_eval_runs(config):
+    if not experiments_eval_runs(orchestrator.config, credentials):
         return False
-    if config.active_model or experiments_eval_failed():
-        return False
-    return not _loaded_the_cached_eval(orchestrator)
+    return not _loaded_the_cached_eval(orchestrator, credentials)
 
 
-def _loaded_the_cached_eval(orchestrator: ConfigOrchestrator[VibeConfigSchema]) -> bool:
-    cached = load_cached_eval_response(orchestrator.config)
+def _loaded_the_cached_eval(
+    orchestrator: ConfigOrchestrator[VibeConfigSchema],
+    credentials: PlatformCredentialFactory | None = None,
+) -> bool:
+    cached = load_cached_eval_response(orchestrator.config, credentials)
     if cached is None:
         return False
     try:
@@ -77,11 +73,5 @@ def _loaded_the_cached_eval(orchestrator: ConfigOrchestrator[VibeConfigSchema]) 
     ) or layer.variants == config_variants_from_response(cached)
 
 
-class ExperimentsWait(FetchWait):
-    def __init__(self, task: asyncio.Task[Any]) -> None:
-        super().__init__(
-            task,
-            name="GrowthBook eval",
-            cap_seconds=EVAL_WAIT_CAP_SECONDS,
-            failures=_failures,
-        )
+def experiments_wait(task: asyncio.Future[Any]) -> FetchWait:
+    return FetchWait(task, name="GrowthBook eval", cap_seconds=EVAL_WAIT_CAP_SECONDS)

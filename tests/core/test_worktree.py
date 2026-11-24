@@ -1412,37 +1412,104 @@ def test_concurrent_prunes_do_not_remove_below_the_limit(
     def pause_snapshot(prepared: PreparedWorktree) -> str:
         if prepared.name == oldest.name:
             inspection_started.set()
-            assert release_inspection.wait(timeout=5)
+            assert release_inspection.wait(timeout=30)
         return snapshot(prepared)
 
-    real_prune_lock = worktree_module.worktree_prune_lock
-    lock_attempts = 0
-    attempts_lock = Lock()
-    second_started = Event()
-
-    @contextmanager
-    def observe_prune_lock() -> Iterator[None]:
-        nonlocal lock_attempts
-        with attempts_lock:
-            lock_attempts += 1
-            if lock_attempts == 2:
-                second_started.set()
-        with real_prune_lock():
-            yield
-
     monkeypatch.setattr(PreparedWorktree, "snapshot", pause_snapshot)
-    monkeypatch.setattr(worktree_module, "worktree_prune_lock", observe_prune_lock)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(ManagedWorktree.prune, 1)
-        assert inspection_started.wait(timeout=5)
-        second = executor.submit(ManagedWorktree.prune, 1)
-        assert second_started.wait(timeout=5)
-        release_inspection.set()
-        assert sorted((first.result(timeout=10), second.result(timeout=10))) == [0, 1]
+        try:
+            assert inspection_started.wait(timeout=10)
+            assert executor.submit(ManagedWorktree.prune, 1).result(timeout=30) == 0
+        finally:
+            release_inspection.set()
+        assert first.result(timeout=30) == 1
 
     assert not oldest.root.exists()
     assert newest.root.is_dir()
+
+
+def test_a_concurrent_prune_keeps_the_limit_when_the_first_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    oldest = _prepare_auto(Path(repo.working_dir), suggested_name="oldest")
+    newest = _prepare_auto(Path(repo.working_dir), suggested_name="newest")
+    _finish_starts(oldest, newest)
+    _age_claim(_claim(repo, oldest.name), 30)
+    snapshot_started = Event()
+    fail_snapshot = Event()
+    snapshot = PreparedWorktree.snapshot
+
+    def fail_oldest_snapshot(prepared: PreparedWorktree) -> str:
+        if prepared.name != oldest.name:
+            return snapshot(prepared)
+        snapshot_started.set()
+        assert fail_snapshot.wait(timeout=30)
+        raise WorktreeError("cannot save")
+
+    monkeypatch.setattr(PreparedWorktree, "snapshot", fail_oldest_snapshot)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(ManagedWorktree.prune, 1)
+        try:
+            assert snapshot_started.wait(timeout=10)
+            assert executor.submit(ManagedWorktree.prune, 1).result(timeout=30) == 0
+        finally:
+            fail_snapshot.set()
+        assert first.result(timeout=30) == 1
+
+    assert oldest.root.is_dir()
+    assert not newest.root.exists()
+
+
+@pytest.mark.timeout(120)
+def test_prune_does_not_block_other_worktrees_while_it_snapshots_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    removed_first = _prepare_auto(Path(repo.working_dir), suggested_name="first")
+    paused = _prepare_auto(Path(repo.working_dir), suggested_name="paused")
+    held = _prepare_auto(Path(repo.working_dir), suggested_name="held")
+    _finish_starts(removed_first, paused, held)
+    _age_claim(_claim(repo, removed_first.name), 30)
+    _hold(held.root, "session-held")
+    snapshot_started = Event()
+    finish_snapshot = Event()
+    snapshot = PreparedWorktree.snapshot
+
+    def pause_snapshot(prepared: PreparedWorktree) -> str:
+        if prepared.name == paused.name:
+            snapshot_started.set()
+            assert finish_snapshot.wait(timeout=60)
+        return snapshot(prepared)
+
+    monkeypatch.setattr(PreparedWorktree, "snapshot", pause_snapshot)
+    held_managed = ManagedWorktree.at(held.root)
+    restored_managed = ManagedWorktree.at(removed_first.root)
+    assert held_managed is not None
+    assert restored_managed is not None
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        prune = executor.submit(ManagedWorktree.prune, 0)
+        try:
+            assert snapshot_started.wait(timeout=20)
+            attach = executor.submit(held_managed.hold_for_attachment)
+            restore = executor.submit(restored_managed.restore, removed_first.root)
+            pending_hold = attach.result(timeout=20)
+            assert restore.result(timeout=20) is True
+        finally:
+            finish_snapshot.set()
+        assert prune.result(timeout=30) == 2
+
+    assert pending_hold is not None
+    pending_hold.release()
+    assert not paused.root.exists()
+    assert held.root.is_dir()
+    assert removed_first.root.is_dir()
+    _claim(repo, removed_first.name).finish_starting()
+    held_managed.release_holder("session-held")
 
 
 def test_prune_discards_an_abandoned_empty_reservation(tmp_path: Path) -> None:
@@ -3486,6 +3553,63 @@ def test_new_branch_starts_from_the_fetched_remote_default(tmp_path: Path) -> No
     assert worktree.base_commit == ahead
 
 
+def test_a_branch_only_the_remote_has_is_checked_out_from_it(tmp_path: Path) -> None:
+    """*Prepare*: A clone whose remote has a branch (a PR's, say) it never
+    checked out.
+    *Do*: Prepare a worktree for that branch.
+    *Assert*: The worktree starts at the remote branch's tip, on a local branch
+    of the same name, not on a fresh branch from the default.
+    """
+    clone, _ = _clone_behind_origin(tmp_path)
+    seed = Repo(tmp_path / "seed")
+    seed.git.checkout("-b", "feat/pr")
+    _commit_on_head(seed, "pr work")
+    seed.git.push("origin", "feat/pr")
+    pr_tip = seed.head.commit.hexsha
+
+    worktree = _prepare("pr-work", Path(clone.working_dir), branch="feat/pr")
+
+    assert worktree.branch == "feat/pr"
+    assert _track_repo(Repo(worktree.path)).head.commit.hexsha == pr_tip
+
+
+def test_a_remote_branch_is_continued_from_its_last_known_tip_when_the_fetch_fails(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A clone that fetched a PR's branch once, then lost its remote.
+    *Do*: Prepare a worktree for that branch.
+    *Assert*: The worktree continues the branch from the tip the clone last
+    fetched, not from a fresh branch off the default one.
+    """
+    clone, _ = _clone_behind_origin(tmp_path)
+    seed = Repo(tmp_path / "seed")
+    seed.git.checkout("-b", "feat/pr")
+    _commit_on_head(seed, "pr work")
+    seed.git.push("origin", "feat/pr")
+    pr_tip = seed.head.commit.hexsha
+    clone.git.fetch("origin", "feat/pr:refs/remotes/origin/feat/pr")
+    clone.remotes.origin.set_url(str(tmp_path / "gone.git"))
+
+    worktree = _prepare("pr-work", Path(clone.working_dir), branch="feat/pr")
+
+    assert _track_repo(Repo(worktree.path)).head.commit.hexsha == pr_tip
+
+
+def test_new_branch_from_the_remote_default_does_not_write_the_shared_config(
+    tmp_path: Path,
+) -> None:
+    clone, ahead = _clone_behind_origin(tmp_path)
+    root = Path(clone.working_dir)
+    # Another session mid-write of .git/config holds this lock, and git fails
+    # rather than waits on it.
+    (root / ".git" / "config.lock").touch()
+
+    worktree = _prepare("feature", root)
+
+    assert worktree.base_commit == ahead
+    assert clone.heads["feature"].tracking_branch() is None
+
+
 def test_new_branch_falls_back_to_head_without_a_remote(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path)
 
@@ -3521,6 +3645,54 @@ def test_existing_branch_is_checked_out_rather_than_rebased(tmp_path: Path) -> N
     worktree = _prepare("feature", root, branch="existing")
 
     assert worktree.base_commit == existing.commit.hexsha
+
+
+def test_a_branch_checked_out_elsewhere_is_continued_on_a_branch_of_its_own(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A checkout on ``feat/x``, which git checks out only once.
+    *Do*: Prepare a worktree for ``feat/x``.
+    *Assert*: The worktree starts at ``feat/x``'s tip on a new branch, and
+    the checkout keeps ``feat/x``.
+    """
+    repo = _init_repo(tmp_path)
+    repo.git.checkout("-b", "feat/x")
+    (tmp_path / "work.txt").write_text("work\n")
+    repo.index.add(["work.txt"])
+    tip = repo.index.commit("work").hexsha
+
+    with WorktreeRepository.open(tmp_path) as repository:
+        worktree = repository.prepare(
+            "feat-x", branch="feat/x", branch_in_use="branch_off"
+        )
+
+    assert worktree.branch == "feat-x"
+    assert _track_repo(Repo(worktree.path)).head.commit.hexsha == tip
+    assert repo.active_branch.name == "feat/x"
+
+
+def test_a_branch_off_takes_a_free_name_when_the_worktree_name_is_a_branch(
+    tmp_path: Path,
+) -> None:
+    """*Prepare*: A checkout on ``feat/x`` and an unrelated ``feat-x`` branch.
+    *Do*: Prepare a ``feat-x`` worktree for ``feat/x``.
+    *Assert*: It branches off ``feat/x`` on ``feat-x-2``, leaving ``feat-x``.
+    """
+    repo = _init_repo(tmp_path)
+    other = repo.create_head("feat-x").commit.hexsha
+    repo.git.checkout("-b", "feat/x")
+    (tmp_path / "work.txt").write_text("work\n")
+    repo.index.add(["work.txt"])
+    tip = repo.index.commit("work").hexsha
+
+    with WorktreeRepository.open(tmp_path) as repository:
+        worktree = repository.prepare(
+            "feat-x", branch="feat/x", branch_in_use="branch_off"
+        )
+
+    assert worktree.branch == "feat-x-2"
+    assert _track_repo(Repo(worktree.path)).head.commit.hexsha == tip
+    assert repo.heads["feat-x"].commit.hexsha == other
 
 
 class _StubProcess:

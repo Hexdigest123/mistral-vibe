@@ -3,41 +3,55 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from vibe.app_server._dispatch import RequestFailure, method_not_found
 from vibe.app_server._local_projects import (
+    CloudBacking,
+    CloudOwner,
     LocalProject,
+    LocalProjectConflict,
     LocalProjectError,
     LocalProjectNotFound,
     LocalProjectStore,
     LocalProjectStoreUnreadable,
 )
 from vibe.app_server._model import ProtocolModel, validate_wire
+from vibe.app_server._project_links import folder_has_commits
 from vibe.app_server.protocol import (
     EmptyResponse,
+    LocalProjectCloudOwner,
     LocalProjectCloudView,
     LocalProjectView,
     ProjectMutationResponse,
     ProjectsCreateParams,
+    ProjectsLinkParams,
     ProjectsListParams,
     ProjectsListResponse,
     ProjectsRemoveParams,
     ProjectsRenameParams,
+    ProjectsRetireCloudParams,
+    ProjectsSetCloudParams,
+    ProjectsSetRootsParams,
     ProtocolErrorCode,
 )
 from vibe.core.vibe_code_project import VibeProjectsStore
 from vibe.observability.logging import logger
 from vibe.observability.sentry import capture_sentry_exception
 
-__all__ = ["LOCAL_PROJECT_METHODS", "LocalProjectsController"]
+__all__ = ["LOCAL_PROJECT_METHODS", "LocalProjectsController", "list_local_projects"]
 
 LOCAL_PROJECT_METHODS = frozenset({
     "projects/create",
+    "projects/link",
     "projects/list",
     "projects/remove",
     "projects/rename",
+    "projects/retireCloud",
+    "projects/setCloud",
+    "projects/setRoots",
 })
 
 
@@ -52,8 +66,11 @@ class LocalProjectsController:
             match method:
                 case "projects/list":
                     validate_wire(ProjectsListParams, raw_params)
-                    projects = await asyncio.to_thread(_list_with_links, store)
-                    return ProjectsListResponse(projects=[_view(p) for p in projects])
+                    projects = await asyncio.to_thread(list_local_projects, store)
+                    views = await asyncio.gather(
+                        *(asyncio.to_thread(_view, project) for project in projects)
+                    )
+                    return ProjectsListResponse(projects=list(views))
                 case "projects/create":
                     params = validate_wire(ProjectsCreateParams, raw_params)
                     root = _root_path(params.root_path)
@@ -63,47 +80,144 @@ class LocalProjectsController:
                             root_path=root,
                         )
                     )
-                    return ProjectMutationResponse(project=_view(project))
+                case "projects/link":
+                    params = validate_wire(ProjectsLinkParams, raw_params)
+                    root = _root_path(params.root_path)
+                    project = await asyncio.to_thread(
+                        link_local_project,
+                        store,
+                        root,
+                        params.cloud_project_id,
+                        params.name,
+                        _cloud_owner(params.owner),
+                    )
                 case "projects/rename":
                     params = validate_wire(ProjectsRenameParams, raw_params)
                     project = await asyncio.to_thread(
                         store.rename, params.id, params.name
                     )
-                    return ProjectMutationResponse(project=_view(project))
+                case "projects/setRoots":
+                    params = validate_wire(ProjectsSetRootsParams, raw_params)
+                    roots = [_project_path(root) for root in params.root_paths]
+                    project = await asyncio.to_thread(
+                        _set_local_project_roots, store, params.id, roots
+                    )
                 case "projects/remove":
                     params = validate_wire(ProjectsRemoveParams, raw_params)
-                    await asyncio.to_thread(store.remove, params.id)
+                    await asyncio.to_thread(_remove_local_project, store, params.id)
                     return EmptyResponse()
+                case "projects/retireCloud":
+                    params = validate_wire(ProjectsRetireCloudParams, raw_params)
+                    await asyncio.to_thread(store.retire_cloud, params.cloud_project_id)
+                    return EmptyResponse()
+                case "projects/setCloud":
+                    params = validate_wire(ProjectsSetCloudParams, raw_params)
+                    project = await asyncio.to_thread(
+                        store.set_cloud,
+                        params.id,
+                        CloudBacking(
+                            project_id=params.cloud_project_id,
+                            state="backed",
+                            owner=_cloud_owner(params.owner),
+                        ),
+                    )
                 case _:
                     raise method_not_found(method)
+            return ProjectMutationResponse(
+                project=await asyncio.to_thread(_view, project)
+            )
         except LocalProjectNotFound as exc:
             raise RequestFailure(ProtocolErrorCode.NOT_FOUND, str(exc)) from exc
+        except LocalProjectConflict as exc:
+            raise RequestFailure(ProtocolErrorCode.CONFLICT, str(exc)) from exc
         except LocalProjectError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
         except LocalProjectStoreUnreadable as exc:
             raise RequestFailure(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
 
 
-def _list_with_links(store: LocalProjectStore) -> list[LocalProject]:
-    # Runs on every list so links made with the local projects flag off show up too.
-    # Best effort: a failed import must not hide the projects already stored.
-    try:
-        store.import_links(VibeProjectsStore().list_project_links())
-    except LocalProjectStoreUnreadable:
-        raise
-    except Exception as exc:
-        logger.warning("Could not import project links", exc_info=True)
-        capture_sentry_exception(
-            exc,
-            fatal=False,
-            tags={"vibe_boundary": "local_projects", "error_type": type(exc).__name__},
-        )
+def list_local_projects(store: LocalProjectStore) -> list[LocalProject]:
+    _import_project_links(store)
     return store.list_projects()
 
 
+def link_local_project(
+    store: LocalProjectStore,
+    root: Path,
+    cloud_project_id: str,
+    name: str,
+    owner: CloudOwner | None,
+) -> LocalProject:
+    # Imported first: a folder linked before local projects but not listed since must still refuse another project.
+    _import_project_links(store)
+    return store.link_cloud(
+        root_path=root, cloud_project_id=cloud_project_id, name=name, owner=owner
+    )
+
+
+def _cloud_owner(owner: LocalProjectCloudOwner | None) -> CloudOwner | None:
+    return CloudOwner(**owner.model_dump(by_alias=False)) if owner is not None else None
+
+
+def _set_local_project_roots(
+    store: LocalProjectStore, project_id: str, roots: list[Path]
+) -> LocalProject:
+    # Imported first: a folder linked since the last listing must count as linked.
+    _import_project_links(store)
+    return store.set_roots(project_id, roots, VibeProjectsStore())
+
+
+def _remove_local_project(store: LocalProjectStore, project_id: str) -> None:
+    # Imported first: a folder linked to its cloud project since the last listing joins it, so its link goes too.
+    _import_project_links(store)
+    try:
+        store.remove(project_id, VibeProjectsStore())
+    except LocalProjectNotFound:
+        # The import merged it into the project its folder is now linked to: it is gone already.
+        if not any(
+            project_id in project.merged_ids for project in store.list_projects()
+        ):
+            raise
+
+
+def _import_project_links(store: LocalProjectStore) -> None:
+    # Runs on every list and link so links saved before local projects count too.
+    # Best effort: a failed purge or import must not hide the projects already stored.
+    links_store = VibeProjectsStore()
+    try:
+        # Purged first, so the import below no longer reads the links of a project an older server hid.
+        store.purge_removed(links_store)
+    except LocalProjectStoreUnreadable:
+        raise
+    except Exception as exc:
+        _report_failure(exc, "Could not purge removed local projects")
+    try:
+        store.import_links(links_store)
+    except LocalProjectStoreUnreadable:
+        raise
+    except Exception as exc:
+        _report_failure(exc, "Could not import project links")
+
+
+def _report_failure(exc: Exception, message: str) -> None:
+    logger.warning(message, exc_info=True)
+    capture_sentry_exception(
+        exc,
+        fatal=False,
+        tags={"vibe_boundary": "local_projects", "error_type": type(exc).__name__},
+    )
+
+
 def _root_path(value: str) -> Path:
+    if not Path(value).expanduser().is_dir():
+        raise LocalProjectError(f"Not a folder: {value!r}")
+    return _project_path(value)
+
+
+def _project_path(value: str) -> Path:
+    """An absolute path, resolved; the store checks that a new folder is there."""
     root = Path(value).expanduser()
-    if not root.is_absolute() or not root.is_dir():
+    if not root.is_absolute():
         raise LocalProjectError(f"Not a folder: {value!r}")
     resolved = root.resolve()
     if resolved.parent == resolved:
@@ -117,10 +231,19 @@ def _view(project: LocalProject) -> LocalProjectView:
         id=project.id,
         name=project.name,
         root_paths=[str(root) for root in project.root_paths],
+        has_commits=folder_has_commits(project.root_paths[0]),
         created_at=project.created_at,
         updated_at=project.updated_at,
         cloud=(
-            LocalProjectCloudView(project_id=cloud.project_id, state=cloud.state)
+            LocalProjectCloudView(
+                project_id=cloud.project_id,
+                state=cloud.state,
+                owner=(
+                    LocalProjectCloudOwner(**asdict(cloud.owner))
+                    if cloud.owner is not None
+                    else None
+                ),
+            )
             if cloud is not None
             else None
         ),

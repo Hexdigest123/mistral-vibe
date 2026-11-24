@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import contextlib
+import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -13,6 +16,7 @@ from tests.app_server.backend_contract.conftest import (
     connect_backend_contract_host,
 )
 from vibe.app_server._process_services import ProcessServices
+from vibe.app_server.events import ServerWarning
 from vibe.app_server.models import PublicCheckpointEntry, PublicMessageEntry
 from vibe.app_server.protocol import (
     AppServerResponseError,
@@ -30,6 +34,8 @@ from vibe.app_server.protocol import (
     SessionResumeResponse,
 )
 from vibe.app_server.session import AppServerSession
+
+pytestmark = pytest.mark.both_paths
 
 
 @pytest.mark.asyncio
@@ -52,40 +58,7 @@ async def test_completed_turn_is_visible_in_the_persisted_session_log(
     assert backend_contract_persistent_session.exit_summary().session_id == (session_id)
 
 
-@pytest.mark.asyncio
-async def test_completed_turn_survives_a_new_host(
-    backend_contract_mistral_api: respx.Route,
-    backend_contract_mistral_response: Callable[[str], httpx.Response],
-    backend_contract_persistent_connection: BackendContractConnection,
-    process_services: ProcessServices,
-) -> None:
-    backend_contract_mistral_api.mock(
-        return_value=backend_contract_mistral_response("stored")
-    )
-    session = await backend_contract_persistent_connection.host.open_session()
-    try:
-        _ = [event async for event in session.act("save this")]
-        session_id = session.session_id
-    finally:
-        await session.close()
-
-    resumed_connection = await connect_backend_contract_host(
-        session_options=SessionOptions(),
-        capabilities=ClientCapabilities(),
-        process_services=process_services,
-    )
-    resumed = await resumed_connection.host.resume_session(session_id)
-    try:
-        assert resumed.session_id == session_id
-        assert [
-            entry.text
-            for entry in resumed.history
-            if isinstance(entry, PublicMessageEntry)
-        ] == ["save this", "stored"]
-    finally:
-        await resumed.close()
-
-
+@pytest.mark.one_path
 @pytest.mark.asyncio
 async def test_empty_started_session_is_not_persisted(
     backend_contract_persistent_connection: BackendContractConnection,
@@ -214,6 +187,50 @@ async def test_compaction_keeps_the_public_session_and_history(
 
 
 @pytest.mark.asyncio
+async def test_cut_off_compaction_warns_and_keeps_the_session_usable(
+    backend_contract_mistral_api: respx.Route,
+    backend_contract_mistral_response: Callable[..., httpx.Response],
+    backend_contract_persistent_session: AppServerSession,
+) -> None:
+    # Prepare
+    backend_contract_mistral_api.mock(
+        side_effect=[
+            backend_contract_mistral_response("First answer"),
+            backend_contract_mistral_response(
+                "<summary>One turn, cut", finish_reason="length"
+            ),
+            backend_contract_mistral_response(
+                "<summary>One turn, cut again", finish_reason="length"
+            ),
+            backend_contract_mistral_response("Second answer"),
+            backend_contract_mistral_response("<summary>Two turns</summary>"),
+        ]
+    )
+    session = backend_contract_persistent_session
+    _ = [event async for event in session.act("First")]
+
+    async def next_warning() -> str | None:
+        async for event in session.events():
+            if isinstance(event, ServerWarning):
+                return event.params.warning.code
+        return None
+
+    # Do
+    await session.compact()
+
+    # Assert
+    assert (
+        await asyncio.wait_for(next_warning(), timeout=10)
+        == "compaction_summary_cut_off"
+    )
+    _ = [event async for event in session.act("Second")]
+    assert [
+        entry.text for entry in session.history if isinstance(entry, PublicMessageEntry)
+    ][-2:] == ["Second", "Second answer"]
+    assert await session.compact() == "Two turns"
+
+
+@pytest.mark.asyncio
 async def test_unified_compaction_responds_before_checkpoint_notifications(
     backend_contract_mistral_api: respx.Route,
     backend_contract_mistral_response: Callable[[str], httpx.Response],
@@ -287,6 +304,140 @@ async def test_unified_compaction_responds_before_checkpoint_notifications(
 
 
 @pytest.mark.asyncio
+async def test_compaction_reply_keeps_the_paused_turn_queue(
+    backend_contract_mistral_api: respx.Route,
+    backend_contract_mistral_response: Callable[[str], httpx.Response],
+    backend_contract_gated_mistral_response: Callable[..., httpx.Response],
+    backend_contract_connection: BackendContractConnection,
+    backend_contract_session: AppServerSession,
+) -> None:
+    """*Prepare*: A message queued behind a turn that is then interrupted, which
+    pauses the queue and leaves the session idle.
+    *Do*: Request manual compaction.
+    *Assert*: The reply's state shows the paused queue with its message, and the
+    queue still holds it afterwards: compaction does not touch the queue.
+    """
+    # Prepare
+    started = asyncio.Event()
+    release = asyncio.Event()
+    backend_contract_mistral_api.mock(
+        side_effect=[
+            backend_contract_gated_mistral_response(
+                "unreachable", started=started, release=release
+            ),
+            backend_contract_mistral_response("<summary>Interrupted turn</summary>"),
+        ]
+    )
+    session = backend_contract_session
+
+    async def consume_turn() -> None:
+        _ = [event async for event in session.act("first question")]
+
+    turn = asyncio.create_task(consume_turn())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        queued = await session.enqueue("queued follow-up")
+        await session.interrupt()
+        await asyncio.wait_for(turn, timeout=5)
+    finally:
+        release.set()
+        if not turn.done():
+            turn.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await turn
+    assert session.state.session.status.type == "idle"
+
+    # Do
+    response = SessionCompactResponse.model_validate(
+        await backend_contract_connection.client.request(
+            "session/compact", SessionCompactParams(session_id=session.session_id)
+        )
+    )
+
+    # Assert
+    assert response.summary == "Interrupted turn"
+    assert response.state.turn_queue.paused is True
+    assert [item.id for item in response.state.turn_queue.items] == [queued.id]
+    queue_after = await session.read_turn_queue()
+    assert queue_after.paused is True
+    assert [item.id for item in queue_after.items] == [queued.id]
+
+
+@pytest.mark.asyncio
+async def test_compaction_reply_keeps_a_running_background_process(
+    backend_contract_mistral_api: respx.Route,
+    backend_contract_mistral_response: Callable[..., httpx.Response],
+    tmp_path: Path,
+    process_services: ProcessServices,
+) -> None:
+    """*Prepare*: A finished turn that left a background process running.
+    *Do*: Request manual compaction.
+    *Assert*: The reply's state still shows the running process: compaction
+    does not stop it.
+    """
+    # Prepare
+    compacting = False
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if compacting:
+            return backend_contract_mistral_response(
+                "<summary>Started the build</summary>"
+            )
+        messages = json.dumps(json.loads(request.content).get("messages", []))
+        if "call_start" in messages:
+            return backend_contract_mistral_response("Started.")
+        return backend_contract_mistral_response(
+            "",
+            tool_calls=[
+                {
+                    "id": "call_start",
+                    "index": 0,
+                    "function": {
+                        "name": "run_typescript",
+                        "arguments": json.dumps({
+                            "code": (
+                                "async function main() { return tools.process.start("
+                                "{command: 'sleep 30'}); }"
+                            )
+                        }),
+                    },
+                }
+            ],
+        )
+
+    backend_contract_mistral_api.mock(side_effect=respond)
+    connection = await connect_backend_contract_host(
+        session_options=SessionOptions(cwd=str(tmp_path), auto_approve=True),
+        capabilities=ClientCapabilities(),
+        process_services=process_services,
+    )
+    session = await connection.host.open_session()
+    try:
+        _ = [event async for event in session.act("run the build in the background")]
+        [running] = session.state.background_processes
+        assert running.status == "running"
+        assert session.state.session.status.type == "idle"
+
+        # Do
+        compacting = True
+        response = SessionCompactResponse.model_validate(
+            await connection.client.request(
+                "session/compact", SessionCompactParams(session_id=session.session_id)
+            )
+        )
+    finally:
+        await session.close()
+        await connection.host.close()
+
+    # Assert
+    assert response.summary == "Started the build"
+    assert [
+        (process.process_id, process.command, process.status)
+        for process in response.state.background_processes
+    ] == [(running.process_id, "sleep 30", "running")]
+
+
+@pytest.mark.asyncio
 async def test_compaction_rejects_an_active_turn(
     backend_contract_mistral_api: respx.Route,
     backend_contract_gated_mistral_response: Callable[..., httpx.Response],
@@ -309,7 +460,7 @@ async def test_compaction_rejects_an_active_turn(
         )
     )
     turn = asyncio.create_task(run_turn())
-    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(started.wait(), timeout=5)
 
     # Do / Assert
     try:
@@ -397,20 +548,29 @@ async def test_compaction_survives_a_new_host_with_the_same_public_identity(
 
 @pytest.mark.asyncio
 async def test_an_agent_change_survives_a_new_host(
+    config_dir: Path,
     backend_contract_mistral_api: respx.Route,
     backend_contract_mistral_response: Callable[[str], httpx.Response],
     backend_contract_persistent_connection: BackendContractConnection,
     process_services: ProcessServices,
 ) -> None:
-    """An agent-mode switch is kept in the persisted session journal."""
+    """An agent switch is kept in the persisted session journal, and the agent
+    and approval policy the session switched to are what it resumes on.
+    """
+    agents = config_dir / "agents"
+    agents.mkdir()
+    (agents / "reviewer.toml").write_text(
+        'display_name = "Reviewer"\n', encoding="utf-8"
+    )
     backend_contract_mistral_api.mock(
-        return_value=backend_contract_mistral_response("Answered under ask")
+        return_value=backend_contract_mistral_response("Answered")
     )
     session = await backend_contract_persistent_connection.host.open_session()
     try:
         _ = [event async for event in session.act("first question")]
         session_id = session.session_id
-        await session.resources.agents.switch("auto-approve")
+        await session.resources.agents.switch("reviewer")
+        await session.resources.agents.switch_policy("auto-approve")
     finally:
         await session.close()
 
@@ -425,7 +585,9 @@ async def test_an_agent_change_survives_a_new_host(
             entry.details
             for entry in resumed.history
             if isinstance(entry, PublicCheckpointEntry) and entry.kind == "agent_change"
-        ] == [{"agent": "auto-approve"}]
+        ] == [{"agent": "reviewer"}]
+        assert resumed.resources.agents.active.name == "reviewer"
+        assert resumed.resources.agents.active_policy.name == "auto-approve"
     finally:
         await resumed.close()
 

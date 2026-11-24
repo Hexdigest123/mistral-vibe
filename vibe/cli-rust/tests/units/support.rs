@@ -11,11 +11,11 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use vibe_rs::app::{App, Status};
 use vibe_rs::message_queue::QueueItem;
-use vibe_rs::resume_picker::Session;
 use vibe_rs::selection::Region;
 use vibe_rs::server::{
     Client, HistoryEntry, MessageContent, Notification, QuestionChoice, UserQuestion,
 };
+use vibe_rs::sessions_page::Session;
 use vibe_rs::transcript::Transcript;
 
 pub fn stub() -> Arc<Client> {
@@ -30,10 +30,9 @@ pub fn ctrl(character: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
 }
 
-/// Route one key through the app's top-level input handler; true means exit.
+/// Route one key through the event loop's real key dispatch; true means exit.
 pub fn send_key(app: &mut App, key: KeyEvent) -> bool {
-    let (config_tx, _config_rx) = mpsc::channel(1);
-    vibe_rs::input::handle_key(app, &stub(), &config_tx, key)
+    vibe_rs::event_loop::route_key(app, &stub(), key)
 }
 
 pub fn press(app: &mut App, code: KeyCode) -> bool {
@@ -148,16 +147,16 @@ pub fn question_region(x: u16, y: u16, width: u16, height: u16) -> Region {
     }
 }
 
-/// An app with the resume picker open on one highlighted saved session, "busy".
-pub fn with_picker() -> App {
+/// An app with the Sessions page open on one highlighted saved session, "busy".
+pub fn with_page() -> App {
     let mut app = App::default();
-    app.resume_picker.open = true;
-    app.resume_picker.sessions = vec![Session {
+    app.sessions_page.open = true;
+    app.sessions_page.sessions = vec![Session {
         id: "busy".into(),
         title: "Saved implementation".into(),
         ..Default::default()
     }];
-    app.resume_picker.list.highlight(0);
+    vibe_rs::sessions_page::relayout(&mut app);
     app
 }
 
@@ -191,6 +190,19 @@ pub fn bottom_bar(app: &mut App, width: u16) -> Buffer {
 
 pub fn bottom_bar_row(app: &mut App, width: u16) -> String {
     row(&bottom_bar(app, width), 0)
+}
+
+/// Paint the status rail alone on a `width`-cell row.
+pub fn rail(app: &mut App, width: u16) -> Buffer {
+    render(width, 1, |frame| {
+        vibe_rs::ui::rail::draw(app, frame, frame.area())
+    })
+}
+
+/// The cell where `text` starts in a row of one-cell glyphs, some multi-byte (`⧉`, `·`).
+pub fn column(row: &str, text: &str) -> u16 {
+    let byte = row.find(text).expect("text");
+    row[..byte].chars().count() as u16
 }
 
 /// A prompt the server already queued, with the same UI and server id.
@@ -238,8 +250,9 @@ pub async fn settle() {
 }
 
 /// A live transcript built from history entries.
+/// The main transcript fed `entries` as live events.
 pub fn live(entries: &[Value]) -> Transcript {
-    let mut transcript = Transcript::default();
+    let mut transcript = Transcript::main();
     for entry in entries {
         transcript.add(&json!({ "entry": entry }));
     }
@@ -291,4 +304,11 @@ pub fn message(id: &str, role: &str, text: &str) -> Value {
         "content": [{"type": "text", "text": text}],
         "generationStatus": "completed",
     })
+}
+
+/// An app with a picker open in the box's place (the theme picker).
+pub fn with_picker() -> App {
+    let mut app = App::default();
+    vibe_rs::theme_picker::open(&mut app);
+    app
 }

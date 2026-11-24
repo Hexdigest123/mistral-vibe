@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Mapping
 import copy
 from typing import Any
 
@@ -17,10 +17,17 @@ from vibe.core.config.layers.project import ProjectConfigLayer
 from vibe.core.config.layers.user import UserConfigLayer
 from vibe.core.config.orchestrator import (
     ConfigOrchestrator,
+    FieldMutation,
+    FieldsMutation,
     _changed_keys_between,
     _sparse_override_model_aliases,
 )
-from vibe.core.config.patch import PatchOp, ensure_parent_paths
+from vibe.core.config.patch import (
+    AddOperationPatch,
+    PatchOp,
+    RemoveOperationPatch,
+    ensure_parent_paths,
+)
 from vibe.core.config.types import ConfigChangeEvent, ConflictStrategy
 from vibe.core.utils.concurrency import run_sync
 
@@ -74,14 +81,22 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
         return self._extra_layers.pop(index)
 
     def rebuild(self) -> None:
+        self._install(run_sync(self._builder_for_rebuild().build()))
+
+    async def arebuild(self) -> None:
+        self._install(await self._builder_for_rebuild().build())
+
+    def _builder_for_rebuild(self) -> ConfigBuilder[C]:
         builder = ConfigBuilder(type(self._base_config))
         builder.add_layer(
             OverridesLayer(
-                data=self._base_config.model_dump(mode="json"), name="fake-base"
+                data=self._base_config.model_dump(mode="json"), name="user-supplied"
             )
         )
         builder.add_layers(list(self._extra_layers))
-        result = run_sync(builder.build())
+        return builder
+
+    def _install(self, result: C) -> None:
         # The verbatim base is already validated (e.g. active_model fixed up), so
         # re-validation won't reproduce its warnings; carry them forward to match
         # the real orchestrator, which re-merges raw layer snapshots.
@@ -158,16 +173,47 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
         default: Any = None,
         target_layer: str | None = None,
         preflight: Callable[[C], Awaitable[None]] | None = None,
-    ) -> list[BaseException]:
+    ) -> FieldMutation:
         raw = (await self.load_persistence_layer()).model_dump()
         current = JsonPointer(path).resolve(raw, default=copy.deepcopy(default))
-        return await self.set_field(
-            path,
-            mutate(copy.deepcopy(current)),
-            reason,
-            target_layer=target_layer,
-            preflight=preflight,
+        value = mutate(copy.deepcopy(current))
+        if value == current:
+            if preflight is not None:
+                await preflight(self.config)
+            return FieldMutation(previous=current, failures=[])
+        failures = await self.set_field(
+            path, value, reason, target_layer=target_layer, preflight=preflight
         )
+        return FieldMutation(previous=current, failures=failures)
+
+    async def mutate_fields(
+        self,
+        mutations: Mapping[str, Callable[[Any], Any]],
+        reason: str = "No reason",
+        *,
+        default: Any = None,
+        target_layer: str | None = None,
+        preflight: Callable[[C], Awaitable[None]] | None = None,
+    ) -> FieldsMutation:
+        raw = (await self.load_persistence_layer()).model_dump()
+        previous: dict[str, Any] = {}
+        operations: list[PatchOp] = []
+        for path, mutate in mutations.items():
+            current = JsonPointer(path).resolve(raw, default=copy.deepcopy(default))
+            previous[path] = current
+            value = mutate(copy.deepcopy(current))
+            if value != current:
+                operations.append(
+                    AddOperationPatch(
+                        path=path, value=value, target_layer_name=target_layer
+                    )
+                )
+        if not operations:
+            if preflight is not None:
+                await preflight(self.config)
+            return FieldsMutation(previous=previous, failures=[])
+        failures = await self.apply_patch(operations, reason, preflight=preflight)
+        return FieldsMutation(previous=previous, failures=failures)
 
     async def preview_patch(
         self, operations: list[PatchOp], *, without: Collection[str] = ()
@@ -210,11 +256,27 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
         ]
         if persistent_operations:
             orchestrator = await self._persistence_orchestrator()
-            failures = await orchestrator.apply_patch(
-                persistent_operations, reason, on_conflict=on_conflict
-            )
-            if failures:
-                return failures
+            # The persisted stack knows only the models the user file defines:
+            # removing a field of another, which the real stack holds, is the
+            # same no-op there as removing one the file does not set.
+            persisted = orchestrator.config.model_dump()
+            missing = object()
+            persistent_operations = [
+                operation
+                for operation in persistent_operations
+                if not (
+                    isinstance(operation, RemoveOperationPatch)
+                    and operation.path.startswith("/models/")
+                    and JsonPointer(operation.path).resolve(persisted, missing)
+                    is missing
+                )
+            ]
+            if persistent_operations:
+                failures = await orchestrator.apply_patch(
+                    persistent_operations, reason, on_conflict=on_conflict
+                )
+                if failures:
+                    return failures
         self._base_config = type(self._base_config).model_validate(data)
         self.rebuild()
         self._publish(before, reason)
@@ -230,6 +292,9 @@ class FakeConfigOrchestrator[C: VibeConfigSchema](ConfigOrchestrator[C]):
         self, name: str, *, preflight: Callable[[C], Awaitable[None]] | None = None
     ) -> None:
         await self.reload(preflight=preflight)
+
+    async def reload_files(self) -> None:
+        await self.reload()
 
     async def _persistence_orchestrator(self) -> ConfigOrchestrator[C]:
         layer = UserConfigLayer()

@@ -7,6 +7,7 @@ use crate::app::App;
 use crate::selection::flow::{resolve, Flow};
 use crate::selection::fold::{self, Folds};
 use crate::selection::table;
+use crate::selection::RowChrome;
 
 /// The scrolling document owned by a selectable region.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -15,17 +16,21 @@ pub enum ScrollTarget {
     None,
     Transcript,
     Trust,
+    /// A background task's output, which scrolls and grows under its selection.
+    Output,
 }
 
-/// Stable identity for each concurrently painted selectable region. A toast
-/// carries its own id, so a selection stays with that toast while the rack
-/// shifts it and dies with it.
+/// Stable identity for each concurrently painted selectable region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionId {
     Main,
-    Toast(u64),
     Loading,
+    Goal,
     BottomApp,
+    RailWindow,
+    CodePreview,
+    /// The Sessions page preview's conversation, selected like the transcript.
+    Preview,
 }
 
 /// The screen region a drag can select, published by whichever surface painted it.
@@ -82,10 +87,10 @@ impl Region {
         }
     }
 
-    fn origin(&self, scroll_target: ScrollTarget) -> i32 {
+    pub(super) fn origin(&self, scroll_target: ScrollTarget) -> i32 {
         match scroll_target {
             ScrollTarget::None => i32::from(self.area.y),
-            ScrollTarget::Transcript | ScrollTarget::Trust => self.top,
+            ScrollTarget::Transcript | ScrollTarget::Trust | ScrollTarget::Output => self.top,
         }
     }
 }
@@ -93,9 +98,12 @@ impl Region {
 pub fn get(app: &App, id: RegionId) -> Region {
     match id {
         RegionId::Main => app.view.selection_region,
-        RegionId::Toast(_) => app.view.toast_selection_region,
         RegionId::Loading => app.view.loading_selection_region,
+        RegionId::Goal => app.view.goal_selection_region,
         RegionId::BottomApp => app.view.bottom_app_selection_region,
+        RegionId::RailWindow => app.view.rail_window_selection_region,
+        RegionId::CodePreview => app.code_preview.selection,
+        RegionId::Preview => app.sessions_page.preview.view.selection,
     }
 }
 
@@ -108,19 +116,27 @@ pub fn spans(app: &App, buf: &Buffer, chat: Rect) -> Vec<RowSpan> {
         return Vec::new();
     };
     if let Some(table_cell) = &selection.table_cell {
-        return table::screen_spans(app, table_cell, chat);
+        return table::screen_spans(app, table_cell, chat)
+            .into_iter()
+            .flat_map(|span| split(&app.view.selection_chrome, span))
+            .collect();
     }
     let region = get(app, selection.owner);
     let (area, origin) = match selection.scroll_target {
-        ScrollTarget::Trust => (region.scroll_area, region.top),
+        ScrollTarget::Trust | ScrollTarget::Output => (region.scroll_area, region.top),
         // The trust footer uses the full width, below the file-list scrollbar.
         ScrollTarget::None if region.scroll_target == ScrollTarget::Trust => {
             (region.area, region.origin(ScrollTarget::None))
         }
         target => (chat, region.origin(target)),
     };
-    let chrome = selection.owner == RegionId::Main;
-    let gutters: &[RowSpan] = if chrome { &app.view.diff_hitmap } else { &[] };
+    let area = match app.view.bottom_app_selection_halves {
+        Some(halves) if selection.owner == RegionId::BottomApp => {
+            half(halves, selection.anchor.0, area)
+        }
+        _ => area,
+    };
+    let (chrome, row_chrome, raw) = transcript_chrome(app, selection.owner);
     let spans = resolve(
         Flow {
             selection: (selection.anchor, selection.head),
@@ -131,13 +147,18 @@ pub fn spans(app: &App, buf: &Buffer, chat: Rect) -> Vec<RowSpan> {
         app.selection.granularity,
         buf,
         area,
-        gutters,
+        row_chrome,
+        raw,
         false,
     );
+    if selection.owner == RegionId::Preview {
+        return super::preview::highlight(app, spans);
+    }
     if !chrome {
         // A bottom-app box cuts its chrome cells (option prefixes, scrollbars) out of its row spans.
         let gaps = match selection.owner {
             RegionId::BottomApp => &app.view.bottom_app_selection_chrome,
+            RegionId::CodePreview => &app.code_preview.gutters,
             _ => return spans,
         };
         return spans
@@ -172,9 +193,26 @@ pub fn extract_document(app: &App) -> Option<String> {
             &document.buffer,
             document.area,
             &[],
+            &[],
             true,
         );
         return Some(document.extract(&spans));
+    }
+    if selection.scroll_target == ScrollTarget::Output {
+        // Only the selected rows are painted, the first at y zero.
+        let rows = [selection.anchor.1, selection.head.1].map(|row| row.max(0) as usize);
+        let (first, last) = (rows[0].min(rows[1]), rows[0].max(rows[1]));
+        let area = region.scroll_area;
+        let (buffer, folds) = crate::ui::task_output::selection_document(app, area, first, last)?;
+        let flow = Flow {
+            selection: (selection.anchor, selection.head),
+            origin: -i32::try_from(first).ok()?,
+            end_exclusive: region.end_exclusive,
+            chrome: false,
+        };
+        let granularity = app.selection.granularity;
+        let spans = resolve(flow, granularity, &buffer, buffer.area, &[], &[], true);
+        return Some(fold::extract(&buffer, &spans, &folds));
     }
     // A dialog paints everything it owns, so its copy comes from the frame.
     if !region.document {
@@ -191,7 +229,8 @@ pub fn extract_document(app: &App) -> Option<String> {
         app.selection.granularity,
         &document.buffer,
         document.area,
-        &document.gutters,
+        &document.chrome,
+        &document.raw,
         true,
     );
     spans.retain(|(y, _, _)| document.margins.binary_search(y).is_err());
@@ -201,7 +240,7 @@ pub fn extract_document(app: &App) -> Option<String> {
 /// True when a press at `at` anchors a selection: inside the region and on a
 /// cell some widget owns, since bare padding anchors nothing. The
 /// chrome map belongs to its region: the transcript's padding and the
-/// bottom-app box's prefixes and scrollbars; a toast publishes only its text rows.
+/// bottom-app box's prefixes and scrollbars.
 pub fn selectable(app: &App, at: (u16, u16), owner: RegionId) -> bool {
     if !get(app, owner).contains(at) {
         return false;
@@ -209,6 +248,8 @@ pub fn selectable(app: &App, at: (u16, u16), owner: RegionId) -> bool {
     let chrome = match owner {
         RegionId::Main => &app.view.selection_chrome,
         RegionId::BottomApp => &app.view.bottom_app_selection_chrome,
+        RegionId::CodePreview => &app.code_preview.gutters,
+        RegionId::Preview => &app.sessions_page.preview.view.gaps,
         _ => return true,
     };
     !chrome
@@ -216,8 +257,30 @@ pub fn selectable(app: &App, at: (u16, u16), owner: RegionId) -> bool {
         .any(|&(y, x0, x1)| y == at.1 && at.0 >= x0 && at.0 <= x1)
 }
 
+/// The columns of `area` a selection keeps to in a box split in `halves`: those of the half its anchor `column` is in.
+fn half((left, right): (Rect, Rect), column: u16, area: Rect) -> Rect {
+    let half = if column < left.right() { left } else { right };
+    Rect {
+        x: half.x,
+        width: half.width,
+        ..area
+    }
+}
+
+/// Whether `owner` paints a transcript, with its row chrome and `/raw` rows.
+fn transcript_chrome(app: &App, owner: RegionId) -> (bool, &[RowChrome], &[(u16, u16)]) {
+    match owner {
+        RegionId::Main => (true, &app.view.chrome_hitmap, &app.view.raw_hitmap),
+        RegionId::Preview => {
+            let view = &app.sessions_page.preview.view;
+            (true, &view.row_chrome, &view.raws)
+        }
+        _ => (false, &[], &[]),
+    }
+}
+
 /// Cut the cells a screen painted as chrome out of a row span.
-fn split(gaps: &[RowSpan], span: RowSpan) -> Vec<RowSpan> {
+pub(super) fn split(gaps: &[RowSpan], span: RowSpan) -> Vec<RowSpan> {
     let (y, x0, x1) = span;
     let mut spans = vec![span];
     for &(gap_y, gap_x0, gap_x1) in gaps {
@@ -249,13 +312,11 @@ pub fn extract(buf: &Buffer, spans: &[RowSpan]) -> String {
 pub fn folds(app: &App, id: RegionId) -> Folds {
     match id {
         RegionId::BottomApp => app.view.bottom_app_selection_folds.clone(),
-        RegionId::Toast(toast) => app
-            .view
-            .toast_folds
-            .iter()
-            .find(|(painted, _)| *painted == toast)
-            .map(|(_, folds)| folds.clone())
-            .unwrap_or_default(),
-        RegionId::Main | RegionId::Loading => Folds::default(),
+        RegionId::Preview => app.sessions_page.preview.view.folds.clone(),
+        RegionId::Main
+        | RegionId::Loading
+        | RegionId::CodePreview
+        | RegionId::Goal
+        | RegionId::RailWindow => Folds::default(),
     }
 }

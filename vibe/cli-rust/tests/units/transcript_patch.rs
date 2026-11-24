@@ -142,6 +142,35 @@ fn transcript_update_for_an_unknown_entry_is_ignored() {
     assert_eq!(transcript.last_assistant_message().as_deref(), Some("Par"));
 }
 
+/// `/copy` skips a draft a hook rejected or sent back, but keeps an interrupted answer.
+#[test]
+fn copy_skips_a_draft_a_hook_discarded() {
+    let mut transcript = Transcript::default();
+    for (id, text, outcome) in [
+        ("m1", "Kept", json!({"type": "committed"})),
+        (
+            "m2",
+            "Rejected",
+            json!({"type": "discarded", "cause": "failure"}),
+        ),
+    ] {
+        transcript.add(&json!({
+            "entry": {"id": id, "type": "message", "role": "assistant",
+                      "content": [{"type": "text", "text": text}], "outcome": outcome}
+        }));
+    }
+    assert_eq!(transcript.last_assistant_message().as_deref(), Some("Kept"));
+    transcript.add(&json!({
+        "entry": {"id": "m3", "type": "message", "role": "assistant",
+                  "content": [{"type": "text", "text": "Partial"}],
+                  "outcome": {"type": "discarded", "cause": "interrupt"}}
+    }));
+    assert_eq!(
+        transcript.last_assistant_message().as_deref(),
+        Some("Partial")
+    );
+}
+
 #[test]
 fn consecutive_effects_share_one_group_keyed_by_the_first_entry() {
     let mut transcript = Transcript::default();
@@ -155,7 +184,7 @@ fn consecutive_effects_share_one_group_keyed_by_the_first_entry() {
     assert_eq!(second.key, "tool-group:e1");
     assert!(first.first && !first.last);
     assert!(!second.first && second.last);
-    assert_eq!(first.kinds, vec![("file_edit", 1), ("file_search", 1)]);
+    assert_eq!(first.running, vec![("file_edit", 1), ("file_search", 1)]);
     assert!(transcript.is_expandable("tool-group:e1"));
 }
 
@@ -213,34 +242,6 @@ fn hidden_entries_do_not_render_until_reasoning_is_enabled() {
 }
 
 #[test]
-fn hook_notices_mount_only_inside_an_open_container() {
-    let mut transcript = Transcript::default();
-    transcript.add(
-        &json!({"entry": {"id": "n1", "type": "notice", "message": "hook",
-                          "detail": {"kind": "hook_run_started", "scope": "pre_tool",
-                                     "toolCallId": "t1"}}}),
-    );
-    transcript.add(
-        &json!({"entry": {"id": "n2", "type": "notice", "message": "hook",
-                          "detail": {"kind": "hook_completed", "scope": "pre_tool",
-                                     "toolCallId": "t1", "content": "ran lint",
-                                     "hookName": "lint"}}}),
-    );
-    // The lifecycle line is hidden; only the completed line with content mounts.
-    assert_eq!(transcript.lines().count(), 1);
-
-    let mut orphan = Transcript::default();
-    orphan.add(
-        &json!({"entry": {"id": "n2", "type": "notice", "message": "hook",
-                          "detail": {"kind": "hook_completed", "scope": "pre_tool",
-                                     "toolCallId": "t1", "content": "ran lint",
-                                     "hookName": "lint"}}}),
-    );
-    // A completed hook outside any opened container renders nothing.
-    assert_eq!(orphan.lines().count(), 0);
-}
-
-#[test]
 fn groups_with_tools_covers_groupable_entries() {
     let reasoning = HistoryEntry::from_value(&json!({"type": "reasoning", "text": "t"}));
     let hook = HistoryEntry::from_value(&json!({"type": "notice",
@@ -282,19 +283,33 @@ fn group_of(kinds: Vec<(&'static str, usize)>, reasoning: bool) -> Group<'static
         last: true,
         finalized: true,
         kinds,
+        running: Vec::new(),
         reasoning,
+        thinking: false,
+        hooks: 0,
+    }
+}
+
+fn running_group_of(running: Vec<(&'static str, usize)>, thinking: bool) -> Group<'static> {
+    Group {
+        finalized: false,
+        running,
+        thinking,
+        ..group_of(Vec::new(), thinking)
     }
 }
 
 #[test]
 fn group_labels_count_each_kind_then_add_reasoning_and_capitalize() {
     let group = group_of(vec![("file_edit", 3), ("web_search", 1)], false);
-    assert_eq!(group.label(false), "Edited 3 files, ran 1 web search");
-    assert_eq!(group.label(true), "Editing 3 files, running 1 web search");
+    assert_eq!(group.label(), "Edited 3 files, ran 1 web search");
+    let group = running_group_of(vec![("file_edit", 3), ("web_search", 1)], false);
+    assert_eq!(group.label(), "Editing 3 files, running 1 web search");
 
     let thinking = group_of(vec![("subagent", 2)], true);
-    assert_eq!(thinking.label(false), "Ran 2 subagents, thought");
-    assert_eq!(thinking.label(true), "Running 2 subagents, thinking");
+    assert_eq!(thinking.label(), "Ran 2 subagents, thought");
+    let thinking = running_group_of(vec![("subagent", 2)], true);
+    assert_eq!(thinking.label(), "Running 2 subagents, thinking");
 }
 
 #[test]
@@ -304,14 +319,35 @@ fn group_labels_pluralize_by_count() {
         false,
     );
     assert_eq!(
-        group.label(false),
+        group.label(),
         "Read 10 files, loaded 1 skill, ran 3 commands, updated todos 2 times"
     );
 }
 
 #[test]
+fn a_group_of_hook_lines_only_counts_its_hooks() {
+    let hooks_only = Group {
+        hooks: 2,
+        ..group_of(vec![], false)
+    };
+    assert_eq!(hooks_only.label(), "Ran 2 hooks");
+    let running_hooks = Group {
+        hooks: 2,
+        ..running_group_of(vec![], false)
+    };
+    assert_eq!(running_hooks.label(), "Running 2 hooks");
+
+    let with_tools = Group {
+        hooks: 1,
+        ..group_of(vec![("shell", 1)], false)
+    };
+    assert_eq!(with_tools.label(), "Ran 1 command");
+}
+
+#[test]
 fn unknown_kinds_fall_back_to_generic_tool_labels() {
     let group = group_of(vec![("custom_tool", 2)], false);
-    assert_eq!(group.label(false), "Called 2 tools");
-    assert_eq!(group.label(true), "Calling 2 tools");
+    assert_eq!(group.label(), "Called 2 tools");
+    let group = running_group_of(vec![("custom_tool", 2)], false);
+    assert_eq!(group.label(), "Calling 2 tools");
 }

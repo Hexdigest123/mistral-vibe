@@ -9,6 +9,9 @@ use tokio::sync::mpsc::error::TrySendError;
 use crate::app::App;
 use crate::server::{method, Client, TelemetryRecordParams};
 
+pub mod environment;
+pub mod install;
+
 /// Queued events awaiting the event loop. Overflow drops the emission attempt:
 /// telemetry must never stall the UI thread or grow without bound.
 pub const TELEMETRY_CHANNEL_CAP: usize = 64;
@@ -49,14 +52,10 @@ pub fn enqueue(
 
 /// Effect side: detached, so no caller ever waits on an analytics round-trip.
 pub fn send(client: &Arc<Client>, session_id: &str, event: TelemetryEvent) {
-    client.telemetry_spawned();
+    // Tracked, so the replay ack waits until the frame is sent and answered.
     let client = client.clone();
     let session_id = session_id.to_owned();
-    tokio::spawn(async move {
-        let answer = deliver(&client, &session_id, event);
-        client.telemetry_written();
-        answer.await;
-    });
+    crate::work::spawn(async move { deliver(&client, &session_id, event).await });
 }
 
 /// Send what is still queued, concurrently, so the last actions (such as
@@ -125,12 +124,13 @@ pub fn slash_command_clicked(app: &App, command: &str, entry_point: &str) {
     );
 }
 
-pub fn user_copied_text(app: &App, text: &str) {
-    record(
-        app,
-        event::USER_COPIED_TEXT,
-        bmap(json!({"text_length": text.chars().count()})),
-    );
+/// A copy; `source` names the surface it came from where one is tagged, such as `code_preview`.
+pub fn user_copied_text(app: &App, text: &str, source: Option<&str>) {
+    let mut properties = bmap(json!({"text_length": text.chars().count()}));
+    if let Some(source) = source {
+        properties.insert("source".to_owned(), source.into());
+    }
+    record(app, event::USER_COPIED_TEXT, properties);
 }
 
 pub fn user_cancelled_action(app: &App, action: &str) {
@@ -150,6 +150,79 @@ pub fn session_branched(app: &App, source_session_id: &str, new_session_id: &str
             "source_session_id": source_session_id,
             "new_session_id": new_session_id,
         })),
+    );
+}
+
+/// A `/cd` ended. `status` is success, cancelled or error; `reason` says why it
+/// did not move: refused_busy, trust_declined, not_a_directory or error. Never a path.
+pub fn session_relocation_done(app: &App, status: &str, reason: Option<&str>) {
+    record(
+        app,
+        event::SESSION_RELOCATION_DONE,
+        bmap(json!({"status": status, "reason": reason})),
+    );
+}
+
+/// The session list opened; `trigger` is left, sessions_command, resume_command or startup.
+pub fn session_search_opened(app: &App, trigger: &str) {
+    record(
+        app,
+        event::SESSION_SEARCH_OPENED,
+        bmap(json!({"trigger": trigger})),
+    );
+}
+
+/// One action on a session of the list; never a path, title or search text.
+pub fn session_search_selected(
+    app: &App,
+    action: &str,
+    position: Option<usize>,
+    search_active: bool,
+    same_project: Option<bool>,
+) {
+    let properties = json!({
+        "action": action,
+        "position": position,
+        "search_active": search_active,
+        "same_project": same_project,
+    });
+    record(app, event::SESSION_SEARCH_SELECTED, bmap(properties));
+}
+
+/// A `/trusted-folders` change the server stored; the path never leaves the machine.
+pub fn trusted_folder_updated(app: &App, action: &str) {
+    record(
+        app,
+        event::TRUSTED_FOLDER_UPDATED,
+        bmap(json!({"action": action})),
+    );
+}
+
+/// The first Normal-mode entry since `vim_keybindings` turned on.
+pub fn vim_normal_mode_entered(app: &App) {
+    record(app, event::VIM_NORMAL_MODE_ENTERED, BTreeMap::new());
+}
+
+/// The tmux `mouse off` warning was filed in the startup box.
+pub fn tmux_mouse_hint_rendered(app: &App) {
+    record(app, event::TMUX_MOUSE_HINT_RENDERED, BTreeMap::new());
+}
+
+/// The user hid the tmux `mouse off` warning for good.
+pub fn tmux_mouse_hint_disabled(app: &App, entry_point: &str) {
+    record(
+        app,
+        event::TMUX_MOUSE_HINT_DISABLED,
+        bmap(json!({"entry_point": entry_point})),
+    );
+}
+
+/// `/raw` switched agent messages between raw Markdown and formatted rendering.
+pub fn raw_mode_toggled(app: &App, enabled: bool) {
+    record(
+        app,
+        event::RAW_MODE_TOGGLED,
+        bmap(json!({"enabled": enabled})),
     );
 }
 
@@ -207,12 +280,24 @@ pub fn bmap(value: Value) -> BTreeMap<String, Value> {
 /// stream per event regardless of which client produced it.
 pub mod event {
     pub const STARTUP: &str = "vibe.startup";
+    pub const VERSION_UPDATED: &str = "vibe.version.updated";
     pub const SLASH_COMMAND_USED: &str = "vibe.slash_command_used";
+    pub const MODEL_SELECTION_OPENED: &str = "vibe.model_selection.opened";
+    pub const MODEL_SELECTION_SELECTED: &str = "vibe.model_selection.selected";
     pub const AT_MENTION_INSERTED: &str = "vibe.at_mention_inserted";
     pub const USER_COPIED_TEXT: &str = "vibe.user_copied_text";
     pub const USER_CANCELLED_ACTION: &str = "vibe.user_cancelled_action";
     pub const SESSION_BRANCHED: &str = "vibe.session_branched";
     pub const VOICE_MODE_TOGGLED: &str = "vibe.voice_mode_toggled";
+    pub const RAW_MODE_TOGGLED: &str = "vibe.raw_mode_toggled";
+    pub const VIM_NORMAL_MODE_ENTERED: &str = "vibe.vim_normal_mode_entered";
+    pub const TMUX_MOUSE_HINT_RENDERED: &str = "vibe.tmux_mouse_hint.rendered";
+    pub const TMUX_MOUSE_HINT_DISABLED: &str = "vibe.tmux_mouse_hint.disabled";
+    /// The code preview popup was first painted, so the user saw it.
+    pub const CODE_PREVIEW_OPENED: &str = "vibe.code_preview.opened";
+    /// A code preview attempt ended: `success` once seen, `error` on a failed read, else `cancelled`.
+    pub const CODE_PREVIEW_DONE: &str = "vibe.code_preview.done";
+    pub const TRUSTED_FOLDER_UPDATED: &str = "vibe.trusted_folder.updated";
     pub const TRANSCRIPTION_START: &str = "vibe.audio.transcription.start";
     pub const TRANSCRIPTION_CANCEL: &str = "vibe.audio.transcription.cancel_recording";
     pub const TRANSCRIPTION_DONE: &str = "vibe.audio.transcription.done";
@@ -220,4 +305,10 @@ pub mod event {
     pub const READ_ALOUD_REQUESTED: &str = "vibe.read_aloud.requested";
     pub const READ_ALOUD_PLAY_STARTED: &str = "vibe.read_aloud.play_started";
     pub const READ_ALOUD_ENDED: &str = "vibe.read_aloud.ended";
+    /// A `/cd` ended: `status` success, cancelled or error, with a `reason` when it did not move.
+    pub const SESSION_RELOCATION_DONE: &str = "vibe.session_relocation.done";
+    /// The Sessions page, the list of every session, opened.
+    pub const SESSION_SEARCH_OPENED: &str = "vibe.session_search.opened";
+    /// An action on a session row of that list (open, new, archive, rename, filters).
+    pub const SESSION_SEARCH_SELECTED: &str = "vibe.session_search.selected";
 }

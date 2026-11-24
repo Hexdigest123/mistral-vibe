@@ -2,6 +2,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+use crate::core::features::sign_in;
 use crate::core::hooks::{HookToolKey, HookToolTarget};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -13,6 +14,10 @@ pub(crate) enum RuntimeBuiltinToolName {
     FileSystemEdit,
     FileSystemBash,
     SkillRead,
+    /// `builtin.auth.request_sign_in`: asks the user to sign in and waits for the answer.
+    SignInRequest,
+    /// `builtin.auth.list_unauthenticated_sources`: lists the sources the user has not signed in to.
+    SignInList,
     ProcessStart,
     ProcessOutput,
     ProcessWrite,
@@ -62,6 +67,8 @@ impl RuntimeBuiltinToolName {
             Self::FileSystemEdit => "file_system.edit",
             Self::FileSystemBash => "file_system.bash",
             Self::SkillRead => "skill.read",
+            Self::SignInRequest => sign_in::REQUEST_TOOL_ID,
+            Self::SignInList => sign_in::LIST_TOOL_ID,
             Self::ProcessStart => "process.start",
             Self::ProcessOutput => "process.output",
             Self::ProcessWrite => "process.write",
@@ -91,6 +98,8 @@ impl RuntimeBuiltinToolName {
             "file_system.edit" => Some(Self::FileSystemEdit),
             "file_system.bash" => Some(Self::FileSystemBash),
             "skill.read" => Some(Self::SkillRead),
+            sign_in::REQUEST_TOOL_ID => Some(Self::SignInRequest),
+            sign_in::LIST_TOOL_ID => Some(Self::SignInList),
             "process.start" => Some(Self::ProcessStart),
             "process.output" => Some(Self::ProcessOutput),
             "process.write" => Some(Self::ProcessWrite),
@@ -121,11 +130,12 @@ impl RuntimeBuiltinToolName {
     /// `None` keeps the schema's text.
     pub(crate) fn explain_schema_error(
         self,
+        schema: &Value,
         error: &jsonschema::ValidationError<'_>,
     ) -> Option<String> {
         match self {
             Self::SubagentSpawn => {
-                crate::core::features::subagents::explain_spawn_schema_error(error)
+                crate::core::features::subagents::explain_spawn_schema_error(schema, error)
             }
             Self::ProcessWrite => {
                 crate::core::features::background_processes::explain_write_schema_error(error)
@@ -167,6 +177,8 @@ impl RuntimeBuiltinToolName {
             | Self::DeprecatedFileSystemSearchReplace
             | Self::FileSystemBash
             | Self::SkillRead
+            | Self::SignInRequest
+            | Self::SignInList
             | Self::ProcessStart
             | Self::ProcessOutput
             | Self::ProcessWrite
@@ -187,6 +199,8 @@ impl RuntimeBuiltinToolName {
             }
             Self::FileSystemBash => command_invocation_name(invocation_name),
             Self::SkillRead => Some("skill".to_string()),
+            Self::SignInRequest => Some(sign_in::ToolName::Request.direct_name().to_string()),
+            Self::SignInList => Some(sign_in::ToolName::List.direct_name().to_string()),
             Self::SelfSleep
             | Self::ProcessStart
             | Self::ProcessOutput
@@ -217,7 +231,7 @@ impl RuntimeBuiltinToolName {
                 Some("edit".to_string())
             }
             Self::FileSystemBash => command_invocation_name(invocation_name),
-            Self::SkillRead => None,
+            Self::SkillRead | Self::SignInRequest | Self::SignInList => None,
             Self::ProcessStart => Some("process_start".to_string()),
             Self::ProcessOutput => Some("process_output".to_string()),
             Self::ProcessWrite => Some("process_write".to_string()),
@@ -239,7 +253,9 @@ impl RuntimeBuiltinToolName {
 
     fn hook_tool_key(self) -> HookToolKey {
         let target = match self {
-            Self::SelfSleep | Self::SelfWait => HookToolTarget::SelfTool,
+            Self::SelfSleep | Self::SelfWait | Self::SignInRequest | Self::SignInList => {
+                HookToolTarget::SelfTool
+            }
             Self::FileSystemReadFile
             | Self::FileSystemWriteFile
             | Self::FileSystemEdit
@@ -348,6 +364,10 @@ pub(crate) enum ExternalTool {
     Provided {
         group_name: String,
         tool_name: String,
+        /// The name the model called. A direct tool can have a function name that
+        /// differs from its tool name.
+        #[serde(skip)]
+        invocation_name: String,
         arguments: Value,
     },
 }
@@ -426,6 +446,7 @@ impl ExternalTool {
             } => Self::Provided {
                 group_name,
                 tool_name,
+                invocation_name: invocation_name.into(),
                 arguments,
             },
         }
@@ -451,10 +472,12 @@ impl ExternalTool {
             Self::Provided {
                 group_name,
                 tool_name,
+                invocation_name,
                 ..
             } => Self::Provided {
                 group_name: group_name.clone(),
                 tool_name: tool_name.clone(),
+                invocation_name: invocation_name.clone(),
                 arguments,
             },
         }
@@ -467,7 +490,9 @@ impl ExternalTool {
                 invocation_name,
                 ..
             } => name.direct_model_name(invocation_name),
-            Self::Provided { tool_name, .. } => Some(tool_name.clone()),
+            Self::Provided {
+                invocation_name, ..
+            } => Some(invocation_name.clone()),
         }
     }
 
@@ -523,6 +548,7 @@ impl ExternalTool {
             group_name,
             tool_name,
             arguments,
+            ..
         } = self
         else {
             return None;

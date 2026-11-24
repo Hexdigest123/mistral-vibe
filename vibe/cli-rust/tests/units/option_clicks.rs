@@ -6,7 +6,7 @@ use serde_json::json;
 use vibe_rs::app::{App, ModelOption};
 use vibe_rs::mouse::{self, MouseTarget};
 use vibe_rs::server::{PublicChildSession, SessionStatus};
-use vibe_rs::{config, config_edit, config_fields, log_level_picker, resume_picker, subagents};
+use vibe_rs::{config, config_edit, config_fields, log_level_picker, sessions_page, subagents};
 
 use crate::support::{mouse, send_mouse};
 
@@ -184,50 +184,25 @@ fn a_log_level_row_highlights_and_its_badge_toggles_on_one_click() {
 }
 
 #[tokio::test]
-async fn a_saved_session_resumes_on_the_second_click() {
-    let mut app = app_on(MouseTarget::ResumePicker);
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+async fn a_saved_session_opens_on_the_second_click() {
+    let mut app = app_on(MouseTarget::SessionsPage);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
     app.events = Some(tx);
-    app.resume_picker.open = true;
-    app.resume_picker.sessions = ["a", "b"]
-        .map(|id| resume_picker::Session {
+    app.set_status(vibe_rs::app::Status::Ready);
+    app.sessions_page.open = true;
+    app.sessions_page.sessions = ["a", "b"]
+        .map(|id| sessions_page::Session {
             id: id.into(),
             ..Default::default()
         })
         .to_vec();
-    app.resume_picker.list.layout_rows(2, AREA);
+    sessions_page::relayout(&mut app);
+    app.sessions_page.browse.list.layout_rows(2, AREA);
 
     click(&mut app, 1);
-    assert_eq!(app.resume_picker.list.selected(), 1);
-    assert!(!app.resume_picker.resuming);
+    assert_eq!(app.sessions_page.browse.list.selected(), 1);
+    assert!(app.sessions_page.busy.is_none());
 
     click(&mut app, 1);
-    assert!(app.resume_picker.resuming);
-}
-
-#[test]
-fn a_remote_project_click_on_the_highlight_while_searching_confirms_it() {
-    let mut app = app_on(MouseTarget::RemoteProject);
-    let state = &mut app.vibe_code_project;
-    state.view = Some(
-        serde_json::from_value(json!({
-            "context": {"repoUrl": "https://github.com/org/repo.git", "repoName": "repo"},
-            "state": {"nextCursor": null, "projects": []},
-            "git": {"defaultBranch": "main", "branch": "feature"}
-        }))
-        .unwrap(),
-    );
-    state.show_picker();
-    state.query.text = "missing".into();
-    state.refresh(None);
-    let lines: Vec<_> = (0..state.items.len())
-        .map(|index| state.items[index].selectable().then_some(index))
-        .collect();
-    state.list.layout(&lines, AREA);
-    let row = state.list.selected() as u16;
-    state.search_focused = true;
-
-    click(&mut app, row);
-    assert!(!app.vibe_code_project.search_focused);
-    assert!(app.vibe_code_project.create.is_some());
+    assert!(app.sessions_page.busy.is_some());
 }

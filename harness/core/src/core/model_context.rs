@@ -87,14 +87,8 @@ impl ModelContext {
     }
 
     /// Older checkpoints carry messages without a Turn group; restoring assigns them one.
-    pub(crate) fn restored(mut messages: Vec<StoredMessage>) -> Self {
-        assign_turn_indexes(&mut messages);
-        Self {
-            messages,
-            revision: 0,
-            replacement_revision: 0,
-            change: ContextChange::Clean,
-        }
+    pub(crate) fn restored(messages: Vec<StoredMessage>) -> Self {
+        Self::new(messages)
     }
 
     pub(crate) fn push(&mut self, message: StoredMessage) {
@@ -139,6 +133,64 @@ impl ModelContext {
         self.replace_messages(messages);
     }
 
+    /// Replaces the input of the latest Turn, whose request the provider rejected, with an
+    /// injected context message holding `note`, so later Turns do not send the input again.
+    /// Returns whether it replaced a message.
+    ///
+    /// The input is the newest user message from the history in the Turn's group, before the
+    /// `delivered_steering` steering messages the Turn added after it: the Turn's own message,
+    /// or its copy after a compaction during the Turn. Everything else in the group stays,
+    /// such as steering, notifications, context messages and a compaction summary.
+    /// Nothing is replaced when the model already answered in the Turn: an assistant message
+    /// or a tool result follows the input.
+    ///
+    /// Replacing keeps the message count, which identities such as completion Action IDs
+    /// derive from, and keeps a context that holds only the system prompt from arising.
+    pub(crate) fn replace_rejected_turn_input(
+        &mut self,
+        delivered_steering: u32,
+        note: &str,
+    ) -> bool {
+        let Some(latest) = self.latest_turn_index() else {
+            return false;
+        };
+        let start = self
+            .messages
+            .iter()
+            .rposition(|message| message.turn_index != Some(latest))
+            .map_or(0, |index| index + 1);
+        let group = &self.messages[start..];
+        let Some(input) = group
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, message)| {
+                message.source == StoredMessageSource::History
+                    && matches!(message.message, Message::User { .. })
+            })
+            .nth(usize::try_from(delivered_steering).unwrap_or(usize::MAX))
+            .map(|(index, _)| index)
+        else {
+            return false;
+        };
+        // The Turn's own replies follow its input; replies before it, kept by a compaction,
+        // belong to earlier Turns.
+        let answered = group[input..].iter().any(|message| {
+            matches!(
+                message.message,
+                Message::Assistant { .. } | Message::Tool { .. }
+            )
+        });
+        if answered {
+            return false;
+        }
+        let replaced = &mut self.messages[start + input];
+        replaced.message = Message::context(vec![ContentBlock::text(note)]);
+        replaced.source = StoredMessageSource::Injection;
+        self.mark_replaced();
+        true
+    }
+
     /// Adds context that arrives between Turns to the group of the Turn that follows it.
     pub(crate) fn push_before_next_turn(
         &mut self,
@@ -149,15 +201,39 @@ impl ModelContext {
         Ok(())
     }
 
+    /// Starts the next Turn with the inputs retained while idle, then `message`. Context
+    /// messages waiting for this Turn move after the retained inputs, so that each stays
+    /// right before the message it came with.
     pub(crate) fn extend_new_turn(
         &mut self,
-        messages: impl IntoIterator<Item = StoredMessage>,
+        retained: Vec<StoredMessage>,
+        message: StoredMessage,
     ) -> Result<(), CoreError> {
         let index = self.next_turn_index()?;
-        self.extend(messages.into_iter().map(|mut message| {
-            message.turn_index = Some(index);
-            message
-        }));
+        let mut waiting_from = self.messages.len();
+        while waiting_from > 0 {
+            let previous = &self.messages[waiting_from - 1];
+            let waiting_context = previous.turn_index == Some(index)
+                && matches!(previous.message, Message::User { context: true, .. });
+            if !waiting_context {
+                break;
+            }
+            waiting_from -= 1;
+        }
+        let reorders = waiting_from < self.messages.len() && !retained.is_empty();
+        let waiting = self.messages.split_off(waiting_from);
+        let messages = retained
+            .into_iter()
+            .chain(waiting)
+            .chain([message])
+            .map(|mut message| {
+                message.turn_index = Some(index);
+                message
+            });
+        self.extend(messages);
+        if reorders {
+            self.mark_replaced();
+        }
         Ok(())
     }
 

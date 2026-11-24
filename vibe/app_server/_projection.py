@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 import hashlib
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from vibe.app_server._skill_toggles import SkillToggles
 from vibe.app_server.config import (
     AudioProviderView,
     ConfigView,
     ModelConfigView,
+    ModelRequirementView,
     ModelSource,
     SpeechConfigView,
     TranscribeModelConfigView,
@@ -17,12 +18,13 @@ from vibe.app_server.config import (
 )
 from vibe.app_server.models import (
     AgentSummary,
+    ApprovalPolicySummary,
     DebugLogEntry,
     DebugLogPage,
     SkillSummary,
 )
 from vibe.config_values import ThinkingLevel
-from vibe.core.agents import AgentProfile
+from vibe.core.agents import AgentManager, AgentProfile
 from vibe.core.config import (
     ModelConfig,
     TranscribeClient,
@@ -33,11 +35,11 @@ from vibe.core.config import (
     TTSProviderConfig,
     VibeConfigSchema,
 )
+from vibe.core.config._self_hosted import crash_reports_allowed
 from vibe.core.config.layers.admin import AdminConfigLayer
 from vibe.core.config.layers.agent_profile import AgentProfileLayer
 from vibe.core.config.layers.default import DefaultConfigLayer
 from vibe.core.config.layers.environment import EnvironmentLayer
-from vibe.core.config.layers.growthbook import GrowthbookLayer
 from vibe.core.config.layers.model_catalog import ModelCatalogLayer
 from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.layers.project import ProjectConfigLayer
@@ -45,14 +47,28 @@ from vibe.core.config.layers.provider_models import ProviderModelsLayer
 from vibe.core.config.layers.user import SuppliedUserConfigLayer, UserConfigLayer
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.log_reader import PaginatedLogs
-from vibe.core.skills.models import SkillInfo, SkillSource
+from vibe.core.skills.models import InstalledSkill, SkillInfo, SkillScope, SkillSource
+
+
+class Selection(NamedTuple):
+    active: AgentSummary
+    agents: list[AgentSummary]
+    active_approval_policy: ApprovalPolicySummary
+    approval_policies: list[ApprovalPolicySummary]
+
+
+class _RouteFacts(NamedTuple):
+    compaction_threshold: int | None
+    thinking: ThinkingLevel
+    thinking_levels: list[ThinkingLevel]
+    threshold_warning: str | None = None
+
 
 # Model picker display priority, each layer with the group it lists models
 # under: org-curated sources first, the user's own last. Display only -- which
 # layer's values win is the merge's call.
 _MODEL_SOURCES: tuple[tuple[str, ModelSource], ...] = (
     (AdminConfigLayer.NAME, "admin"),
-    (GrowthbookLayer.NAME, "growthbook"),
     (ModelCatalogLayer.NAME, "catalog"),
     (ProjectConfigLayer.NAME, "project"),
     (AgentProfileLayer.NAME, "project"),
@@ -88,12 +104,13 @@ def project_config_view(
     # Grouped by source; a model no known layer defines keeps its place, last.
     models = [available[alias] for alias in sources if alias in available]
     models += [model for alias, model in available.items() if alias not in sources]
+    active_facts = _route_facts(config, active_model)
     return ConfigView(
         active_model=_project_model_config(
             active_model,
             image_fallback=image_fallback,
             source=sources.get(active_model.alias),
-            route_facts=_route_facts(config, active_model),
+            route_facts=active_facts,
         ),
         active_model_pinned=active_model_pinned,
         images_supported=active_model.supports_images or describable,
@@ -103,13 +120,19 @@ def project_config_view(
         # is in effect.
         default_model_alias=config.resolve_default_model_alias(),
         default_agent=config.default_agent,
+        default_approval_policy=config.default_approval_policy,
         theme=config.theme,
         log_level=config.log_level,
         disable_welcome_banner_animation=config.disable_welcome_banner_animation,
+        disable_selection_animation=config.disable_selection_animation,
         cursor_blink=config.cursor_blink,
-        show_greeting=config.show_greeting,
+        vim_keybindings=config.vim_keybindings,
+        show_dangerous_directory_warning=config.show_dangerous_directory_warning,
         autocopy_to_clipboard=config.autocopy_to_clipboard,
         enable_mouse_capture=config.enable_mouse_capture,
+        enable_sticky_prompt=config.enable_sticky_prompt,
+        collapse_turn_details=config.collapse_turn_details,
+        enable_file_autocomplete=config.enable_file_autocomplete,
         file_watcher_for_autocomplete=config.file_watcher_for_autocomplete,
         ask_confirmation_on_exit=config.ask_confirmation_on_exit,
         voice_mode_enabled=config.voice_mode_enabled,
@@ -117,19 +140,23 @@ def project_config_view(
         show_thinking_nodes=config.show_thinking_nodes,
         show_subagent_status_list=config.show_subagent_status_list,
         worktree_limit=config.worktree_limit,
+        auto_worktree=config.auto_worktree,
         enable_update_checks=config.enable_update_checks,
         enable_notifications=config.enable_notifications,
         enable_system_trust_store=config.enable_system_trust_store,
         experimental_enable_tab_status=config.experimental_enable_tab_status,
-        enable_telemetry=config.enable_telemetry,
+        crash_reports_enabled=crash_reports_allowed(config),
         experimental_enable_registry_skills=config.experimental_enable_registry_skills,
-        experimental_enable_local_projects=config.experimental_enable_local_projects,
+        enable_pr_monitoring=config.enable_pr_monitoring,
+        experimental_enable_storage_usage=config.experimental_enable_storage_usage,
         models=[
             _project_model_config(
                 model,
                 image_fallback=image_fallback,
                 source=sources.get(model.alias),
-                route_facts=_route_facts(config, model),
+                route_facts=active_facts
+                if model == active_model
+                else _route_facts(config, model),
             )
             for model in models
         ],
@@ -147,7 +174,10 @@ def project_config_view(
                 config.get_tts_provider_for_model(tts_model)
             ),
         ),
-        validation_warnings=list(config.validation_warnings),
+        validation_warnings=[
+            *config.validation_warnings,
+            *filter(None, [active_facts.threshold_warning]),
+        ],
     )
 
 
@@ -176,14 +206,13 @@ def _model_sources(config: VibeConfigSchema) -> dict[str, ModelSource]:
 
 
 def offered_levels(config: VibeConfigSchema, model: ModelConfig) -> list[ThinkingLevel]:
-    return _route_facts(config, model)[2]
+    return _route_facts(config, model).thinking_levels
 
 
-def _route_facts(
-    config: VibeConfigSchema, model: ModelConfig
-) -> tuple[int | None, ThinkingLevel, list[ThinkingLevel]]:
+def _route_facts(config: VibeConfigSchema, model: ModelConfig) -> _RouteFacts:
     """Where ``model`` compacts, unset thresholds included, the thinking level
-    it runs, and the levels a picker offers.
+    it runs, the levels a picker offers, and the warning when its threshold
+    was fitted into its window.
 
     Clients show context usage against the threshold, so an unset one reports
     the model's default rather than nothing. The level shown is the one the
@@ -202,8 +231,13 @@ def _route_facts(
         levels = list(model.thinking_levels)
         if model.thinking not in levels:
             levels.append(model.thinking)
-        return model.auto_compact_threshold, model.thinking, levels
-    return facts.compaction_threshold, facts.thinking, list(facts.thinking_levels)
+        return _RouteFacts(model.auto_compact_threshold, model.thinking, levels)
+    return _RouteFacts(
+        facts.compaction_threshold,
+        facts.thinking,
+        list(facts.thinking_levels),
+        facts.threshold_warning,
+    )
 
 
 def _project_model_config(
@@ -211,9 +245,9 @@ def _project_model_config(
     *,
     image_fallback: bool,
     source: ModelSource | None,
-    route_facts: tuple[int | None, ThinkingLevel, list[ThinkingLevel]],
+    route_facts: _RouteFacts,
 ) -> ModelConfigView:
-    compaction_threshold, thinking, thinking_levels = route_facts
+    compaction_threshold, thinking, thinking_levels, _ = route_facts
     image_delivery: Literal["native", "resource_link"] | None = None
     if model.supports_images:
         image_delivery = "native"
@@ -231,6 +265,11 @@ def _project_model_config(
         image_delivery=image_delivery,
         thinking_levels=thinking_levels,
         source=source,
+        requires=(
+            None
+            if model.requires is None
+            else ModelRequirementView(kind=model.requires.kind)
+        ),
     )
 
 
@@ -270,12 +309,23 @@ def _project_tts_provider(provider: TTSProviderConfig) -> AudioProviderView:
     )
 
 
-def project_agent_summaries(
-    active: AgentProfile, available: Iterable[AgentProfile]
-) -> tuple[AgentSummary, list[AgentSummary]]:
-    return project_agent_summary(active), [
-        project_agent_summary(profile) for profile in available
-    ]
+def project_selection(agents: AgentManager) -> Selection:
+    """The session's agent and policy with the ones it may switch to.
+
+    Subagents stay listed: clients tell them apart by ``agent_type``.
+    """
+    return Selection(
+        active=project_agent_summary(agents.active_agent),
+        agents=[
+            project_agent_summary(profile)
+            for profile in agents.available_agents.values()
+        ],
+        active_approval_policy=project_policy_summary(agents.active_policy),
+        approval_policies=[
+            project_policy_summary(agents.available_policies[name])
+            for name in agents.get_policy_order()
+        ],
+    )
 
 
 def project_skill_summaries(skills: Iterable[SkillInfo]) -> list[SkillSummary]:
@@ -283,7 +333,7 @@ def project_skill_summaries(skills: Iterable[SkillInfo]) -> list[SkillSummary]:
 
 
 def _skill_summary(
-    skill: SkillInfo, enabled: bool = True, locked: bool = False
+    skill: SkillInfo, *, enabled: bool = True, locked: bool = False, active: bool = True
 ) -> SkillSummary:
     return SkillSummary.model_validate({
         "name": skill.name,
@@ -295,17 +345,25 @@ def _skill_summary(
         "registry": skill.registry.model_dump() if skill.registry else None,
         "enabled": enabled,
         "locked": locked,
+        "active": active,
     })
 
 
 def writable_disabled_skills(
     orchestrator: ConfigOrchestrator[VibeConfigSchema],
 ) -> Sequence[str] | None:
-    """The writable layer's own ``disabled_skills``, or None when unavailable.
+    """The writable layer's own ``disabled_skills``, or None when unavailable."""
+    return writable_list_field(orchestrator, "disabled_skills")
 
-    ``disabled_skills`` concat-merges, so the effective list is every layer at
-    once while a toggle can only add to or remove from the writable one. Reads
-    the cached layer rather than loading, to stay usable from sync projection.
+
+def writable_list_field(
+    orchestrator: ConfigOrchestrator[VibeConfigSchema], field: str
+) -> Sequence[str] | None:
+    """The writable layer's own value of a concat-merged list, or None when unavailable.
+
+    Such a list's effective value is every layer at once, while a toggle can
+    only add to or remove from the writable one. Reads the cached layer rather
+    than loading, to stay usable from sync projection.
     """
     try:
         layer = orchestrator.get_layer(orchestrator.writable_layer_name)
@@ -314,12 +372,12 @@ def writable_disabled_skills(
     data = layer.cached_data
     if data is None:
         return None
-    names = getattr(data, "disabled_skills", None)
+    names = getattr(data, field, None)
     return list(names) if names else []
 
 
 def project_installed_skill_summaries(
-    skills: Iterable[SkillInfo],
+    skills: Iterable[InstalledSkill],
     config: VibeConfigSchema,
     user_disabled: Sequence[str] | None = None,
 ) -> list[SkillSummary]:
@@ -336,7 +394,11 @@ def project_installed_skill_summaries(
     assumes a single layer.
 
     Plugin skills are locked: they come from an installed plugin and are managed
-    through ``/plugins``, not by this config.
+    through ``/plugins``, not by this config. So is a skill picked for the session:
+    a toggle would disable its name for every later session.
+
+    ``active`` is whether the agent resolves the skill's name to it. A pin that
+    another skill of the same name shadows is still listed, so it can be managed.
     """
     disabled = config.disabled_skills
     toggles = SkillToggles(
@@ -349,9 +411,36 @@ def project_installed_skill_summaries(
         return info.source is SkillSource.PLUGIN or toggles.enabled(info.name)
 
     def _locked(info: SkillInfo) -> bool:
-        return info.source is SkillSource.PLUGIN or toggles.locked(info.name)
+        return (
+            info.source is SkillSource.PLUGIN
+            or info.scope is SkillScope.SESSION
+            or toggles.locked(info.name)
+        )
 
-    return [_skill_summary(info, _enabled(info), _locked(info)) for info in skills]
+    return [
+        _skill_summary(
+            skill.info,
+            enabled=_enabled(skill.info),
+            locked=_locked(skill.info),
+            active=skill.active,
+        ).model_copy(update=_file_of(skill.info))
+        for skill in skills
+    ]
+
+
+def _file_of(skill: SkillInfo) -> dict[str, object]:
+    """A local skill's file as its root lists it, so a delete names the link of a
+    linked folder, never the folder it points at.
+    """
+    entry = skill.entry_path
+    if entry is not None:
+        folder = entry.parent
+        return {
+            "path": str(entry),
+            "linked": folder.is_symlink() or folder.is_junction(),
+        }
+    path = skill.skill_path
+    return {"path": None if path is None else str(path), "linked": False}
 
 
 def project_debug_logs(logs: PaginatedLogs) -> DebugLogPage:
@@ -380,6 +469,14 @@ def project_agent_summary(profile: AgentProfile) -> AgentSummary:
         name=profile.name,
         display_name=profile.display_name,
         description=profile.description,
-        safety=profile.safety,
         agent_type=profile.agent_type,
+    )
+
+
+def project_policy_summary(profile: AgentProfile) -> ApprovalPolicySummary:
+    return ApprovalPolicySummary(
+        name=profile.name,
+        display_name=profile.display_name,
+        description=profile.description,
+        safety=profile.safety,
     )

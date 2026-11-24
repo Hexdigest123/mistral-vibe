@@ -30,6 +30,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import select
 import shutil
@@ -51,15 +52,28 @@ _DEL = 0x7F
 _C1_CONTROL_END = 0x9F
 DEFAULT_LINE_LIMIT = 2_000
 MAX_READ_BYTES = 64_000
-"""The most bytes one ``read_file`` returns: the Agents SDK's ``MAX_FILE_BYTES``."""
+"""The most bytes one ``read_file`` returns: the Agents SDK's ``MAX_FILE_BYTES``.
+
+Bytes are counted once JSON-escaped, as the model receives them.
+"""
 MAX_COUNTED_FILE_BYTES = 32 * 1_024 * 1_024
 """The largest file ``read_file`` reads to the end to count its lines."""
 MAX_DIRECTORY_ENTRIES = 500
 """The most entries one ``read_file`` of a directory lists."""
+MAX_IMAGE_BYTES = 10 * 1_024 * 1_024
+"""The largest image ``read_file`` returns."""
 MAX_WRITE_BYTES = 64_000
 MAX_WRITE_PREVIOUS_CONTENT_BYTES = 64_000
 MAX_EDIT_FILE_SIZE_BYTES = 512 * 1_024 * 1_024
 MAX_NEWLINE_SNIFF_BYTES = 1_024 * 1_024
+# Bounds on choosing a new file's line ending, so a write stays cheap in a
+# large repository.
+_GIT_ATTRIBUTE_TIMEOUT_SECONDS = 5
+_GIT_EOL_NEWLINES = {"crlf": "\r\n", "lf": "\n"}
+_MAX_NEIGHBOR_ENTRIES = 2_000
+_MAX_NEIGHBOR_FILES = 8
+_MAX_NEIGHBOR_PARENTS = 3
+_LINE_ENDING = re.compile(r"\r\n|\n|\r")
 MAX_OUTPUT_BYTES = 512 * 1_024
 """The most of one output stream a command's result carries whole. Past it,
 the result keeps the stream's first and last ``MAX_OUTPUT_BYTES // 2`` bytes."""
@@ -123,6 +137,15 @@ class ShellNotFoundError(LookupError):
 # Paths
 
 
+def normalize_windows_drive_path(path: str) -> str:
+    """Spell a Git Bash drive path (``/c/Users``) as ``C:/Users``."""
+    match = re.fullmatch(r"/([A-Za-z])(?:[/\\](.*))?", path)
+    if match is None:
+        return path
+    suffix = match.group(2)
+    return f"{match.group(1).upper()}:/{suffix or ''}"
+
+
 def resolve_path(
     raw_path: str, *, cwd: str, roots: Sequence[str], roots_are_a_boundary: bool
 ) -> Path:
@@ -133,6 +156,9 @@ def resolve_path(
     """
     if not raw_path.strip():
         raise ValueError("Path cannot be empty")
+    if os.name == "nt":
+        # Windows would anchor ``/c/Users`` to the current drive: ``C:\c\Users``.
+        raw_path = normalize_windows_drive_path(raw_path)
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = Path(cwd) / path
@@ -148,21 +174,34 @@ def resolve_path(
 # File tools
 
 
-def read_file(path: Path, *, offset: int = 0, limit: int | None) -> dict[str, Any]:
+def read_file(
+    path: Path, *, offset: int = 0, limit: int | None
+) -> tuple[dict[str, Any], dict[str, str] | None]:
     """Read a text file window, trying each supported encoding in turn.
 
     ``was_truncated`` means the file has more past what was returned, and
     ``next_offset`` is where to read on, None once the window reached the end.
     An offset past the last line is an error, not an empty window. A directory
     reads as its listing; see :func:`_read_directory`.
+
+    A PNG, JPEG, GIF or WebP file reads as the image itself: see
+    :func:`_read_image`. The second value is that image, None for text. Any
+    other file with a NUL byte in its start is binary and is refused. Control
+    characters alone do not refuse a read, so a log with terminal colours
+    still reads.
     """
     if _is_directory(path):
-        return _read_directory(path, offset=offset, limit=limit)
+        return _read_directory(path, offset=offset, limit=limit), None
     handle, status = _open_file(path)
     with handle:
         file_size_bytes = status.st_size
         raw_prefix = handle.read(SNIFF_BYTES)
+        mime_type = _image_mime_type(raw_prefix)
+        if mime_type is not None:
+            return _read_image(path, handle, raw_prefix, mime_type=mime_type)
     for encoding in _candidate_encodings(raw_prefix):
+        if _has_binary_nul(raw_prefix, encoding):
+            raise ValueError(f"Binary files are not supported: {path}")
         try:
             resolved_offset = _resolve_read_offset(
                 path, encoding=encoding, offset=offset
@@ -187,8 +226,47 @@ def read_file(path: Path, *, offset: int = 0, limit: int | None) -> dict[str, An
             "total_lines": window.total_lines,
             "next_offset": window.next_offset,
             "was_truncated": window.next_offset is not None or window.line_cut,
-        }
+        }, None
     raise ValueError(f"Could not decode text file with supported encodings: {path}")
+
+
+def _image_mime_type(raw: bytes) -> str | None:
+    """The image type ``raw``, a file's first bytes, starts with, if any."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _read_image(
+    path: Path, handle: IO[bytes], raw_prefix: bytes, *, mime_type: str
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Read a whole image, past the ``raw_prefix`` already read from ``handle``.
+
+    The result describes the image and carries none of its bytes: a program
+    receives only that. The image goes beside it, base64 encoded, for the model.
+    """
+    data = raw_prefix + handle.read(MAX_IMAGE_BYTES + 1 - len(raw_prefix))
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"Image is too large to read: {path} is over {MAX_IMAGE_BYTES} bytes"
+        )
+    return {
+        "path": str(path),
+        "content": f"Image file ({mime_type}, {len(data)} bytes).",
+        "file_size_bytes": len(data),
+        "returned_bytes": 0,
+        "offset": 0,
+        "lines_read": 0,
+        "total_lines": None,
+        "next_offset": None,
+        "was_truncated": False,
+    }, {"data": base64.b64encode(data).decode("ascii"), "mime_type": mime_type}
 
 
 def _is_directory(path: Path) -> bool:
@@ -217,20 +295,21 @@ def _read_directory(path: Path, *, offset: int, limit: int | None) -> dict[str, 
         raise ValueError(_past_listing_end_message(offset, len(lines)))
     cap = MAX_DIRECTORY_ENTRIES if limit is None else min(limit, MAX_DIRECTORY_ENTRIES)
     parts: list[str] = []
-    returned_bytes = 0
+    model_bytes = 0
     for line in lines[offset : offset + cap]:
-        line_bytes = len(line.encode("utf-8"))
-        if parts and returned_bytes + line_bytes > MAX_READ_BYTES:
+        line_bytes = _model_bytes(line)
+        if parts and model_bytes + line_bytes > MAX_READ_BYTES:
             break
         parts.append(line)
-        returned_bytes += line_bytes
+        model_bytes += line_bytes
     end = offset + len(parts)
     next_offset = end if end < len(lines) else None
+    content = "".join(parts)
     return {
         "path": str(path),
-        "content": "".join(parts),
+        "content": content,
         "file_size_bytes": sum(len(line.encode("utf-8")) for line in lines),
-        "returned_bytes": returned_bytes,
+        "returned_bytes": len(content.encode("utf-8")),
         "offset": offset,
         "lines_read": len(parts),
         "total_lines": len(lines),
@@ -278,12 +357,14 @@ def _past_listing_end_message(offset: int, entries: int) -> str:
     )
 
 
-def write_file(path: Path, content: str) -> tuple[dict[str, Any], str | None]:
+def write_file(
+    path: Path, content: str, *, sandbox: bool = False, workspace: Path | None = None
+) -> tuple[dict[str, Any], str | None]:
     """Write ``content`` atomically; also return the text it replaced, if small.
 
-    Overwriting a file keeps its dominant line ending, whichever ``content``
-    uses, so rewriting a CRLF file with ``\\n`` lines does not convert it. A new
-    file gets ``content`` as given.
+    Every ``\\n``, ``\\r\\n`` and ``\\r`` in ``content`` is a line break, and the
+    file is written with one line ending: the replaced file's dominant one, or
+    :func:`new_file_newline` for a new file or one without a line break.
     """
     if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
         raise ValueError(f"Content exceeds {MAX_WRITE_BYTES} bytes limit")
@@ -292,9 +373,10 @@ def write_file(path: Path, content: str) -> tuple[dict[str, Any], str | None]:
 
     file_existed = path.exists()
     previous_content = _replaced_content(path) if file_existed else None
-    newline = _existing_newline(path) if file_existed else None
-    if newline is not None:
-        content = _from_lf(_to_lf(content), newline)
+    newline = (_existing_newline(path) if file_existed else None) or new_file_newline(
+        path, sandbox=sandbox, workspace=workspace
+    )
+    content = _from_lf(_to_lf(content), newline)
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(path, content, "utf-8")
     result = {
@@ -306,15 +388,22 @@ def write_file(path: Path, content: str) -> tuple[dict[str, Any], str | None]:
 
 
 def edit(
-    path: Path, old_string: str, new_string: str, *, replace_all: bool = False
+    path: Path,
+    old_string: str,
+    new_string: str,
+    *,
+    replace_all: bool = False,
+    sandbox: bool = False,
+    workspace: Path | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str | None]:
     """Replace ``old_string`` with ``new_string``; return the result, line
     previews and the text the edit replaced.
 
     The strings and the file match with their line endings normalized to
     ``\\n``, so an edit written with either ``\\n`` or ``\\r\\n`` edits a CRLF
-    file. An edited file is written back with its dominant line ending, which
-    also unifies a file that mixed several.
+    file. Only the replaced passages are rewritten, with the line endings
+    :func:`_replace_passages` picks; a file without a line break falls back
+    to :func:`new_file_newline`.
     """
     handle, status = _open_file(path)
     with handle:
@@ -324,24 +413,26 @@ def edit(
             )
         raw = handle.read()
     decoded, encoding = _decode_editable_text(raw, path)
-    newline = _dominant_newline(decoded) or os.linesep
-    original = _to_lf(decoded)
     previews: list[dict[str, Any]] = []
     warnings: list[str] = []
 
     updated, lines_changed = _replace(
-        original, old_string, new_string, replace_all, path, previews
+        decoded,
+        old_string,
+        new_string,
+        replace_all,
+        path,
+        previews,
+        default_newline=lambda: (
+            _dominant_newline(decoded)
+            or new_file_newline(path, sandbox=sandbox, workspace=workspace)
+        ),
     )
 
-    if updated == original:
+    if updated == decoded:
         warnings.append("the edit leaves the file unchanged")
     else:
-        _atomic_write_text(path, _from_lf(updated, newline), encoding)
-    # Previews carry the lines as written, so a reader that splices them back
-    # into the file restores its own line endings.
-    for preview in previews:
-        for key in ("old_lines", "new_lines"):
-            preview[key] = [_from_lf(line, newline) for line in preview[key]]
+        _atomic_write_text(path, updated, encoding)
 
     result = {"file": str(path), "lines_changed": lines_changed, "warnings": warnings}
     # Carried text is exact only when re-encoding it as UTF-8 reproduces the
@@ -361,18 +452,21 @@ def edit(
 
 
 def _replace(
-    text: str,
+    original: str,
     old_string: str,
     new_string: str,
     replace_all: bool,
     path: Path,
     previews: list[dict[str, Any]],
+    *,
+    default_newline: Callable[[], str],
 ) -> tuple[str, int]:
     if not old_string.removesuffix("\r"):
         raise ValueError("old_string cannot be empty")
     old_str, new_str = _edit_strings_to_lf(old_string, new_string)
     if old_str == new_str:
         raise ValueError("old_string and new_string must differ")
+    text = _to_lf(original)
     matches = text.count(old_str)
     if matches == 0:
         raise ValueError(_not_found_message(text, old_str, path))
@@ -380,20 +474,107 @@ def _replace(
         raise ValueError(_not_unique_message(text, old_str, path, matches))
 
     replacement_count = matches if replace_all else 1
-    old_lines = old_str.splitlines(keepends=True)
-    new_lines = new_str.splitlines(keepends=True)
+    updated, passages = _replace_passages(
+        original, old_str, new_str, replacement_count, default_newline
+    )
+    old_line_count = len(old_str.splitlines())
+    new_line_count = len(new_str.splitlines())
     line_delta = 0
-    for match_start in _find_matches(text, old_str, limit=replacement_count):
-        old_start_line = text[:match_start].count("\n") + 1
+    for match_start, (passage, replacement) in zip(
+        _find_matches(text, old_str, limit=replacement_count), passages, strict=True
+    ):
+        old_start_line = text.count("\n", 0, match_start) + 1
+        # Previews carry the lines as written, so a reader that splices them
+        # back into the file restores its own line endings.
         previews.append({
             "old_start_line": old_start_line,
             "new_start_line": old_start_line + line_delta,
-            "old_lines": old_lines,
-            "new_lines": new_lines,
+            "old_lines": passage.splitlines(keepends=True),
+            "new_lines": replacement.splitlines(keepends=True),
         })
-        line_delta += len(new_lines) - len(old_lines)
-    lines_changed = max(len(old_lines), len(new_lines)) * replacement_count
-    return text.replace(old_str, new_str, replacement_count), lines_changed
+        line_delta += new_line_count - old_line_count
+    lines_changed = max(old_line_count, new_line_count) * replacement_count
+    return updated, lines_changed
+
+
+def _replace_passages(
+    original: str, old: str, new: str, count: int, default_newline: Callable[[], str]
+) -> tuple[str, list[tuple[str, str]]]:
+    """Replace the first ``count`` matches of ``old`` in ``original``, leaving
+    every other byte as it was.
+
+    ``old`` and ``new`` use ``\\n`` line breaks, and match ``original`` with its
+    line endings read as ``\\n``. Each replacement takes the dominant line
+    ending of the passage it replaces, else the line ending of the line that
+    passage ends on, else ``default_newline()``. Returns the new text and each
+    (replaced passage, replacement) pair, both as written.
+    """
+    text = _to_lf(original)
+    positions = _OriginalPositions(original)
+    pieces: list[str] = []
+    passages: list[tuple[str, int]] = []
+    cursor = 0
+    search = 0
+    for _ in range(count):
+        start = text.find(old, search)
+        if start < 0:
+            break
+        search = start + len(old)
+        passage_start = positions.at(start)
+        passage_end = positions.at(search)
+        passage = original[passage_start:passage_end]
+        line_end = _LINE_ENDING.search(original, passage_end)
+        newline = (
+            _dominant_newline(passage)
+            or (line_end.group() if line_end is not None else None)
+            or default_newline()
+        )
+        pieces += [original[cursor:passage_start], _from_lf(new, newline)]
+        passages.append((passage, len(pieces) - 1))
+        cursor = passage_end
+    pieces.append(original[cursor:])
+    _keep_line_breaks_apart(pieces)
+    return "".join(pieces), [(passage, pieces[index]) for passage, index in passages]
+
+
+def _keep_line_breaks_apart(pieces: list[str]) -> None:
+    """Make a CR that ends a piece a CRLF when the next piece starts with LF.
+
+    A lone CR next to an LF would otherwise read as one CRLF line break
+    instead of two line breaks.
+    """
+    previous: int | None = None
+    for index, piece in enumerate(pieces):
+        if not piece:
+            continue
+        if (
+            previous is not None
+            and pieces[previous].endswith("\r")
+            and piece.startswith("\n")
+        ):
+            pieces[previous] += "\n"
+        previous = index
+
+
+class _OriginalPositions:
+    """Maps positions in ``_to_lf(original)`` back to ``original``, for
+    positions that never decrease.
+
+    Only a CRLF changes length when read as LF, so a position moves by the
+    CRLFs before it.
+    """
+
+    def __init__(self, original: str) -> None:
+        self._original = original
+        self._next_crlf = original.find("\r\n")
+        self._crlfs_before = 0
+
+    def at(self, position: int) -> int:
+        # A CRLF whose LF form sits before ``position`` shifts it by one.
+        while self._next_crlf >= 0 and self._next_crlf - self._crlfs_before < position:
+            self._crlfs_before += 1
+            self._next_crlf = self._original.find("\r\n", self._next_crlf + 2)
+        return position + self._crlfs_before
 
 
 def _not_found_message(text: str, old_str: str, path: Path) -> str:
@@ -625,9 +806,11 @@ def run_file_tool(request: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve the target path, then run one file tool.
 
     ``request`` carries ``tool`` (``read_file``, ``write_file`` or ``edit``),
-    its validated ``arguments`` and the path ``policy``. Returns
-    ``{"result": ..., "annotations": ...}``, plus ``previous_content`` with the
-    pre-edit text when the tool is ``edit``.
+    its validated ``arguments``, the path ``policy``, and ``sandbox``, true
+    when the tool runs in a sandbox rather than on the user's machine. Returns
+    ``{"result": ..., "annotations": ...}``, plus ``image`` when the tool is
+    ``read_file`` and ``previous_content`` with the pre-edit text when it is
+    ``edit``.
     """
     tool = request["tool"]
     arguments = request["arguments"]
@@ -654,16 +837,24 @@ def run_file_tool(request: Mapping[str, Any]) -> dict[str, Any]:
         # there since is refused when opened.
         path = path.resolve()
     if tool == "read_file":
-        result = read_file(path, offset=arguments["offset"], limit=arguments["limit"])
-        return {"result": result, "annotations": None}
+        result, image = read_file(
+            path, offset=arguments["offset"], limit=arguments["limit"]
+        )
+        return {"result": result, "annotations": None, "image": image}
+    sandbox = bool(request.get("sandbox", False))
+    workspace = Path(policy["cwd"]).expanduser().resolve()
     if tool == "write_file":
-        result, previous_content = write_file(path, arguments["content"])
+        result, previous_content = write_file(
+            path, arguments["content"], sandbox=sandbox, workspace=workspace
+        )
         return {"result": result, "annotations": previous_content}
     result, previews, previous_content = edit(
         path,
         arguments["old_string"],
         arguments["new_string"],
         replace_all=bool(arguments.get("replace_all", False)),
+        sandbox=sandbox,
+        workspace=workspace,
     )
     return {
         "result": result,
@@ -793,7 +984,7 @@ def _read_content(
             if limit is not None and yielded >= limit:
                 next_offset = index
                 break
-            line_bytes = len(line.encode("utf-8"))
+            line_bytes = _model_bytes(line)
             if bytes_written + line_bytes <= MAX_READ_BYTES:
                 parts.append(line)
                 bytes_written += line_bytes
@@ -802,9 +993,7 @@ def _read_content(
                 next_offset = index
                 break
             # One line longer than the whole budget: return its start.
-            parts.append(
-                line.encode("utf-8")[:MAX_READ_BYTES].decode("utf-8", errors="ignore")
-            )
+            parts.append(_model_prefix(line, MAX_READ_BYTES))
             line_cut = True
             next_offset = lines
             break
@@ -829,6 +1018,24 @@ def _read_content(
         total_lines=total_lines,
         line_cut=line_cut,
     )
+
+
+def _model_bytes(text: str) -> int:
+    """The bytes ``text`` costs the model once its tool result is JSON."""
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def _model_prefix(text: str, budget: int) -> str:
+    """The longest start of ``text`` whose ``_model_bytes`` fit in ``budget``."""
+    # Each character costs at least one byte, so the prefix has at most ``budget``.
+    low, high = 0, min(len(text), budget)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _model_bytes(text[:middle]) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low]
 
 
 def _count_remaining(handle: IO[str], counted: int) -> int | None:
@@ -864,22 +1071,18 @@ def _decode_editable_text(raw: bytes, path: Path) -> tuple[str, str]:
     raise ValueError(f"Could not decode text file with supported encodings: {path}")
 
 
-def _existing_newline(path: Path) -> str | None:
+def _existing_newline(
+    path: Path, *, limit: int = MAX_NEWLINE_SNIFF_BYTES
+) -> str | None:
     """The dominant line ending of the file's start, if it has one.
 
-    Reads until a chunk holds a line ending, so a long first line does not
-    hide it, but at most :data:`MAX_NEWLINE_SNIFF_BYTES`.
+    Reads the whole file, or its first ``limit`` bytes, so line endings past
+    the first ones still count.
     """
     try:
         with _open_bytes(path) as handle:
-            prefix = b""
-            truncated = True
-            while truncated and len(prefix) < MAX_NEWLINE_SNIFF_BYTES:
-                chunk = handle.read(SNIFF_BYTES)
-                prefix += chunk
-                truncated = len(chunk) == SNIFF_BYTES
-                if b"\n" in chunk or b"\r" in chunk:
-                    break
+            prefix = handle.read(limit)
+            truncated = len(prefix) == limit
             if truncated:
                 # Up to one more code unit, so a CRLF the boundary splits is
                 # read whole in any encoding.
@@ -894,6 +1097,153 @@ def _existing_newline(path: Path) -> str | None:
         # A CR the extended read still ends on may be half of a CRLF.
         text = text.removesuffix("\r")
     return _dominant_newline(text)
+
+
+def new_file_newline(
+    path: Path, *, sandbox: bool, workspace: Path | None = None
+) -> str:
+    """The line ending of a new file at ``path``.
+
+    The ``eol`` attribute git gives the path comes first, then the dominant
+    line ending of nearby files with the same extension, then the default:
+    ``\\n`` in a sandbox, whose platform says nothing about the user's
+    project, and the platform's line ending elsewhere.
+    """
+    repository = _git_repository(path.parent)
+    newline = _git_eol(path, repository) if repository is not None else None
+    if newline is None:
+        # Nearby files never come from above the workspace.
+        root = (
+            repository
+            if repository is not None
+            and (workspace is None or repository.is_relative_to(workspace))
+            else workspace
+        )
+        newline = _neighbor_newline(path, root)
+    if newline is not None:
+        return newline
+    return "\n" if sandbox else os.linesep
+
+
+def _git_repository(directory: Path) -> Path | None:
+    """The work tree root containing ``directory``, without running git."""
+    for candidate in (directory, *directory.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _git_eol(path: Path, repository: Path) -> str | None:
+    """The line ending git's ``eol`` attribute gives ``path``, if any.
+
+    git only runs when an attributes file could apply, so most writes cost a
+    few ``stat`` calls.
+    """
+    if not _has_git_attributes(path, repository):
+        return None
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        relative = path.relative_to(repository).as_posix()
+        completed = subprocess.run(
+            [
+                git,
+                # No fsmonitor hook from the repository's own config, which
+                # could run a command, and no optional locks.
+                "-c",
+                "core.fsmonitor=",
+                "--no-optional-locks",
+                "-C",
+                str(repository),
+                "check-attr",
+                "eol",
+                "--",
+                relative,
+            ],
+            capture_output=True,
+            # On Windows, git stalls at startup while another thread reads an
+            # inherited stdin pipe, and the timeout cannot kill its child.
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=_GIT_ATTRIBUTE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.rsplit(": ", 1)[-1].strip()
+    return _GIT_EOL_NEWLINES.get(value) if completed.returncode == 0 else None
+
+
+def _has_git_attributes(path: Path, repository: Path) -> bool:
+    directories = (path.parent, *path.parent.parents)
+    for directory in directories:
+        if (directory / ".gitattributes").is_file():
+            return True
+        if directory == repository:
+            break
+    git_directory = repository / ".git"
+    # A linked worktree or a submodule has a `.git` file pointing at a Git
+    # directory elsewhere, whose `info/attributes` only git resolves.
+    return (
+        not git_directory.is_dir() or (git_directory / "info" / "attributes").is_file()
+    )
+
+
+def _neighbor_newline(path: Path, root: Path | None) -> str | None:
+    """The dominant line ending of files with ``path``'s extension nearby.
+
+    Looks in ``path``'s folder, then in each parent up to ``root`` or
+    :data:`_MAX_NEIGHBOR_PARENTS` folders up, and stops at the first folder with
+    such a file. Reads the start of at most :data:`_MAX_NEIGHBOR_FILES` files
+    per folder.
+    """
+    suffix = path.suffix.lower()
+    if not suffix:
+        return None
+    directories = _directories_up_to(path.parent, root)[: _MAX_NEIGHBOR_PARENTS + 1]
+    for directory in directories:
+        newlines = _neighbor_newlines(directory, path.name, suffix)
+        if newlines:
+            # Tied counts go to the first key, so CRLF wins a tie, then LF.
+            counts = {
+                newline: newlines.count(newline) for newline in ("\r\n", "\n", "\r")
+            }
+            return max(counts, key=counts.__getitem__)
+    return None
+
+
+def _directories_up_to(directory: Path, root: Path | None) -> list[Path]:
+    directories: list[Path] = []
+    for candidate in (directory, *directory.parents):
+        if root is not None and not candidate.is_relative_to(root):
+            break
+        directories.append(candidate)
+        if candidate == root:
+            break
+    return directories
+
+
+def _neighbor_newlines(directory: Path, name: str, suffix: str) -> list[str]:
+    """The dominant line ending of each file with ``suffix`` in ``directory``."""
+    newlines: list[str] = []
+    read = 0
+    try:
+        with os.scandir(directory) as entries:
+            for index, entry in enumerate(entries):
+                if index >= _MAX_NEIGHBOR_ENTRIES or read >= _MAX_NEIGHBOR_FILES:
+                    break
+                if entry.name == name or not entry.name.lower().endswith(suffix):
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                read += 1
+                newline = _existing_newline(Path(entry.path), limit=SNIFF_BYTES)
+                if newline is not None:
+                    newlines.append(newline)
+    except OSError:
+        return []
+    return newlines
 
 
 def _dominant_newline(text: str) -> str | None:
@@ -935,8 +1285,13 @@ def _from_lf(text: str, newline: str) -> str:
     return text if newline == "\n" else text.replace("\n", newline)
 
 
+def _has_binary_nul(raw: bytes, encoding: str) -> bool:
+    """Whether ``raw`` holds a NUL byte that ``encoding`` does not explain."""
+    return b"\x00" in raw and not encoding.startswith(("utf-16", "utf-32"))
+
+
 def _looks_binary(text: str, raw: bytes, encoding: str) -> bool:
-    if b"\x00" in raw and not encoding.startswith(("utf-16", "utf-32")):
+    if _has_binary_nul(raw, encoding):
         return True
     return any(
         character not in "\t\n\r\v\f\x1c\x1d\x1e\x85"
@@ -2009,11 +2364,19 @@ def decode_output(raw: bytes, encoding: str) -> str:
 async def kill(process: asyncio.subprocess.Process) -> None:
     """Kill the process and its group, tolerating one that already exited.
 
+    The process must lead its own group (``start_new_session``). On POSIX the
+    group is killed even once the process has exited: what it started with
+    ``&`` stays in the group and must not outlive the command. Long-lived work
+    goes through background processes instead.
+
     On POSIX the process is only terminated directly when its group could not
     be killed: a second signal after a delivered SIGKILL can still win on
     macOS for a multi-threaded process, which then reports -15 instead of -9.
     """
     if process.returncode is not None:
+        if sys.platform != "win32":
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(process.pid, signal.SIGKILL)
         return
     if sys.platform == "win32":
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):

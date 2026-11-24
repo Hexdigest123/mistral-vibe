@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 
 import pexpect
 import pytest
@@ -16,8 +17,8 @@ from tests.e2e.agent_loop_characterization.support import (
 from tests.e2e.common import (
     SpawnedVibeProcessFixture,
     send_ctrl_c_until_quit_confirmation,
-    wait_for_main_screen,
     wait_for_rendered_text,
+    wait_for_session_ready,
 )
 from tests.e2e.mock_server import ChatCompletionsRequestPayload, StreamingMockServer
 
@@ -32,14 +33,15 @@ PARENT_ANSWER = "Parent used the subagent result."
 # The unified runtime exposes subagents as the programmatic ``tools.agents``
 # namespace, called from ``run_typescript``. There is no direct ``task`` tool
 # and no declared builtin agent types: a bare spawn inherits the parent's
-# prompt and tools (see ``workspace_agent_types``). Spawn admits the child's
-# first message and returns at once; the child's result is pushed to the
-# parent as a notification. ``wait`` is a direct tool, not a programmatic one,
+# tools and runs the instructions it gives (see ``workspace_agent_types``).
+# Spawn admits the child's first message and returns at once; the child's
+# result is pushed to the parent as a notification. ``wait`` is a direct tool, not a programmatic one,
 # so this program lists its children until this one is done, which keeps the
 # parent's Turn open for that notification. The ``wait`` variant is below.
 SPAWN_CODE = (
     "async function main() {\n"
     f"  await tools.agents.spawn({{ name: '{SUBAGENT_NAME}', "
+    "instructions: 'Follow the message.', "
     f"message: '{SUBAGENT_SPAWN_MESSAGE}' }});\n"
     "  let child;\n"
     "  for (let attempt = 0; attempt < 100; attempt++) {\n"
@@ -106,7 +108,7 @@ def test_spawned_subagent_returns_result_to_parent_model(
     spawned_vibe_process: SpawnedVibeProcessFixture,
 ) -> None:
     with spawned_vibe_process(e2e_workdir) as (child, captured):
-        wait_for_main_screen(child, timeout=15)
+        wait_for_session_ready(child, captured, timeout=15)
         child.send(PARENT_PROMPT)
         child.send("\r")
 
@@ -148,19 +150,16 @@ def test_spawned_subagent_returns_result_to_parent_model(
 
 WAITING_PARENT_PROMPT = "Delegate exploration and wait"
 WAIT_TOOL_CALL_ID = "call_wait_for_subagent"
-CHILD_PAUSE_CALL_ID = "call_child_pause"
 
 # The parent spawns without polling, then calls the direct ``wait`` tool.
 SPAWN_ONLY_CODE = (
     "async function main() {\n"
     f"  return await tools.agents.spawn({{ name: '{SUBAGENT_NAME}', "
+    "instructions: 'Follow the message.', "
     f"message: '{SUBAGENT_SPAWN_MESSAGE}' }});\n"
     "}"
 )
-# The child pauses first, so the parent is already waiting when it finishes.
-CHILD_PAUSE_CODE = (
-    "async function main() {\n  await tools.self.sleep({ seconds: 1 });\n}"
-)
+_parent_asked_to_wait = threading.Event()
 
 
 def _is_waiting_parent_request(payload: ChatCompletionsRequestPayload) -> bool:
@@ -184,15 +183,10 @@ def _waiting_parent_factory(
 ) -> list[dict[str, object]]:
     answered = _tool_call_ids(payload)
     if not _is_waiting_parent_request(payload):
-        if CHILD_PAUSE_CALL_ID not in answered:
-            return single_tool_call_chunks(
-                call_id=CHILD_PAUSE_CALL_ID,
-                tool_name="run_typescript",
-                arguments={"code": CHILD_PAUSE_CODE},
-                created=95,
-            )
+        _parent_asked_to_wait.wait(timeout=30)
         return assistant_text_chunks(SUBAGENT_ANSWER, created=100)
     if SUBAGENT_TOOL_CALL_ID not in answered:
+        _parent_asked_to_wait.clear()
         return single_tool_call_chunks(
             call_id=SUBAGENT_TOOL_CALL_ID,
             tool_name="run_typescript",
@@ -200,6 +194,7 @@ def _waiting_parent_factory(
             created=90,
         )
     if WAIT_TOOL_CALL_ID not in answered:
+        _parent_asked_to_wait.set()
         return single_tool_call_chunks(
             call_id=WAIT_TOOL_CALL_ID,
             tool_name="wait",
@@ -223,7 +218,7 @@ def test_subagent_result_wakes_a_waiting_parent_model(
     spawned_vibe_process: SpawnedVibeProcessFixture,
 ) -> None:
     with spawned_vibe_process(e2e_workdir) as (child, captured):
-        wait_for_main_screen(child, timeout=15)
+        wait_for_session_ready(child, captured, timeout=15)
         child.send(WAITING_PARENT_PROMPT)
         child.send("\r")
 
@@ -231,7 +226,7 @@ def test_subagent_result_wakes_a_waiting_parent_model(
             child,
             captured,
             lambda: len(streaming_mock_server.requests),
-            expected_count=5,
+            expected_count=4,
             timeout=30,
         )
         wait_for_rendered_text(child, captured, needle=PARENT_ANSWER, timeout=10)

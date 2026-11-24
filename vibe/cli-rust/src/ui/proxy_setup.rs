@@ -2,24 +2,32 @@
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
-use super::vibe_code_project::paint;
 use super::{scrollbar, theme};
 use crate::app::App;
 use crate::hints::{self, action, key};
-use crate::proxy_setup::ProxyInput;
+use crate::proxy_setup::{Field, ProxyInput};
 
 /// Borders, title and help line around a label and an input row per variable.
 fn box_height(app: &App) -> u16 {
     app.proxy_setup.inputs.len() as u16 * 2 + 4
 }
 
+const HINTS: &[crate::hints::Hint] = &[
+    (key::ARROWS, action::NAVIGATE),
+    (key::ENTER, action::SAVE_EXIT),
+    hints::CANCEL,
+];
+
 pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     app.view.input_area = Rect::default();
     let kind = super::bottom_app::Kind::ProxySetup;
-    super::bottom_app::draw(app, f, area, box_height(app), kind, draw_box);
+    let height = box_height(app) + super::hint_line::extra(HINTS, area.width);
+    super::bottom_app::draw(app, f, area, height, kind, draw_box);
 }
 
 fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
@@ -30,7 +38,7 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::popup_border())),
+            .border_style(theme::border_style()),
         area,
     );
     let x = area.x + 2;
@@ -46,21 +54,12 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
         width as usize,
         heading,
     );
-    if area.height >= 4 {
-        super::hint_line::draw_clipped(
-            f,
-            x,
-            bottom - 1,
-            width,
-            &[
-                (key::ARROWS, action::NAVIGATE),
-                (key::ENTER, action::SAVE_EXIT),
-                hints::CANCEL,
-            ],
-        );
+    let help = super::hint_line::height(HINTS, width);
+    if area.height >= 3 + help {
+        super::hint_line::draw_above(f, x, bottom - 1, width, HINTS);
     }
     let top = area.y + 2;
-    let visible = bottom.saturating_sub(1).saturating_sub(top) as usize;
+    let visible = bottom.saturating_sub(help).saturating_sub(top) as usize;
     draw_rows(app, f, Rect::new(x, top, width, visible as u16), heading);
 }
 
@@ -108,25 +107,72 @@ fn draw_input(
     focused: bool,
     cursor_on: bool,
 ) {
-    let bar = Style::default()
-        .fg(theme::popup_border())
-        .bg(theme::background());
+    let bar = theme::border_style().bg(theme::background());
     f.buffer_mut().set_string(x, text.y, "▎", bar);
-    if !input.field.text.is_empty() {
-        paint::field(f, text, &mut input.field, focused, cursor_on);
-        return;
+    let description = &input.description;
+    draw_field_or_placeholder(f, text, &mut input.field, description, focused, cursor_on);
+}
+
+/// `draw_field`, or the muted `placeholder` with the caret on its first cell while the field is empty.
+pub(crate) fn draw_field_or_placeholder(
+    f: &mut Frame,
+    area: Rect,
+    field: &mut Field,
+    placeholder: &str,
+    focused: bool,
+    cursor_on: bool,
+) {
+    if !field.text.is_empty() {
+        return draw_field(f, area, field, focused, cursor_on);
     }
-    let placeholder = theme::muted_style().bg(theme::background());
-    f.buffer_mut().set_stringn(
-        text.x,
-        text.y,
-        &input.description,
-        text.width as usize,
-        placeholder,
-    );
-    if focused && cursor_on && text.width > 0 {
-        let cell = Rect::new(text.x, text.y, 1, 1);
+    let muted = theme::muted_style().bg(theme::background());
+    f.buffer_mut()
+        .set_stringn(area.x, area.y, placeholder, area.width as usize, muted);
+    if focused && cursor_on && area.width > 0 {
+        let cell = Rect::new(area.x, area.y, 1, 1);
         f.buffer_mut()
-            .set_style(cell, theme::fixed::input_caret(placeholder));
+            .set_style(cell, theme::fixed::input_caret(muted));
     }
+}
+
+/// A compact single-line input: the caret, the selection and a horizontal scroll that follows the caret.
+pub(crate) fn draw_field(
+    f: &mut Frame,
+    area: Rect,
+    field: &mut Field,
+    focused: bool,
+    cursor_on: bool,
+) {
+    let base = theme::text(theme::foreground()).bg(theme::background());
+    let selected = crate::chat_input::selection_range(&field.text, field.cursor, field.anchor);
+    let caret = theme::fixed::input_caret(base);
+    field.scroll_to_cursor(area.width as usize);
+    let skip = field.scroll;
+    let mut used = 0;
+    let mut spans = Vec::new();
+    for (index, ch) in field
+        .text
+        .char_indices()
+        .chain(std::iter::once((field.text.len(), ' ')))
+    {
+        let width = ch.to_string().width();
+        used += width;
+        if used <= skip {
+            continue;
+        }
+        if used > skip + area.width as usize {
+            break;
+        }
+        let style = if focused && cursor_on && index == field.cursor {
+            caret
+        } else if focused && selected.is_some_and(|(a, b)| index >= a && index < b) {
+            base.fg(theme::selection_fg())
+                .bg(theme::active().input_selection_bg)
+        } else {
+            base
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    f.buffer_mut()
+        .set_line(area.x, area.y, &Line::from(spans), area.width);
 }

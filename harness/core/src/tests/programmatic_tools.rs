@@ -15,7 +15,24 @@ fn run_typescript_completion(action_id: &str, calls: &[(&str, &str)]) -> Value {
                 }))
                 .collect::<Vec<_>>(),
             "finish_reason": "tool_call",
-            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+            "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+        },
+    })
+}
+
+fn program_committed(turn_id: &str, action_id: &str, call_id: &str, source: &str) -> Value {
+    let raw = json!({"code": source}).to_string();
+    json!({
+        "type": "assistant_message_committed",
+        "turn_id": turn_id,
+        "action_id": action_id,
+        "candidate": {
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_call", "id": call_id, "name": "run_typescript",
+                "arguments": {"type": "json", "raw": raw, "value": {"code": source}},
+            }]},
+            "finish_reason": "tool_call",
+            "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         },
     })
 }
@@ -148,8 +165,8 @@ fn self_sleep_is_programmatic_only_and_uses_the_runtime_route() {
 
 ///
 /// *Prepare*: A programmatic filesystem read is stopped by a pre-tool hook before any Runtime tool action is dispatched.
-/// *Do*: Complete the hook with a non-empty skip reason through the serialized Core interface.
-/// *Assert*: Core commits one skipped external result, resumes the private program, and asks the model to continue without dispatching the filesystem call.
+/// *Do*: Complete the hook with a skip reason that has model-visible and user-only text through the serialized Core interface.
+/// *Assert*: Core commits one skipped external result, resumes the private program, and asks the model to continue with the visible reason, without the user-only text and without dispatching the filesystem call.
 ///
 #[test]
 fn programmatic_pre_tool_skip_commits_the_normalized_result() {
@@ -176,6 +193,15 @@ fn programmatic_pre_tool_skip_commits_the_normalized_result() {
     let tool_action_id = hook_action["input"]["tool_call"]["action_id"].clone();
     let tool_call_id = hook_action["input"]["tool_call"]["call_id"].clone();
 
+    let reason = json!([
+        {"type": "text", "text": "workspace policy denied the read"},
+        {
+            "type": "text",
+            "text": "operator note: the file holds credentials",
+            "annotations": {"audience": ["user"]},
+        },
+    ]);
+
     // Do
     let skipped = accepted_value(session.apply(input(
         3,
@@ -186,7 +212,7 @@ fn programmatic_pre_tool_skip_commits_the_normalized_result() {
                 "hook": "pre_tool_call",
                 "output": {
                     "type": "skip",
-                    "reason": [{"type": "text", "text": "workspace policy denied the read"}],
+                    "reason": reason.clone(),
                 },
             },
         }),
@@ -207,9 +233,10 @@ fn programmatic_pre_tool_skip_commits_the_normalized_result() {
     );
     assert_eq!(observations[0]["result"]["type"], "failure");
     assert_eq!(observations[0]["result"]["error"]["code"], "tool_skipped");
+    assert_eq!(observations[0]["result"]["content"], reason);
     assert_eq!(
-        observations[0]["result"]["content"],
-        json!([{"type": "text", "text": "workspace policy denied the read"}])
+        observations[0]["result"]["error"]["message"],
+        "workspace policy denied the read"
     );
     assert_eq!(observations[1]["type"], "tool_execution_finished");
     assert_eq!(observations[1]["call_id"], "program-pre-skip");
@@ -228,19 +255,107 @@ fn programmatic_pre_tool_skip_commits_the_normalized_result() {
             .iter()
             .all(|directive| directive["action"]["type"] != "runtime_builtin_tool_call")
     );
+    let program_result = parent_tool_message(&skipped, "program-pre-skip");
+    assert_eq!(program_result["outcome"], "failure");
+    let program_text = program_result["content"][0]["text"]
+        .as_str()
+        .expect("the program result is text");
+    assert!(
+        program_text.contains(r#""message":"workspace policy denied the read""#),
+        "the model sees the hook's skip reason: {program_text}"
+    );
+    assert!(
+        !program_text.contains("operator note"),
+        "the model does not see user-only reason text: {program_text}"
+    );
+}
+
+///
+/// *Prepare*: A programmatic filesystem read is stopped by a pre-tool hook before any Runtime tool action is dispatched.
+/// *Do*: Complete the hook with a skip reason that has only user-only text through the serialized Core interface.
+/// *Assert*: The skipped result keeps the reason as its content, its error message stays the generic one, and the model sees that message without the user-only text.
+///
+#[test]
+fn programmatic_pre_tool_skip_without_visible_reason_keeps_the_generic_message() {
+    // Prepare
+    let mut config = config();
+    crate::core::testing::add_always_hook(&mut config, HookPoint::PreToolCall);
+    let mut session = HarnessSession::create(config).expect("session creates");
+    let started = accepted_value(session.apply(input(
+        1,
+        user_message(
+            "turn-program-hidden-skip",
+            "read the protected file",
+            "queue",
+        ),
+    )));
+    let completion_action_id = dispatched_action_id(&started).to_string();
+    let source =
+        "async function main() { return tools.file_system.read_file({ path: 'protected.txt' }); }";
+    let hook_pending = accepted_value(session.apply(input(
+        2,
+        run_typescript_completion(&completion_action_id, &[("program-hidden-skip", source)]),
+    )));
+    let hook_action_id = hook_pending["transition"]["next"]["directives"][0]["action"]["action_id"]
+        .as_str()
+        .expect("pre-tool hook has an action ID")
+        .to_string();
+    let reason = json!([
+        {
+            "type": "text",
+            "text": "operator note: the file holds credentials",
+            "annotations": {"audience": ["user"]},
+        },
+    ]);
+
+    // Do
+    let skipped = accepted_value(session.apply(input(
+        3,
+        json!({
+            "type": "hook_completed",
+            "action_id": hook_action_id,
+            "result": {
+                "hook": "pre_tool_call",
+                "output": {
+                    "type": "skip",
+                    "reason": reason.clone(),
+                },
+            },
+        }),
+    )));
+
+    // Assert
+    let observations = skipped["transition"]["observations"]
+        .as_array()
+        .expect("observations are an array");
+    assert_eq!(observations[0]["type"], "tool_result_committed");
+    assert_eq!(observations[0]["result"]["error"]["code"], "tool_skipped");
+    assert_eq!(observations[0]["result"]["content"], reason);
     assert_eq!(
-        parent_tool_message(&skipped, "program-pre-skip")["outcome"],
-        "failure"
+        observations[0]["result"]["error"]["message"],
+        "Tool execution was skipped by Runtime policy."
+    );
+    let program_text = parent_tool_message(&skipped, "program-hidden-skip")["content"][0]["text"]
+        .as_str()
+        .expect("the program result is text")
+        .to_string();
+    assert!(
+        program_text.contains(r#""message":"Tool execution was skipped by Runtime policy.""#),
+        "the model sees the generic skip message: {program_text}"
+    );
+    assert!(
+        !program_text.contains("operator note"),
+        "the model does not see user-only reason text: {program_text}"
     );
 }
 
 ///
 /// *Prepare*: A programmatic provided tool is checkpointed while its pre-tool hook is pending.
 /// *Do*: Restore the session and continue the hook with arguments that violate its configured schema.
-/// *Assert*: The restored catalog rejects the rewrite exactly and preserves both pending state and checkpoint semantics.
+/// *Assert*: The restored catalog finds the rewrite invalid: Core warns, and the program reads the failure instead of a tool result.
 ///
 #[test]
-fn restored_programmatic_provided_tool_uses_its_resolved_input_schema() {
+fn restored_programmatic_provided_tool_hook_arguments_use_its_resolved_input_schema() {
     // Prepare
     let mut config = config();
     crate::core::testing::add_always_hook(&mut config, HookPoint::PreToolCall);
@@ -285,11 +400,9 @@ fn restored_programmatic_provided_tool_uses_its_resolved_input_schema() {
     let decoded = decode_checkpoint(&encoded).expect("checkpoint decodes");
     let mut restored =
         HarnessSession::restore(config, decoded, 0).expect("provided-tool hook restores");
-    let before_inspection = inspection_value(&restored);
-    let before_checkpoint = checkpoint_value(&restored);
 
     // Do
-    let rejected = serde_json::to_value(restored.apply(input(
+    let failed = accepted_value(restored.apply(input(
         1,
         json!({
             "type": "hook_completed",
@@ -302,16 +415,41 @@ fn restored_programmatic_provided_tool_uses_its_resolved_input_schema() {
                 },
             },
         }),
-    )))
-    .expect("rejection serializes");
+    )));
 
     // Assert
+    let message = "A pre_tool_call hook returned arguments for `calendar.find_event` that do \
+                   not satisfy its input schema: the array value is not of type \"object\". The tool did not run.";
+    let observations = failed["transition"]["observations"]
+        .as_array()
+        .expect("observations are an array");
+    assert_eq!(observations.len(), 3);
+    assert_eq!(observations[0]["type"], "warning");
+    assert_eq!(observations[0]["code"], "pre_tool_call_arguments_invalid");
+    assert_eq!(observations[0]["message"], message);
     assert_eq!(
-        rejected["rejection"]["error"]["message"],
-        "pre-tool hook arguments do not satisfy the original tool schema: [] is not of type \"object\""
+        observations[0]["details"]["hook_binding_ids"],
+        json!(["test-hook-0-PreToolCall"])
     );
-    assert_eq!(inspection_value(&restored), before_inspection);
-    assert_eq!(checkpoint_value(&restored), before_checkpoint);
+    assert_eq!(observations[1]["type"], "tool_result_committed");
+    assert_eq!(
+        observations[1]["call"]["arguments"],
+        json!({"query": "planning"})
+    );
+    assert_eq!(
+        observations[1]["result"]["error"]["code"],
+        "pre_tool_call_arguments_invalid"
+    );
+    assert_eq!(observations[2]["type"], "tool_execution_finished");
+    assert_eq!(observations[2]["call_id"], "program-restored-provided-hook");
+    let program_result = observations[2]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("the program result is text");
+    assert!(program_result.contains("\"code\":\"pre_tool_call_arguments_invalid\""));
+    assert_eq!(
+        failed["transition"]["next"]["directives"][0]["action"]["type"],
+        "llm_call"
+    );
 }
 
 ///
@@ -395,7 +533,7 @@ fn programmatic_post_tool_failure_commits_only_the_hook_failure() {
 ///
 /// *Prepare*: A turn's `run_typescript` completion dispatches two parallel filesystem reads, which remain pending at an opaque checkpoint.
 /// *Do*: Restore the checkpoint and return the second read before the first to both the live and restored sessions.
-/// *Assert*: Only ordinary filesystem effects are observable, both continuations and checkpoints agree, and the completed program result reaches model input despite append-versus-replace delivery.
+/// *Assert*: The program candidate commits before ordinary filesystem effects, both continuations and checkpoints agree, and the completed program result reaches model input despite append-versus-replace delivery.
 ///
 #[test]
 fn parallel_programmatic_tools_survive_checkpoint_restore() {
@@ -421,7 +559,7 @@ fn parallel_programmatic_tools_survive_checkpoint_restore() {
                     "arguments_json": json!({"code": source}).to_string(),
                 }],
                 "finish_reason": "tool_call",
-                "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+                "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
             }
         }),
     )));
@@ -460,10 +598,11 @@ fn parallel_programmatic_tools_survive_checkpoint_restore() {
     // Assert
     assert_eq!(
         program_started["transition"]["observations"],
-        json!([{
+        json!([program_committed("turn-program", &completion_action_id, "program-call", source), {
             "type": "tool_execution_started",
             "turn_id": "turn-program",
             "call_id": "program-call",
+            "executed_by_core": true,
         }])
     );
     assert_eq!(first_action["type"], "runtime_builtin_tool_call");
@@ -822,19 +961,24 @@ fn local_program_success_and_failure_stay_inside_core() {
         }
         assert_eq!(
             result["transition"]["observations"][0],
+            program_committed(turn_id, &completion_action_id, call_id, source),
+        );
+        assert_eq!(
+            result["transition"]["observations"][1],
             json!({
                 "type": "tool_execution_started",
                 "turn_id": turn_id,
                 "call_id": call_id,
+                "executed_by_core": true,
             })
         );
         assert_eq!(
-            result["transition"]["observations"][1]["type"],
+            result["transition"]["observations"][2]["type"],
             "tool_execution_finished"
         );
-        assert_eq!(result["transition"]["observations"][1]["call_id"], call_id);
+        assert_eq!(result["transition"]["observations"][2]["call_id"], call_id);
         assert_eq!(
-            result["transition"]["observations"][1]["result"]["type"],
+            result["transition"]["observations"][2]["result"]["type"],
             expected_outcome
         );
     }

@@ -25,6 +25,7 @@ from vibe.app_server.events import (
     UnknownNotificationError,
     parse_server_event,
     reconcile_snapshot,
+    unchanged_prefix,
 )
 from vibe.app_server.models import (
     ApprovalCallbackDetail,
@@ -59,6 +60,7 @@ from vibe.app_server.protocol import (
     MCPAuthRequiredParams,
     Notification,
     SessionTextContentBlock,
+    TurnCompletedParams,
     TurnQueueUpdatedParams,
     TurnUserInputEntry,
 )
@@ -274,6 +276,53 @@ def test_snapshot_reconciliation_replays_missing_stream_updates() -> None:
     ) == completed.model_dump(mode="json", by_alias=True)
 
 
+def test_reconciling_states_that_share_a_prefix_emits_only_what_follows() -> None:
+    """*Prepare*: Two states that share their first entry object; after it, the
+        current state changes the second entry, adds a third, and drops nothing.
+    *Do*: Reconcile them, and measure their shared prefix.
+    *Assert*: The shared prefix ends at the changed entry, and only the change
+        and the addition become events, as a full comparison gives.
+    """
+
+    # Prepare
+    def message(entry_id: str, text: str) -> PublicMessageEntry:
+        return PublicMessageEntry(
+            id=entry_id,
+            session_id="session-1",
+            turn_id="turn-1",
+            role="assistant",
+            content=[TextContentBlock(text=text)],
+            generation_status=PublicEntryGenerationStatus.COMPLETED,
+            created_at=1,
+            updated_at=1,
+        )
+
+    shared = message("assistant-1", "kept")
+    previous = _projection().state.model_copy(
+        update={"history": [shared, message("assistant-2", "old")]}
+    )
+    current = previous.model_copy(
+        update={
+            "history": [
+                shared,
+                message("assistant-2", "new"),
+                message("assistant-3", "added"),
+            ]
+        }
+    )
+
+    # Do
+    events = reconcile_snapshot(previous, current)
+
+    # Assert
+    assert unchanged_prefix(previous.history or [], current.history or []) == 1
+    assert [
+        (type(event).__name__, event.entry.id)
+        for event in events
+        if isinstance(event, HistoryEntryAdded | HistoryEntryUpdated)
+    ] == [("HistoryEntryUpdated", "assistant-2"), ("HistoryEntryAdded", "assistant-3")]
+
+
 def test_reconnect_replays_steered_user_before_later_output_and_queue_update() -> None:
     queued = _queued_turn("queue-1", "message-1", "steer me")
     previous = _projection().state.model_copy(
@@ -417,6 +466,31 @@ def test_started_turn_prevents_stale_enqueue_reconciliation() -> None:
     projection.track_queued_turn(queued, session_id="session-1")
 
     assert projection.state.turn_queue.items == []
+
+
+def test_late_turn_start_response_does_not_reopen_a_terminated_turn() -> None:
+    projection = _projection()
+    started = PublicTurn(
+        id="turn-1",
+        session_id="session-1",
+        status=PublicTurnStatus.IN_PROGRESS,
+        started_at=2,
+    )
+    interrupted = started.model_copy(
+        update={"status": PublicTurnStatus.INTERRUPTED, "completed_at": 3}
+    )
+    projection.consume(
+        Notification(
+            method="turn/completed",
+            params=TurnCompletedParams(
+                event_id=1, session_id="session-1", turn=interrupted, emitted_at=3
+            ).model_dump(mode="json", by_alias=True),
+        )
+    )
+
+    projection.begin_turn(started)
+
+    assert projection.state.turns == [interrupted]
 
 
 def test_live_snapshot_preserves_loaded_history_and_turn_prefixes() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from git import Repo
 import pytest
 
 pytest.importorskip("mistralai_vibe_local_harness.vibe")
@@ -26,8 +27,10 @@ from vibe.app_server._agents_md_hooks import (
     AGENTS_MD_HOOK_BINDING_ID,
     agents_md_hook,
     merge_agents_md_hook,
+    register_access_roots,
 )
 from vibe.core.config.harness_files import HarnessFilesManager
+from vibe.core.git.worktree import WorktreeRepository
 from vibe.core.trusted_folders import trusted_folders_manager
 from vibe.utils import VIBE_WARNING_TAG
 
@@ -189,6 +192,72 @@ async def test_untrusted_cwd_does_not_inject_despite_production_roots(
     result = await handler(
         _hook_input(_read_call("outside/file.py"), _success()), _context(tmp_path)
     )
+    assert len(result.output.tool_result.content) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_entered_worktree_injects_no_agents_md(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """*Prepare*: A session that entered an untrusted worktree carrying a
+        nested AGENTS.md, then a second one.
+    *Do*: Read a file under the first.
+    *Assert*: Its AGENTS.md is not injected.
+    """
+    # Prepare
+    repo = Repo.init(tmp_path / "repo", initial_branch="main")
+    repo.config_writer().set_value("user", "name", "T").release()
+    repo.config_writer().set_value("user", "email", "t@e.com").release()
+    (tmp_path / "repo" / "file.txt").write_text("x\n", encoding="utf-8")
+    repo.index.add(["file.txt"])
+    repo.index.commit("initial")
+    with WorktreeRepository.open(tmp_path / "repo") as repository:
+        worktree = repository.prepare_auto(suggested_name="pr").root.resolve()
+        current = repository.prepare_auto(suggested_name="next").root.resolve()
+    (worktree / "sub").mkdir()
+    (worktree / "sub" / "AGENTS.md").write_text("# Theirs", encoding="utf-8")
+    (worktree / "sub" / "file.py").write_text("hello", encoding="utf-8")
+    checkout = (tmp_path / "repo").resolve()
+    monkeypatch.setattr(
+        trusted_folders_manager, "is_trusted", lambda path: path == checkout
+    )
+    handler = agents_md_hook(
+        HarnessFilesManager(sources=("user", "project"), cwd=checkout)
+    )
+    context = HookContext(
+        config=LocalRuntimeAdapterConfig.at(cwd=current, roots=(current, worktree)),
+        messages=(),
+        session_id="session-1",
+    )
+
+    # Do
+    result = await handler(
+        _hook_input(_read_call(str(worktree / "sub" / "file.py")), _success()), context
+    )
+
+    # Assert
+    assert len(result.output.tool_result.content) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_read_in_an_access_root_brings_in_no_agents_md(tmp_path: Path) -> None:
+    primary, other = (tmp_path / "primary").resolve(), (tmp_path / "other").resolve()
+    primary.mkdir()
+    (other / "sub").mkdir(parents=True)
+    (other / "sub" / "AGENTS.md").write_text("# Other", encoding="utf-8")
+    (other / "sub" / "file.py").write_text("hello", encoding="utf-8")
+    register_access_roots(primary, (primary, other), (other,))
+    handler = agents_md_hook(HarnessFilesManager(sources=("user", "project")))
+    context = HookContext(
+        config=LocalRuntimeAdapterConfig.at(cwd=primary, roots=(primary, other)),
+        messages=(),
+        session_id="session-1",
+    )
+
+    result = await handler(
+        _hook_input(_read_call(str(other / "sub" / "file.py")), _success()), context
+    )
+
     assert len(result.output.tool_result.content) == 1
 
 

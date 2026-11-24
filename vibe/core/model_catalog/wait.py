@@ -3,10 +3,11 @@
 With no catalog loaded, a session whose model is unpinned or missing may be
 about to get it from the catalog: its readiness and first turn wait for the
 fetch, for at most ``MODEL_CATALOG_WAIT_CAP_SECONDS`` from when the session
-starts waiting on it. Once a fetch fails, or is still running when a cap
-expires, no later session or ``/clear`` in the process waits. A fetch cancelled
-with its session is not a failure: the next session still waits for its own
-fetch.
+starts waiting on it. A pick of a model the config does not offer yet waits
+for it too, within the same cap, whatever the session's model.
+
+A failed fetch, or one still running at the cap, is handled as described in
+``vibe.core.utils.fetch_wait``.
 """
 
 from __future__ import annotations
@@ -16,30 +17,17 @@ from typing import TYPE_CHECKING, Any
 
 from vibe.core.config.layers.model_catalog import ModelCatalogLayer
 from vibe.core.model_catalog._constants import MODEL_CATALOG_WAIT_CAP_SECONDS
-from vibe.core.utils.fetch_wait import FetchFailures, FetchWait
+from vibe.core.utils.fetch_wait import FetchWait
 
 if TYPE_CHECKING:
     from vibe.core.config import VibeConfigSchema
     from vibe.core.config.orchestrator import ConfigOrchestrator
-
-_failures = FetchFailures()
-
-
-def model_catalog_failed() -> bool:
-    return _failures.failed
-
-
-def mark_model_catalog_failed() -> None:
-    _failures.mark()
-
-
-def reset_model_catalog_failed() -> None:
-    """Forget a failed fetch; for test isolation."""
-    _failures.reset()
+    from vibe.core.platform_auth import PlatformCredentialFactory
 
 
 def model_catalog_wait_needed(
     orchestrator: ConfigOrchestrator[VibeConfigSchema],
+    credentials: PlatformCredentialFactory | None = None,
 ) -> bool:
     """Whether a session opening on *orchestrator* must wait for its catalog
     fetch.
@@ -49,16 +37,26 @@ def model_catalog_wait_needed(
     resolve to a catalog model once the fetch lands. Without a Mistral
     credential the fetch is skipped, so there is nothing to wait for.
     """
-    config = orchestrator.config
-    if not config.experimental_enable_model_catalog:
+    if orchestrator.config.active_model:
         return False
-    if config.active_model or model_catalog_failed():
-        return False
-    # Imported here, as in the fetch: it keeps the telemetry stack off this
-    # module's import path.
-    from vibe.core.telemetry.send import get_mistral_provider_and_api_key
+    return model_catalog_pending(orchestrator, credentials)
 
-    if get_mistral_provider_and_api_key(config) is None:
+
+def model_catalog_pending(
+    orchestrator: ConfigOrchestrator[VibeConfigSchema],
+    credentials: PlatformCredentialFactory | None = None,
+) -> bool:
+    """Whether a catalog fetch may still bring models to *orchestrator*: the
+    catalog is on, none is loaded, and a fetch can run.
+    """
+    config = orchestrator.config
+    if not config.enable_model_catalog:
+        return False
+    # Imported here, as in the fetch: it keeps the HTTP stack off this
+    # module's import path.
+    from vibe.core.platform_auth._mistral import mistral_credentials
+
+    if mistral_credentials(config, credentials) is None:
         return False
     try:
         layer = orchestrator.get_layer(ModelCatalogLayer.NAME)
@@ -69,11 +67,7 @@ def model_catalog_wait_needed(
     return isinstance(layer, ModelCatalogLayer) and layer.catalog is None
 
 
-class ModelCatalogWait(FetchWait):
-    def __init__(self, task: asyncio.Task[Any]) -> None:
-        super().__init__(
-            task,
-            name="Model catalog",
-            cap_seconds=MODEL_CATALOG_WAIT_CAP_SECONDS,
-            failures=_failures,
-        )
+def model_catalog_wait(task: asyncio.Future[Any]) -> FetchWait:
+    return FetchWait(
+        task, name="Model catalog", cap_seconds=MODEL_CATALOG_WAIT_CAP_SECONDS
+    )

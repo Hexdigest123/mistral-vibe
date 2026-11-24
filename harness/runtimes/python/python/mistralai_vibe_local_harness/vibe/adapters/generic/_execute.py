@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing
+from dataclasses import dataclass
 from html import escape
 import json
 import logging
@@ -57,6 +58,7 @@ from mistralai_vibe_local_harness.vibe._runtime_config import (
 from mistralai_vibe_local_harness.vibe._ssl import build_ssl_context
 from mistralai_vibe_local_harness.vibe.adapters._correlation import correlation_hook
 from mistralai_vibe_local_harness.vibe.adapters._provider_failure import (
+    EmptyProviderResponse,
     IncompleteProviderStream,
     ProviderRefusal,
     is_read_timeout,
@@ -71,6 +73,7 @@ from mistralai_vibe_local_harness.vibe.adapters._request_log import (
     log_completion_request,
 )
 from mistralai_vibe_local_harness.vibe.adapters._retry import (
+    ProviderAttempt,
     RetryNotices,
     call_with_retries,
 )
@@ -199,6 +202,31 @@ async def execute_generic_completion(
     adapter = _get_adapter(provider.api_style)
     wire = generic_wire(provider.api_style)
     notices = RetryNotices(on_retry)
+    current_attempt: ProviderAttempt | None = None
+
+    async def observe_response(response: httpx2.Response) -> None:
+        if response.is_success and current_attempt is not None:
+            current_attempt.accept()
+        await notices.clear_on_success(response)
+
+    async def complete_attempt(
+        provider_attempt: ProviderAttempt,
+    ) -> RustCompletionResult:
+        nonlocal current_attempt
+        current_attempt = provider_attempt
+        return await _complete_once(
+            client=client,
+            url=url,
+            body=request.body,
+            headers=headers,
+            provider=provider,
+            model=route.model,
+            guard=config.stream_guard(),
+            on_delta=on_delta,
+            malformed=malformed,
+            provider_attempt=provider_attempt,
+        )
+
     request = adapter.prepare_request(
         model_name=route.model,
         messages=[_to_llm_message(message) for message in messages],
@@ -254,22 +282,14 @@ async def execute_generic_completion(
         # Mistral-hosted models reached through the generic (OpenAI-compatible)
         # path still return mistral-correlation-id; capture it like the native
         # adapter. Non-Mistral providers omit the header (sink gets None).
-        event_hooks={"response": [correlation_hook(config), notices.clear_on_success]},
+        event_hooks={"response": [correlation_hook(config), observe_response]},
     ) as client:
         result = await call_with_retries(
-            lambda: _complete_once(
-                client=client,
-                url=url,
-                body=request.body,
-                headers=headers,
-                provider=provider,
-                model=route.model,
-                guard=config.stream_guard(),
-                on_delta=on_delta,
-                malformed=malformed,
-            ),
+            complete_attempt,
             max_elapsed_time_s=config.retry_max_elapsed_time_s,
             notices=notices,
+            completion_budget=config.completion_budget,
+            pricing=route.pricing,
         )
 
     _warn_on_workless_completion(
@@ -322,13 +342,16 @@ async def _complete_once(
     guard: StreamGuard,
     on_delta: ProviderDeltaObserver | None = None,
     malformed: MalformedToolCalls | None = None,
+    provider_attempt: ProviderAttempt,
 ) -> RustCompletionResult:
     # Adapters buffer parse state, so a retried attempt gets a fresh one.
     adapter = _get_adapter(provider.api_style)
     accumulated: LLMChunk | None = None
     raw_usage: dict[str, object] | None = None
     wire = generic_wire(provider.api_style)
-    raw_chunks = _stream_json_chunks(client, url, body, headers, guard)
+    end = _StreamEnd()
+    saw_error_payload = False
+    raw_chunks = _stream_json_chunks(client, url, body, headers, guard, end)
     async for parsed in until_connection_lost(
         adapter.parse_stream(raw_chunks, provider),
         # Read when the stream fails, so it must see the latest chunk.
@@ -341,8 +364,12 @@ async def _complete_once(
         chunk = parsed.chunk
         if _carries_model_output(chunk):
             guard.mark_output()
+        if "error" in parsed.data:
+            saw_error_payload = True
         if (reported := _reported_usage(parsed.data)) is not None:
             raw_usage = merge_reported_usage(raw_usage, reported)
+            if has_reply_usage(wire, raw_usage):
+                provider_attempt.report_usage(reply_token_usage(wire, raw_usage))
         accumulated = chunk if accumulated is None else accumulated + chunk
         if on_delta is not None:
             text = chunk.message.content or ""
@@ -355,11 +382,17 @@ async def _complete_once(
                     )
                 )
 
+    # An error payload is a failure, possibly transient, not an empty answer.
+    empty = end.done and not guard.output_started and not saw_error_payload
     if accumulated is None:
+        if empty:
+            raise _empty_response(provider, model)
         raise IncompleteProviderStream(
             f"Model stream from {provider.name} ({model}) produced no chunks."
         )
     if provider.emits_finish_reason and accumulated.stop is None:
+        if empty:
+            raise _empty_response(provider, model)
         raise IncompleteProviderStream(
             f"Model stream from {provider.name} ({model}) ended without a finish reason."
         )
@@ -375,15 +408,32 @@ async def _complete_once(
         raise ProviderRefusal(
             category=accumulated.stop.category, explanation=accumulated.stop.explanation
         )
+    usage = reply_token_usage(wire, raw_usage)
+    provider_attempt.report_usage(usage)
     return _to_completion_result(
         accumulated.model_copy(
             update={"message": adapter.finish_message(accumulated.message)}
         ),
         wire=wire,
-        usage=reply_token_usage(wire, raw_usage),
+        usage=usage,
         source=CompletionSource(provider=provider.name, model=model),
         record=malformed,
     )
+
+
+def _empty_response(provider: ProviderView, model: str) -> EmptyProviderResponse:
+    return EmptyProviderResponse(
+        f"Model stream from {provider.name} ({model}) ended without sending any "
+        "content. The provider may not support a setting of this request, such "
+        "as its reasoning effort."
+    )
+
+
+@dataclass(slots=True)
+class _StreamEnd:
+    """Whether the stream ended with the ``[DONE]`` marker, not a closed body."""
+
+    done: bool = False
 
 
 def _carries_model_output(chunk: LLMChunk) -> bool:
@@ -418,6 +468,7 @@ async def _stream_json_chunks(
     body: bytes,
     headers: dict[str, str],
     guard: StreamGuard,
+    end: _StreamEnd,
 ) -> AsyncGenerator[dict[str, Any]]:
     opened = False
 
@@ -460,6 +511,7 @@ async def _stream_json_chunks(
                 # e.g. anthropic/responses `event:` lines, or OpenRouter comments.
                 continue
             if value.strip() == "[DONE]":
+                end.done = True
                 return
             try:
                 yield json.loads(value.strip())
@@ -504,6 +556,7 @@ def _provider_view(config: LocalRuntimeAdapterConfig) -> ProviderView:
         api_style=config.api_style,
         reasoning_field_name=config.reasoning_field_name,
         emits_finish_reason=config.emits_finish_reason,
+        tool_result_images=config.tool_result_images,
         project_id=config.project_id,
         region=config.region,
         extra_headers=dict(config.extra_headers),

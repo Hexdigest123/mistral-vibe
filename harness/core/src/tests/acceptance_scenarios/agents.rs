@@ -182,10 +182,10 @@ fn operator_prompts_reach_model_guidance_and_tool_catalogs() {
             "operator",
             &first,
             "spawn",
-            "return await tools.agents.spawn({name: 'worker', message: 'inspect'});",
+            "return await tools.agents.spawn({name: 'worker', message: 'inspect', instructions: 'Work.'});",
             [runtime_tool(
                 "agents.spawn",
-                json!({"name":"worker", "message":"inspect"}),
+                json!({"name": "worker", "message": "inspect", "instructions": "Work."}),
             )],
         )
         .only_action();
@@ -354,7 +354,7 @@ fn forked_child_sees_the_running_spawn_call_closed_before_its_task() {
         .as_str()
         .unwrap();
     let request = "Spawn a helper to check the notes, then wait for it.";
-    let source = "async function main() { return tools.agents.spawn({ name: 'helper', message: 'Check the notes' }); }";
+    let source = "async function main() { return tools.agents.spawn({ name: 'helper', message: 'Check the notes', instructions: 'Work.' }); }";
     let mut parent = SynchronousRuntime::new(config());
     let first = parent.start_turn("parent", request);
     let spawn = parent
@@ -365,7 +365,7 @@ fn forked_child_sees_the_running_spawn_call_closed_before_its_task() {
             source,
             [runtime_tool(
                 "agents.spawn",
-                json!({"name":"helper", "message":"Check the notes"}),
+                json!({"name": "helper", "message": "Check the notes", "instructions": "Work."}),
             )],
         )
         .only_action();
@@ -513,7 +513,7 @@ fn pending_agent_message_survives_restore_and_is_seen_once_before_new_input() {
     assert_eq!(runtime.inspection_value()["has_pending_model_input"], true);
 
     assert_eq!(
-        runtime.checkpoint_value()["notifications"][0]["notification"]["source"],
+        runtime.checkpoint_value()["pending_input"][0]["notification"]["source"],
         json!({
             "type":"agent_message", "sender_agent_path":"/root/child",
         }),
@@ -568,6 +568,18 @@ fn agent_results_survive_restore_and_are_seen_once_before_new_input() {
             "Status: stopped, iteration limit reached before the agent finished\nTo let it continue with its history, send a message to /root/child.",
         ),
         (
+            json!({"outcome":"completed", "output":[{"type":"text", "text":"Two of five steps done."}], "stop_reason":"output_limit"}),
+            "Status: stopped, output limit reached before the agent finished its reply\nPartial output: [{\"type\":\"text\",\"text\":\"Two of five steps done.\"}]\nTo let it continue with its history, send a message to /root/child.",
+        ),
+        (
+            json!({"outcome":"completed", "output":[], "stop_reason":"output_limit"}),
+            "Status: stopped, output limit reached before the agent finished its reply\nTo let it continue with its history, send a message to /root/child.",
+        ),
+        (
+            json!({"outcome":"completed", "output":[{"type":"text", "text":"Stopped this turn."}], "stop_reason":"repeated_tool_failure"}),
+            "Status: stopped, the same tool call failed repeatedly before the agent finished\nPartial output: [{\"type\":\"text\",\"text\":\"Stopped this turn.\"}]\nTo let it continue with its history, send a message to /root/child.",
+        ),
+        (
             json!({"outcome":"completed", "output":[{"type":"text", "text":"Skipped by policy"}], "stop_reason":"skipped"}),
             "Status: completed\nOutput: [{\"type\":\"text\",\"text\":\"Skipped by policy\"}]",
         ),
@@ -609,7 +621,7 @@ fn agent_results_survive_restore_and_are_seen_once_before_new_input() {
         );
         assert_eq!(runtime.inspection_value()["has_pending_model_input"], true);
         assert_eq!(
-            runtime.checkpoint_value()["notifications"][0]["notification"]["source"],
+            runtime.checkpoint_value()["pending_input"][0]["notification"]["source"],
             source
         );
 
@@ -704,7 +716,7 @@ fn agent_result_start_and_steering_share_turn_semantics_through_restore() {
 
 /// *Prepare*: The parent cannot resume an idle child with a message: its tree policy keeps such
 /// messages pending, or it has no `send_message`.
-/// *Do*: Deliver a cancelled and an iteration-limited child result.
+/// *Do*: Deliver a cancelled, an iteration-limited and an output-limited child result.
 /// *Assert*: The result keeps its status and partial output but has no continue hint.
 #[test]
 fn unfinished_agent_results_omit_the_continue_hint_when_a_message_cannot_resume_the_child() {
@@ -720,6 +732,10 @@ fn unfinished_agent_results_omit_the_continue_hint_when_a_message_cannot_resume_
             (
                 json!({"outcome":"completed", "output":[], "stop_reason":"iteration_limit"}),
                 "Status: stopped, iteration limit reached before the agent finished",
+            ),
+            (
+                json!({"outcome":"completed", "output":[{"type":"text", "text":"Two of five"}], "stop_reason":"output_limit"}),
+                "Status: stopped, output limit reached before the agent finished its reply\nPartial output: [{\"type\":\"text\",\"text\":\"Two of five\"}]",
             ),
         ] {
             // Prepare
@@ -1128,11 +1144,12 @@ fn agent_hooks_select_the_canonical_runtime_identity() {
             turn_id,
             &first,
             "program",
-            "async function main() { return tools.agents.spawn({name:'child', message:'work'}); }",
+            "async function main() { return tools.agents.spawn({name: 'child', message: 'work', instructions: 'Work.'}); }",
             [hook_call("pre_tool_call", &["spawn-pre"], Value::Null)],
         )
         .only_action();
-    let approved = json!({"name": "reviewer", "message": "review the patch"});
+    let approved =
+        json!({"name": "reviewer", "message": "review the patch", "instructions": "Work."});
 
     // Do
     runtime.restart_from_checkpoint();

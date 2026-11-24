@@ -8,10 +8,10 @@ use serde_json::Value;
 use super::event::{dispatch, CommandEvent};
 use super::submission::new_message_id;
 use crate::app::{App, QueuedPrompt};
-use crate::resume_picker::short_id;
 use crate::server::Client;
-use crate::server::{method, PublicSessionState, SessionHistoryClearParams, TokenUsage};
+use crate::server::{method, PublicSessionState, SessionHistoryClearParams};
 use crate::session_exit::is_resumable;
+use crate::sessions_page::short_id;
 
 /// Bound on the pre-clear `session/log/read`; past it the notice omits the previous session.
 const PREVIOUS_SESSION_READ_TIMEOUT: Duration = Duration::from_millis(500);
@@ -33,7 +33,7 @@ pub(super) fn clear_history(app: &mut App, client: &Arc<Client>, value: &str) {
         return;
     };
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         // Read before the clear: the server drops the old session once it is replaced.
         let previous_session_id = is_resumable(&client, &session_id, PREVIOUS_SESSION_READ_TIMEOUT)
             .await
@@ -68,9 +68,7 @@ pub fn cleared(
         .and_then(|state| serde_json::from_value::<PublicSessionState>(state).ok())
     {
         Some(state) => CommandEvent::Cleared {
-            session_id: state.session.id,
-            usage: state.session.token_usage,
-            child_sessions: state.child_sessions,
+            state: Box::new(state),
             previous_session_id,
             seed,
         },
@@ -81,7 +79,9 @@ pub fn cleared(
 /// Wipe the screen once the server confirmed: a failed clear keeps its history.
 fn reset_transcript(app: &mut App) {
     app.view.transcript.clear();
+    crate::notices::clear(app);
     app.todo_tracker.clear();
+    crate::goal::adopt(app, None, false);
     app.queue.clear();
     app.view.transcript_cache.invalidate_layouts();
     app.view.scroll = 0;
@@ -89,23 +89,17 @@ fn reset_transcript(app: &mut App) {
 }
 
 /// Adopt the session `session/history/clear` created, on the main thread.
-pub fn apply_cleared(
-    app: &mut App,
-    session_id: String,
-    usage: Option<TokenUsage>,
-    child_sessions: Vec<crate::server::PublicChildSession>,
-) {
+pub fn apply_cleared(app: &mut App, state: &PublicSessionState) {
     reset_transcript(app);
     app.terminal_notifier.set_default_title("");
-    app.set_session_id(session_id);
+    crate::background_work::adopt_session(app, state);
     app.session.active_turn_id = None;
-    // The cleared replacement owns its own child sessions.
-    app.subagents.seed_snapshot(child_sessions);
     // A cleared context drops the previous session's subagent views.
     crate::subagents::reset_views(app);
     crate::subagents::refresh(app);
     // Reset the usage baseline on the clear adopt, falling back to the
     // stats still held when the fresh state carries no usage.
+    let usage = state.session.token_usage;
     let baseline = usage.unwrap_or_else(|| crate::session_exit::current_usage(app));
     app.session.usage_baseline = Some(baseline);
     app.session.tokens = (0, app.session.tokens.1);
@@ -128,7 +122,7 @@ pub fn new_conversation_text(previous_session_id: Option<&str>) -> String {
 pub fn start_seed_turn(app: &App, client: &Arc<Client>, session_id: String, seed: QueuedPrompt) {
     let client = client.clone();
     let telemetry = app.telemetry_tx.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         super::submission::start_turn(client, session_id, seed, telemetry).await;
     });
 }

@@ -14,6 +14,18 @@ Slash commands have two execution policies:
 - All other slash commands require an idle session. If the user submits one
   while busy, the client keeps the text in the input and shows a warning.
 
+A paused queue (after an interrupted or failed turn) waits for the user, so the
+session counts as idle for slash commands. Only commands that replace the
+session or its history, and drop the queue with it (`/clear`, `/compact`,
+`/rewind`, `/resume`), wait until the user resumes or empties the queue.
+`/retry` starts its injected turn ahead of the held prompts. The local runtime
+admits an injected `turn/start` past a paused queue, refuses any other direct
+start while the queue holds turns, and resumes the queue once the injected turn
+completes; a failed or interrupted retry leaves it paused. App-server callers
+that inject turns on their own, such as goal continuations, keep checking for a
+paused queue first. The target runtime must match this before injected starts
+move to the Session API.
+
 Shell commands also require an idle session. They are rejected while an agent
 turn, another shell command, or accepted queued prompt is active.
 
@@ -42,10 +54,28 @@ logic.
 ## Side-channel rules
 
 A side-channel command must be safe to run alongside active work. Suitable
-commands display information, copy data, exit, or write settings no turn reads.
-They must not mutate session history or configuration the active turn reads.
+commands display information, copy data, exit, write settings no turn reads, or
+fork a detached copy of the session. They must not mutate session history or
+configuration the active turn reads.
+
+`/branch` forks while a turn runs: the Harness cuts the copy before that turn,
+whose history is not committed yet. The fork holds the source's turn-start lock
+while it copies, so queued prompts wait for it. A turn an automatic compaction
+merged into its summary refuses the fork until it ends.
+
+Left and `/sessions` open the Sessions page as a side-channel command. While
+busy, the page only lists and reads sessions, lists projects, renames any
+session, and archives or marks as seen a session other than the busy one. It
+refuses to switch to another session until the turn ends. `/resume` opens the
+same page but stays idle-only, since it attaches another session.
+
 MCP, connector, and plugin changes stay idle-only: the Harness refuses them
 while a turn runs.
+
+`/skills` is side-channel: its reads never touch the turn, and a skill change
+made during a turn is persisted at once and parked until the turn ends, like
+`config/model/write` and the skill folder watch. The answer says `pending`, and
+the running turn keeps the skills it bound at its start.
 
 If one side-channel command is already running, a second one is rejected with a
 warning. Side-channel commands are not queue items and do not appear in the
@@ -60,7 +90,7 @@ queued-message UI.
 - Add a config path to `config/write`'s turn-independent allowlist only when no
   turn, tool, or prompt reads it.
 - Mark a side-channel command `.after_jobs()` when its server write conflicts
-  with a compaction, teleport, project request, or agent install.
+  with a compaction, project request, or agent install.
 - Keep lifecycle commands such as `/clear`, `/compact`, `/rewind`, `/resume`,
   and `/retry` on the idle-only path.
 - Keep settings commands that a turn reads on the idle-only path and write

@@ -11,9 +11,10 @@ use crate::commands::{submission::new_message_id, CommandEvent};
 use crate::server::proto_proxy::{ConfigProxyReadResponse, ProxySettingsView};
 use crate::server::{method, Client};
 use crate::transcript::local;
-use crate::vibe_code_project::Field;
 
+mod field;
 mod input;
+pub use field::{Field, MAX_INPUT_BYTES};
 pub use input::{copy_selection, handle_key, paste, press};
 
 pub const SAVED_MESSAGE: &str = "Proxy settings saved. Restart the CLI for changes to take effect.";
@@ -147,9 +148,8 @@ pub fn open(app: &mut App, client: &Arc<Client>) {
     };
     app.proxy_setup.loading = true;
     app.proxy_setup.session_id = Some(session_id.clone());
-    let pending = app.commit_started();
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let result = client
             .request_err(method::CONFIG_PROXY_READ, json!({"sessionId": session_id}))
             .await
@@ -159,7 +159,7 @@ pub fn open(app: &mut App, client: &Arc<Client>) {
                     .map(|response| response.settings)
                     .map_err(|error| error.to_string())
             });
-        crate::input::deliver(Some(tx), CommandEvent::ProxySettings(result), &pending).await;
+        crate::input::deliver(Some(tx), CommandEvent::ProxySettings(result)).await;
     });
 }
 
@@ -192,9 +192,8 @@ fn save(app: &mut App, client: &Arc<Client>) {
     };
     let changes = app.proxy_setup.changes();
     app.proxy_setup = ProxySetupApp::default();
-    let pending = app.commit_started();
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = json!({"sessionId": session_id, "changes": changes});
         let event = match client.request_err(method::CONFIG_PROXY_WRITE, params).await {
             Ok(_) => CommandEvent::Status(SAVED_MESSAGE.to_owned()),
@@ -203,6 +202,6 @@ fn save(app: &mut App, client: &Arc<Client>) {
                 error.message
             )),
         };
-        crate::input::deliver(Some(tx), event, &pending).await;
+        crate::input::deliver(Some(tx), event).await;
     });
 }

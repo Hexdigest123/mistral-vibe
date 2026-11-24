@@ -69,6 +69,7 @@ class SessionTelemetry:
         nb_context_messages: int,
         nb_prompt_chars: int,
         call_type: TelemetryCallType,
+        reasoning_effort: str,
         message_id: str | None = None,
         attachment_counts: dict[AttachmentKind, int] | None = None,
     ) -> None:
@@ -78,6 +79,7 @@ class SessionTelemetry:
             nb_context_messages=nb_context_messages,
             nb_prompt_chars=nb_prompt_chars,
             call_type=call_type,
+            reasoning_effort=reasoning_effort,
             message_id=message_id,
             attachment_counts=attachment_counts,
         )
@@ -107,7 +109,7 @@ class SessionTelemetry:
             message_id=message_id,
         )
 
-    def record_tool_call_finished(
+    def record_tool_call_finished(  # noqa: PLR0913
         self,
         *,
         tool_name: str,
@@ -116,11 +118,14 @@ class SessionTelemetry:
         nb_files_created: int,
         nb_files_modified: int,
         file_extension: str | None,
+        approval_policy: str | None = None,
         message_id: str | None = None,
         decision: Literal["execute", "skip"] | None = None,
         approval_type: Literal["always", "never", "ask"] | None = None,
         approval_source: Literal["config", "smart", "user", "bypass", "never"]
         | None = None,
+        error_code: str | None = None,
+        error_reason: str | None = None,
     ) -> None:
         send_unified_tool_call_finished(
             self._client,
@@ -128,6 +133,7 @@ class SessionTelemetry:
             status=status,
             model=self._model,
             agent_profile_name=agent_profile_name,
+            approval_policy=approval_policy,
             nb_files_created=nb_files_created,
             nb_files_modified=nb_files_modified,
             file_extension=file_extension,
@@ -135,6 +141,8 @@ class SessionTelemetry:
             decision=decision,
             approval_type=approval_type,
             approval_source=approval_source,
+            error_code=error_code,
+            error_reason=error_reason,
         )
 
     def record_subagent_tool_call_finished(
@@ -257,7 +265,7 @@ class SessionTelemetry:
         self,
         *,
         provider: Literal["github", "gitlab"],
-        trigger: Literal["session_start", "turn_end", "client_request"],
+        trigger: Literal["session_start", "turn_end", "client_request", "poll"],
         changed: bool,
     ) -> None:
         """A provider sync pass refreshed an artifact (Phase 4).
@@ -274,7 +282,7 @@ class SessionTelemetry:
         self,
         *,
         provider: Literal["github", "gitlab", "unknown"],
-        trigger: Literal["session_start", "turn_end", "client_request"],
+        trigger: Literal["session_start", "turn_end", "client_request", "poll"],
         error_type: str,
     ) -> None:
         """A provider sync fetch failed for one artifact (Phase 4)."""

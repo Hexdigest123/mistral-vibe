@@ -11,10 +11,18 @@ from pathlib import Path
 from typing import Any
 
 from vibe.app_server._cached_layers import apply_cached_layers
+from vibe.app_server._config_changes import ConfigChanges
 from vibe.app_server._config_errors import USER_CONFIG_ERRORS, user_config_error
+from vibe.app_server._config_introspect import TELEMETRY_FIELD, telemetry_setting_view
 from vibe.app_server._connection_protocol import ClientInfo
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
+from vibe.app_server._experiments_service import ExperimentsService
 from vibe.app_server._history_projection import project_message_history
+from vibe.app_server._local_plugins_controller import (
+    LOCAL_PLUGIN_METHODS,
+    ConnectorCatalogReader,
+    LocalPluginsController,
+)
 from vibe.app_server._local_projects_controller import (
     LOCAL_PROJECT_METHODS,
     LocalProjectsController,
@@ -25,29 +33,39 @@ from vibe.app_server._local_skills_controller import (
 )
 from vibe.app_server._missing_layers import MissingLayerFetches
 from vibe.app_server._model import ProtocolModel, validate_wire
+from vibe.app_server._model_catalog_service import ModelCatalogKey, ModelCatalogService
+from vibe.app_server._open_sessions import OpenSessions
 from vibe.app_server._org_config_service import OrgConfigService
 from vibe.app_server._project_links import (
-    ProjectLinksAuthError,
     ProjectLinksController,
     ProjectLinksError,
-    ProjectLinksInternalError,
     ProjectLinksInvalidRequest,
 )
 from vibe.app_server._projection import (
-    project_agent_summaries,
     project_config_view,
+    project_selection,
     project_skill_summaries,
+)
+from vibe.app_server._session_config_cache import (
+    BuiltSessionConfig,
+    SessionConfigCache,
+    SessionConfigKey,
 )
 from vibe.app_server._session_model import active_model_is_pinned
 from vibe.app_server._setup import SetupRequestHandler, _launch_context
 from vibe.app_server._state import build_stored_public_state, history_page
+from vibe.app_server._storage_usage.files import touch_stale_marker
+from vibe.app_server._trusted_folders import (
+    TRUST_FOLDER_METHODS,
+    dispatch_trust_folders,
+)
 from vibe.app_server._workspace import (
     WorkspaceTrustError,
     decide_workspace_trust,
     read_untrusted_config_dirs,
     read_workspace_trust,
 )
-from vibe.app_server._worktree_cleanup import session_finished, worktree_cleanup
+from vibe.app_server._worktree_housekeeping import WorktreeHousekeeping
 from vibe.app_server.protocol import (
     AgentsListParams,
     AgentsListResponse,
@@ -57,16 +75,10 @@ from vibe.app_server.protocol import (
     ConfigSchemaReadResponse,
     EmptyResponse,
     ProjectLinkMutationResponse,
-    ProjectLinksCreateParams,
     ProjectLinksInspectRootParams,
     ProjectLinksInspectRootResponse,
-    ProjectLinksLinkParams,
     ProjectLinksListParams,
     ProjectLinksListResponse,
-    ProjectLinksPickerLoadMoreParams,
-    ProjectLinksPickerLoadMoreResponse,
-    ProjectLinksPickerLoadParams,
-    ProjectLinksPickerLoadResponse,
     ProjectLinksResolveRootParams,
     ProjectLinksResolveRootResponse,
     ProjectLinksSaveParams,
@@ -86,6 +98,10 @@ from vibe.app_server.protocol import (
     SessionTitleUpdateResponse,
     SkillsListParams,
     SkillsListResponse,
+    TelemetrySettingReadParams,
+    TelemetrySettingReadResponse,
+    TelemetrySettingUpdateParams,
+    TelemetrySettingUpdateResponse,
     WorkspaceGitBranchChanges,
     WorkspaceGitCheckout,
     WorkspaceGitCheckoutsParams,
@@ -94,6 +110,8 @@ from vibe.app_server.protocol import (
     WorkspaceTrustDecisionParams,
     WorkspaceTrustStatusParams,
     WorkspaceUntrustedConfigParams,
+    WorkspaceWorktreeAutoUpdateParams,
+    WorkspaceWorktreeAutoUpdateResponse,
     WorkspaceWorktreeLimitUpdateParams,
     WorkspaceWorktreeLimitUpdateResponse,
     WorkspaceWorktreeListParams,
@@ -106,10 +124,17 @@ from vibe.app_server.protocol import (
 )
 from vibe.core.agents.manager import AgentManager
 from vibe.core.config import VibeConfigSchema, build_default_orchestrator
+from vibe.core.config._self_hosted import (
+    crash_reports_allowed,
+    log_self_hosted_services,
+)
 from vibe.core.config._setting_keys import config_json_schema
+from vibe.core.config.builder import InvalidConfigError
 from vibe.core.config.harness_files import HarnessFilesManager
-from vibe.core.config.layers.admin import enforced_keys
+from vibe.core.config.layers.admin import AdminConfigLayer, enforced_keys
+from vibe.core.config.layers.environment import EnvironmentLayer
 from vibe.core.config.orchestrator import ConfigOrchestrator
+from vibe.core.config.vibe_schema import DEFAULT_PROVIDERS, VIBE_BOT_KEYS
 from vibe.core.git.errors import (
     GitError,
     GitRepositoryNotFoundError,
@@ -123,6 +148,8 @@ from vibe.core.git.worktree import (
     WorktreeRepository,
 )
 from vibe.core.hooks.config import load_hooks_from_fs
+from vibe.core.platform_auth import PlatformCredentialFactory
+from vibe.core.platform_auth._mistral import api_key_credentials
 from vibe.core.session.artifacts import sanitize_artifacts_in_raw_metadata
 from vibe.core.session.saved_sessions import (
     delete_saved_session,
@@ -140,12 +167,10 @@ _HOST_METHODS = frozenset({
     "agents/list",
     "config/read",
     "config/schema",
-    "projectLinks/create",
+    "config/telemetry/read",
+    "config/telemetry/update",
     "projectLinks/inspectRoot",
-    "projectLinks/link",
     "projectLinks/list",
-    "projectLinks/picker/load",
-    "projectLinks/picker/loadMore",
     "projectLinks/resolveRoot",
     "projectLinks/save",
     "projectLinks/unlink",
@@ -163,10 +188,13 @@ _HOST_METHODS = frozenset({
     "setup/submit-choices",
     "skills/list",
     *LOCAL_SKILL_METHODS,
+    *LOCAL_PLUGIN_METHODS,
     "workspace/trust/decision",
+    *TRUST_FOLDER_METHODS,
     "workspace/trust/untrustedConfig",
     "workspace/trust/status",
     "workspace/git/checkouts",
+    "workspace/git/worktrees/auto/update",
     "workspace/git/worktrees/limit/update",
     "workspace/git/worktrees/list",
     "workspace/git/worktrees/prune",
@@ -175,16 +203,31 @@ _HOST_METHODS = frozenset({
 
 
 class HostRequestHandler:
-    def __init__(
+    def __init__(  # noqa: PLR0913 - one collaborator per concern, all keyword-only
         self,
         harness_files: HarnessFilesManager,
         *,
         org_config: OrgConfigService,
+        worktrees: WorktreeHousekeeping,
+        experiments: ExperimentsService,
+        model_catalog: ModelCatalogService,
+        credentials: PlatformCredentialFactory | None = None,
         image_fallback: bool = False,
         builtin_plugin_roots: Sequence[Path] | None = None,
+        open_sessions: OpenSessions | None = None,
+        config_changes: ConfigChanges | None = None,
+        connector_catalog: ConnectorCatalogReader | None = None,
     ) -> None:
         self._harness_files = harness_files
+        # Reached by a setting written without a session; None when nothing
+        # else in the process holds a session or listens for config changes.
+        self._open_sessions = open_sessions
+        self._config_changes = config_changes
         self._org_config = org_config
+        self._model_catalog = model_catalog
+        self._credentials = credentials or api_key_credentials
+        self._worktrees = worktrees
+        self._worktree_limit_configs = SessionConfigCache()
         self._image_fallback = image_fallback
         self._builtin_plugin_roots = builtin_plugin_roots
         self._project_links = ProjectLinksController()
@@ -193,10 +236,23 @@ class HostRequestHandler:
         self._local_skills = LocalSkillsController(
             self._local_skill_files, self._load_orchestrator
         )
-        self._missing_layers = MissingLayerFetches(org_config)
+        self._local_plugins = LocalPluginsController(
+            self._local_skill_files,
+            self._load_orchestrator,
+            self._resolved_builtin_plugin_roots,
+            connector_catalog,
+            self._credentials,
+        )
+        self._missing_layers = MissingLayerFetches(
+            org_config, experiments, model_catalog, self._credentials
+        )
 
     def handles(self, method: str) -> bool:
         return method in _HOST_METHODS
+
+    def harness_trust_store(self) -> TrustedFoldersManager:
+        """The trust a worktree removal asked for no session judges with."""
+        return self._harness_files.trust_store
 
     async def dispatch(
         self,
@@ -222,16 +278,18 @@ class HostRequestHandler:
             if error is None:
                 raise
             raise RequestFailure(error.code, error.message, error.data) from exc
+        except InvalidConfigError as exc:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS,
+                f"Cannot load the Vibe config. {exc}",
+                {"kind": "configuration"},
+            ) from exc
         except WorkspaceTrustError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
         except GitError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
-        except ProjectLinksAuthError as exc:
-            raise RequestFailure(ProtocolErrorCode.UNAUTHORIZED, str(exc)) from exc
         except ProjectLinksInvalidRequest as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
-        except ProjectLinksInternalError as exc:
-            raise RequestFailure(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
         except ProjectLinksError as exc:
             raise RequestFailure(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
         except FileNotFoundError as exc:
@@ -251,6 +309,17 @@ class HostRequestHandler:
             case "config/schema":
                 validate_wire(ConfigSchemaReadParams, raw_params)
                 response: ProtocolModel = config_schema_response()
+            case "config/telemetry/read":
+                validate_wire(TelemetrySettingReadParams, raw_params)
+                response = TelemetrySettingReadResponse(
+                    setting=telemetry_setting_view(
+                        await self._load_orchestrator(self._user_config_files())
+                    )
+                )
+            case "config/telemetry/update":
+                response = await self._update_telemetry(
+                    validate_wire(TelemetrySettingUpdateParams, raw_params)
+                )
             case "config/read":
                 response = await self._read_config(
                     validate_wire(ConfigReadParams, raw_params),
@@ -271,6 +340,8 @@ class HostRequestHandler:
                 )
             case _ if method in LOCAL_SKILL_METHODS:
                 response = await self._local_skills.dispatch(method, raw_params)
+            case _ if method in LOCAL_PLUGIN_METHODS:
+                response = await self._local_plugins.dispatch(method, raw_params)
             case _ if method in LOCAL_PROJECT_METHODS:
                 response = await self._local_projects.dispatch(method, raw_params)
             case _ if method.startswith("setup/"):
@@ -376,10 +447,7 @@ class HostRequestHandler:
                 self._session_files(None), org_config=False
             )
             agents = AgentManager(orchestrator, None, harness_files=harness_files)
-        active, available = project_agent_summaries(
-            agents.active_profile, agents.available_agents.values()
-        )
-        return AgentsListResponse(active=active, agents=available)
+        return AgentsListResponse(**project_selection(agents)._asdict())
 
     async def _list_skills(
         self,
@@ -396,10 +464,7 @@ class HostRequestHandler:
         cwd = self._cwd(params.cwd)
         session_files = self._session_files(params.cwd)
         if params.trust_workspace:
-            session_files = replace(
-                session_files, trust_store=session_files.trust_store.for_session()
-            )
-            session_files.trust_store.trust_for_session(cwd)
+            session_files = session_files.trusting(cwd)
         orchestrator = await self._load_picker_orchestrator(
             params.cwd,
             client_info=client_info,
@@ -413,6 +478,7 @@ class HostRequestHandler:
             session_files,
             config_orchestrator=orchestrator,
             builtin_plugin_roots=self._builtin_plugin_roots,
+            credentials=self._credentials,
         )
         _issues, projection = await asyncio.to_thread(
             discover_session_skills,
@@ -439,6 +505,21 @@ class HostRequestHandler:
             params.cwd, client_info=client_info, attached_session_id=attached_session_id
         )
         config = orchestrator.config
+        # A plan upgrade unlocks models: the picker's read refreshes an old
+        # catalog (one showing an upsell is old after 30 s), and
+        # `config/changed` tells the client once it lands.
+        key = ModelCatalogKey.current(config, self._credentials)
+        if params.refresh_model_catalog:
+            await self._model_catalog.refreshed_for_picker(key)
+            # Built again on what the fetch brought, so the answer lists it.
+            orchestrator = await self._load_picker_orchestrator(
+                params.cwd,
+                client_info=client_info,
+                attached_session_id=attached_session_id,
+            )
+            config = orchestrator.config
+        else:
+            await self._model_catalog.check_for_picker(key)
         view = project_config_view(
             config,
             active_model_pinned=active_model_is_pinned(orchestrator),
@@ -482,32 +563,6 @@ class HostRequestHandler:
                 params = validate_wire(ProjectLinksInspectRootParams, raw_params)
                 response = ProjectLinksInspectRootResponse.model_validate(
                     await self._project_links.inspect_root(params.root_path)
-                )
-            case "projectLinks/picker/load":
-                params = validate_wire(ProjectLinksPickerLoadParams, raw_params)
-                response = ProjectLinksPickerLoadResponse.model_validate(
-                    await self._project_links.picker_load(params.root_path)
-                )
-            case "projectLinks/picker/loadMore":
-                params = validate_wire(ProjectLinksPickerLoadMoreParams, raw_params)
-                response = ProjectLinksPickerLoadMoreResponse.model_validate(
-                    await self._project_links.picker_load_more(
-                        params.root_path, params.cursor
-                    )
-                )
-            case "projectLinks/create":
-                params = validate_wire(ProjectLinksCreateParams, raw_params)
-                response = ProjectLinkMutationResponse.model_validate(
-                    await self._project_links.create(
-                        params.root_path, params.name, params.default_branch
-                    )
-                )
-            case "projectLinks/link":
-                params = validate_wire(ProjectLinksLinkParams, raw_params)
-                response = ProjectLinkMutationResponse.model_validate(
-                    await self._project_links.link(
-                        params.root_path, params.project_id, params.project_name
-                    )
                 )
             case "projectLinks/save":
                 params = validate_wire(ProjectLinksSaveParams, raw_params)
@@ -564,6 +619,10 @@ class HostRequestHandler:
                     self._cwd(params.cwd),
                     self._harness_files.trust_store,
                 )
+            case _ if method in TRUST_FOLDER_METHODS:
+                response = await dispatch_trust_folders(
+                    method, raw_params, cwd=self._cwd
+                )
             case "workspace/git/worktrees/list":
                 params = validate_wire(WorkspaceWorktreeListParams, raw_params)
                 response = await asyncio.to_thread(
@@ -583,15 +642,24 @@ class HostRequestHandler:
                     limit=orchestrator.config.worktree_limit,
                     failures=[str(failure) for failure in failures],
                 )
+            case "workspace/git/worktrees/auto/update":
+                params = validate_wire(WorkspaceWorktreeAutoUpdateParams, raw_params)
+                orchestrator = await self._load_orchestrator(self._session_files(None))
+                failures = await orchestrator.set_field(
+                    "/auto_worktree",
+                    params.auto,
+                    reason="desktop worktree placement setting",
+                )
+                response = WorkspaceWorktreeAutoUpdateResponse(
+                    auto=orchestrator.config.auto_worktree,
+                    failures=[str(failure) for failure in failures],
+                )
             case "workspace/git/worktrees/prune":
                 validate_wire(WorkspaceWorktreePruneParams, raw_params)
-                worktree_cleanup().sweep(trust_store=self._harness_files.trust_store)
-                orchestrator = await self._load_orchestrator(self._session_files(None))
-                removed = await asyncio.to_thread(
-                    ManagedWorktree.prune,
-                    orchestrator.config.worktree_limit,
-                    session_finished,
-                    trust_store=self._harness_files.trust_store.for_session(),
+                trust_store = self._harness_files.trust_store
+                self._worktrees.sweep(trust_store=trust_store)
+                removed = await self._worktrees.prune(
+                    await self._worktree_limit(), trust_store=trust_store
                 )
                 response = WorkspaceWorktreePruneResponse(removed=removed)
             case "workspace/git/checkouts":
@@ -694,15 +762,8 @@ class HostRequestHandler:
             raise RequestFailure(
                 ProtocolErrorCode.INVALID_PARAMS, f"Not a directory: {target}"
             )
-        # The same boundary the live move keeps: a session may only reach the
-        # counterparts of where it already sits, so a move never grants a tree
-        # the session never occupied.
-        if not await asyncio.to_thread(_is_counterpart, Path(current), target):
-            raise RequestFailure(
-                ProtocolErrorCode.INVALID_PARAMS,
-                f"Not a worktree of this session's repository: {target}",
-            )
-
+        # As on the live move, any directory will do: the record grants no
+        # trust, and the client asks for the destination's before moving.
         await relocate_saved_session(params.session_id, target, config.session_logging)
         # Read back through the same path `session/read` uses, so the state a
         # move answers with is the state a read of the moved session gives.
@@ -727,20 +788,118 @@ class HostRequestHandler:
     async def setup_telemetry(self, client_info: ClientInfo) -> TelemetryClient:
         config = await self._load_config(None)
         return TelemetryClient(
-            config_getter=lambda: config, launch_context=_launch_context(client_info)
+            config_getter=lambda: config,
+            launch_context=_launch_context(client_info),
+            credentials=self._credentials,
         )
+
+    async def mistral_api_origin(self) -> str:
+        """The origin of the signed-in account's Mistral API (a tenant's own)."""
+        provider = (await self._load_config(None)).get_mistral_provider()
+        api_base = (provider or DEFAULT_PROVIDERS[0]).api_base
+        return api_base.rstrip("/").removesuffix("/v1")
+
+    async def user_config_orchestrator(self) -> ConfigOrchestrator[VibeConfigSchema]:
+        """The user's own config, with no project's, as a host read applies it."""
+        return await self._load_orchestrator(self._user_config_files())
 
     async def _load_config(self, cwd: str | None) -> VibeConfigSchema:
         return (await self._load_orchestrator(self._session_files(cwd))).config
 
+    async def _worktree_limit(self) -> int:
+        # Desktop prunes on every session start: rebuilt only when the config
+        # it reads changed, not built whole each time on the event loop.
+        files = self._session_files(None)
+
+        async def build() -> BuiltSessionConfig:
+            orchestrator = await build_default_orchestrator(harness_files=files)
+            pre_org_config = orchestrator.config
+            key, tried, failure = await apply_cached_layers(
+                orchestrator,
+                self._org_config,
+                self._credentials,
+                model_catalog=self._model_catalog,
+            )
+            return BuiltSessionConfig(
+                orchestrator,
+                pre_org_config=pre_org_config,
+                org_config_key=key,
+                org_config_tried=tried,
+                org_config_failure=failure,
+            )
+
+        config = await self._worktree_limit_configs.config(
+            SessionConfigKey.of(self._cwd(None), {}, org_config=True),
+            files,
+            self._org_config,
+            build,
+            self._credentials,
+        )
+        return config.worktree_limit
+
     def _session_files(self, cwd: str | None) -> HarnessFilesManager:
         return self._harness_files.for_session(self._cwd(cwd))
+
+    def _user_config_files(self) -> HarnessFilesManager:
+        """The user's own config, with no project's: a setting a client shows
+        outside any project.
+        """
+        return replace(self._session_files(None), sources=("user",))
+
+    async def _update_telemetry(
+        self, params: TelemetrySettingUpdateParams
+    ) -> TelemetrySettingUpdateResponse:
+        """Write ``enable_telemetry`` to the user config.
+
+        Refused while the environment or the org's admin config decides it: the
+        write would be reported as saved and change nothing. Once written, the
+        sessions already open re-read it, and subscribed clients are told.
+        """
+        orchestrator = await self._load_orchestrator(self._user_config_files())
+        current = telemetry_setting_view(orchestrator)
+        if current.locked:
+            return TelemetrySettingUpdateResponse(
+                setting=current,
+                rejected=True,
+                reason=_LOCKED_REASONS.get(current.origin, _LOCKED_REASON_FALLBACK),
+            )
+        failures = await orchestrator.set_field(
+            f"/{TELEMETRY_FIELD}", params.enabled, reason="telemetry setting"
+        )
+        if not failures:
+            if self._open_sessions is not None:
+                await self._open_sessions.reload_config_files()
+            if self._config_changes is not None:
+                self._config_changes.publish()
+        return TelemetrySettingUpdateResponse(
+            setting=telemetry_setting_view(orchestrator),
+            failures=[str(failure) for failure in failures],
+        )
 
     def _local_skill_files(self, project_root: Path | None) -> HarnessFilesManager:
         # The user's own skills follow the user's config, wherever this server runs.
         if project_root is None:
-            return replace(self._session_files(None), sources=("user",))
+            return self._user_config_files()
         return self._session_files(str(project_root))
+
+    def _resolved_builtin_plugin_roots(self) -> list[Path]:
+        from vibe.app_server._plugins import packaged_builtin_plugin_roots
+
+        if self._builtin_plugin_roots is None:
+            return packaged_builtin_plugin_roots()
+        return list(self._builtin_plugin_roots)
+
+    async def crash_reports_allowed(self) -> bool:
+        """The crash-report gate from local and cached config, never fetched."""
+        orchestrator = await self._load_orchestrator(self._session_files(None))
+        return crash_reports_allowed(orchestrator.config)
+
+    async def log_self_hosted_services(self) -> None:
+        """Note a self-hosted deployment in ``vibe.log``, from local and cached
+        config, never fetched.
+        """
+        orchestrator = await self._load_orchestrator(self._session_files(None))
+        log_self_hosted_services(orchestrator.config)
 
     async def _load_orchestrator(
         self, session_files: HarnessFilesManager, *, org_config: bool = True
@@ -749,7 +908,10 @@ class HostRequestHandler:
         # Match the session path so host reads (agents/list) see rollout flags
         # like smart_approve_available and the enforced default agent.
         await apply_cached_layers(
-            orchestrator, self._org_config if org_config else None
+            orchestrator,
+            self._org_config if org_config else None,
+            self._credentials,
+            model_catalog=self._model_catalog,
         )
         return orchestrator
 
@@ -776,9 +938,20 @@ class HostRequestHandler:
         return Path(value or Path.cwd()).expanduser().resolve()
 
 
+_LOCKED_REASONS = {
+    AdminConfigLayer.NAME: "Usage telemetry is enforced by your organization.",
+    EnvironmentLayer.NAME: (
+        "Usage telemetry is set by the VIBE_ENABLE_TELEMETRY environment variable."
+    ),
+}
+_LOCKED_REASON_FALLBACK = "Usage telemetry is set where this setting cannot change it."
+
+
 @lru_cache(maxsize=1)
 def config_schema_response() -> ConfigSchemaReadResponse:
     schema = config_json_schema(VibeConfigSchema)
+    for key in VIBE_BOT_KEYS:
+        schema["properties"].pop(key, None)
     encoded = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
     version = hashlib.sha256(encoded, usedforsecurity=False).hexdigest()
     return ConfigSchemaReadResponse.model_validate({
@@ -960,6 +1133,9 @@ def worktree_remove_response(
             branch_created=branch_created,
             holders=holders,
         )
+    if release.outcome is WorktreeReleaseOutcome.REMOVED and not inspect:
+        # A scan that still counted the folder now reads stale.
+        touch_stale_marker()
     return WorkspaceWorktreeRemoveResponse(
         outcome=_WORKTREE_REMOVE_OUTCOMES[release.outcome],
         root=None if release.root is None else str(release.root),
@@ -1151,21 +1327,3 @@ def git_checkouts_response(
                     )
                 )
         return WorkspaceGitCheckoutsResponse(checkouts=checkouts)
-
-
-def _is_counterpart(cwd: Path, target: Path) -> bool:
-    """Whether *target* is where a session at *cwd* sits, in another checkout.
-
-    The detached mirror of ``AgentLoop._is_derived_destination``: the same
-    narrowing, so a session cannot reach a tree it never occupied whether or
-    not an agent happens to be holding it. Git refusing to answer is a no,
-    since a destination that cannot be shown to be a counterpart is not one.
-    """
-    try:
-        with WorktreeRepository.open(cwd) as repository:
-            counterparts = {worktree.path.resolve() for worktree in repository.linked()}
-            if (in_repository := repository.repository_counterpart) is not None:
-                counterparts.add(in_repository)
-    except GitError:
-        return False
-    return target in counterparts

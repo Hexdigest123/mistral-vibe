@@ -22,6 +22,40 @@ fn plain_completion_ends_one_turn_without_tools() {
 }
 
 ///
+/// *Prepare*: A completion contains only a private program call.
+/// *Do*: Accept the completion through the Step Protocol and finish the next model call.
+/// *Assert*: The completion commits its candidate with the Action identity before its tool lifecycle.
+///
+#[test]
+fn private_program_completion_commits_before_its_tool_lifecycle() {
+    // Prepare
+    let turn_id = "turn-private-program-completion";
+    let mut runtime = SynchronousRuntime::new(config());
+    let completion = runtime.start_turn(turn_id, "calculate privately");
+    let source = "async function main() { return 42; }";
+
+    // Do
+    let next = runtime
+        .apply(
+            run_typescript_completion(action_id(&completion), "program", source),
+            running(turn_id)
+                .dispatch(llm_call(1))
+                .observe(assistant_program_committed(
+                    turn_id,
+                    &completion,
+                    "program",
+                    source,
+                ))
+                .observe(core_tool_execution_started(turn_id, "program"))
+                .observe_tool_execution_finished("program", run_typescript_success(json!(42))),
+        )
+        .only_action();
+
+    // Assert
+    runtime.finish_turn_with_text(turn_id, &next, "42");
+}
+
+///
 /// *Prepare*: Four sessions select Unix, Git Bash, PowerShell, or in-memory Bash while background processes are enabled.
 /// *Do*: Inspect the first model request, dispatch the selected command directly, restore it, then dispatch the same command through `run_typescript` and restore again.
 /// *Assert*: Each environment owns its model-facing name and guidance while every foreground command keeps the `file_system.bash` Runtime route across restoration.
@@ -313,7 +347,7 @@ fn reasoning_only_completion_ends_the_turn_with_empty_visible_output() {
             }],
         },
         "finish_reason": "stop",
-        "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+        "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
     });
 
     // Do
@@ -327,7 +361,7 @@ fn reasoning_only_completion_ends_the_turn_with_empty_visible_output() {
                     "content": [{"type": "text", "text": reasoning}],
                 }],
                 "finish_reason": "stop",
-                "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+                "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
             },
         }),
         completed(turn_id, vec![])
@@ -401,7 +435,7 @@ fn tool_discovery_reports_the_completed_summary() {
                     &first_completion,
                     &discovery_calls,
                 ))
-                .observe(tool_execution_started(turn_id, "discovery-1"))
+                .observe(core_tool_execution_started(turn_id, "discovery-1"))
                 .observe(json!({
                     "type": "tool_discovery_finished",
                     "turn_id": turn_id,
@@ -457,7 +491,7 @@ fn tool_discovery_details_render_the_description_once() {
         "search_tool_functions",
         json!({"mode": "details", "functions": ["github.search_issues"]}),
     )];
-    let discovery_result = "---\nmode: details\nrelevantFunctionCount: 1\nrelatedFunctionCount: 1\nrelatedConnectorCount: 1\nrelevantConnectorNoticeCount: 0\nrequestedFunctionCount: 1\nloadedFunctionCount: 1\nloadedFunctions:\n  - name: github.search_issues\n    connector: github\n---\n\n# Tool Function Details\n\n```ts\n// Result 1.\n// connector: github\n// function: github.search_issues\n// tool: tools.github.search_issues\n\ndeclare namespace tools.github {\n  type SearchIssuesArg = Record<string, unknown>;\n  type SearchIssuesReturned = unknown;\n  /**\n   * Search GitHub issues.\n   *\n   * Use it for open bugs.\n   */\n  function search_issues(arg: SearchIssuesArg): Promise<SearchIssuesReturned>;\n}\n```";
+    let discovery_result = "---\nmode: details\nrelevantFunctionCount: 1\nrelatedFunctionCount: 1\nrelatedConnectorCount: 1\nrelevantConnectorNoticeCount: 0\nrequestedFunctionCount: 1\nloadedFunctionCount: 1\nloadedFunctions:\n  - name: github.search_issues\n    connector: github\n---\n\n# Tool Function Details\n\n```ts\n// Result 1.\n// connector: github\n// function: github.search_issues\n// tool: tools.github.search_issues\n\ndeclare namespace tools.github {\n  type SearchIssuesArg = Record<string, unknown>;\n  type SearchIssuesReturned = unknown;\n  /**\n   * Search GitHub issues.\n   *\n   * Use it for open bugs.\n   */\n  function search_issues(arg?: SearchIssuesArg): Promise<SearchIssuesReturned>;\n}\n```";
 
     // Do
     let second_completion = runtime
@@ -470,7 +504,7 @@ fn tool_discovery_details_render_the_description_once() {
                     &first_completion,
                     &discovery_calls,
                 ))
-                .observe(tool_execution_started(turn_id, "discovery-details"))
+                .observe(core_tool_execution_started(turn_id, "discovery-details"))
                 .observe(json!({
                     "type": "tool_discovery_finished",
                     "turn_id": turn_id,
@@ -557,7 +591,7 @@ fn tool_discovery_reports_the_returned_count_when_matches_exceed_the_limit() {
                     &first_completion,
                     &discovery_calls,
                 ))
-                .observe(tool_execution_started(turn_id, "discovery-over-limit"))
+                .observe(core_tool_execution_started(turn_id, "discovery-over-limit"))
                 .observe(json!({
                     "type": "tool_discovery_finished",
                     "turn_id": turn_id,
@@ -856,7 +890,13 @@ fn invalid_unicode_in_programmatic_arguments_finishes_without_a_runtime_tool_act
             run_typescript_completion(action_id(&first_completion), call_id, source),
             running(turn_id)
                 .dispatch(llm_call(1))
-                .observe(tool_execution_started(turn_id, call_id))
+                .observe(assistant_program_committed(
+                    turn_id,
+                    &first_completion,
+                    call_id,
+                    source,
+                ))
+                .observe(core_tool_execution_started(turn_id, call_id))
                 .observe(tool_execution_finished(turn_id, call_id, failure_result)),
         )
         .only_action();
@@ -916,7 +956,13 @@ fn a_thrown_object_with_a_code_fails_the_program_as_an_execution_error() {
             run_typescript_completion(action_id(&first_completion), call_id, source),
             running(turn_id)
                 .dispatch(llm_call(1))
-                .observe(tool_execution_started(turn_id, call_id))
+                .observe(assistant_program_committed(
+                    turn_id,
+                    &first_completion,
+                    call_id,
+                    source,
+                ))
+                .observe(core_tool_execution_started(turn_id, call_id))
                 .observe(tool_execution_finished(turn_id, call_id, failure_result)),
         )
         .only_action();
@@ -1077,7 +1123,7 @@ fn completed_programmatic_sibling_is_observed_before_another_sibling_resumes() {
     // Do
     let callback_action = runtime
         .apply(
-            tool_call_completion(action_id(&first_completion), calls),
+            tool_call_completion(action_id(&first_completion), calls.clone()),
             running(turn_id)
                 .dispatch(json!({
                     "type": "provided_tool_call",
@@ -1087,9 +1133,15 @@ fn completed_programmatic_sibling_is_observed_before_another_sibling_resumes() {
                         "tool_name": "ask_enable_connector",
                         "arguments": {"connector": "data_gouv"},
                     },
+                    "parent_call_id": pending_call_id,
                 }))
-                .observe(tool_execution_started(turn_id, completed_call_id))
-                .observe(tool_execution_started(turn_id, pending_call_id))
+                .observe(assistant_tool_calls_committed(
+                    turn_id,
+                    &first_completion,
+                    &calls,
+                ))
+                .observe(core_tool_execution_started(turn_id, completed_call_id))
+                .observe(core_tool_execution_started(turn_id, pending_call_id))
                 .observe(tool_execution_finished(
                     turn_id,
                     completed_call_id,
@@ -1239,7 +1291,7 @@ fn cut_off_completion(action: &Value, text: &str) -> Value {
         "result": {
             "parts": [{"type": "text", "text": text}],
             "finish_reason": "length",
-            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+            "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         },
     })
 }
@@ -1258,7 +1310,7 @@ fn cut_off_committed(turn_id: &str, action: &Value, text: &str) -> Value {
 ///
 /// *Prepare*: Output limit recovery allows two retries per turn.
 /// *Do*: Answer three times with completions cut off at the output limit.
-/// *Assert*: The first two cut-off answers are discarded and retried with feedback appended to the model input, and the third is committed as the turn's output because the recovery budget is spent.
+/// *Assert*: The first two cut-off answers are discarded and retried with feedback appended to the model input, and the third is committed as the turn's output because the recovery budget is spent; the turn ends with the `output_limit` stop reason.
 ///
 #[test]
 fn output_limit_recovery_retries_cut_off_completions_up_to_the_cap() {
@@ -1303,7 +1355,7 @@ fn output_limit_recovery_retries_cut_off_completions_up_to_the_cap() {
             vec![json!({"type": "text", "text": "third fragment"})],
         )
         .observe(cut_off_committed(turn_id, &third, "third fragment"))
-        .observe(turn_completed(turn_id, "third fragment")),
+        .observe(turn_completed_at_output_limit(turn_id, "third fragment")),
     );
 
     // Assert: the budget is per turn, so the next turn starts afresh.
@@ -1330,7 +1382,7 @@ fn output_limit_recovery_retries_cut_off_completions_up_to_the_cap() {
 ///
 /// *Prepare*: Output limit recovery is enabled, and the turn has a single iteration.
 /// *Do*: Answer with a completion cut off at the output limit.
-/// *Assert*: Recovery never spends the last iteration, so the cut-off answer is committed as the turn's output.
+/// *Assert*: Recovery never spends the last iteration, so the cut-off answer is committed as the turn's output, with the `output_limit` stop reason.
 ///
 #[test]
 fn output_limit_recovery_does_not_spend_the_last_iteration() {
@@ -1344,7 +1396,7 @@ fn output_limit_recovery_does_not_spend_the_last_iteration() {
         cut_off_completion(&completion, "fragment"),
         completed(turn_id, vec![json!({"type": "text", "text": "fragment"})])
             .observe(cut_off_committed(turn_id, &completion, "fragment"))
-            .observe(turn_completed(turn_id, "fragment")),
+            .observe(turn_completed_at_output_limit(turn_id, "fragment")),
     );
 
     // Assert
@@ -1479,7 +1531,7 @@ fn cut_off_answers_and_cut_off_tool_calls_share_one_recovery_budget() {
     // Do
     let third = runtime
         .apply(
-            cut_off_tool_call_completion(&second, json!({"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0})),
+            cut_off_tool_call_completion(&second, json!({"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0})),
             running(turn_id)
                 .dispatch(llm_call(2))
                 .observe(cut_off_tool_call_committed(turn_id, &second))
@@ -1511,7 +1563,7 @@ fn cut_off_tool_call_runs_as_a_tool_call_without_output_limit_recovery() {
     // Do
     let next = runtime
         .apply(
-            cut_off_tool_call_completion(&completion, json!({"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0})),
+            cut_off_tool_call_completion(&completion, json!({"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0})),
             running(turn_id)
                 .dispatch(llm_call(1))
                 .observe(cut_off_tool_call_committed(turn_id, &completion))
@@ -1563,7 +1615,7 @@ fn cut_off_tool_call_committed(turn_id: &str, action: &Value) -> Value {
                 ],
             },
             "finish_reason": "tool_call",
-            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+            "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         },
     })
 }
@@ -1571,7 +1623,7 @@ fn cut_off_tool_call_committed(turn_id: &str, action: &Value) -> Value {
 ///
 /// *Prepare*: Output limit recovery is disabled, the default.
 /// *Do*: Answer with a completion cut off at the output limit.
-/// *Assert*: The cut-off answer is committed as the turn's output, as before.
+/// *Assert*: The cut-off answer is committed as the turn's output, and the turn ends with the `output_limit` stop reason.
 ///
 #[test]
 fn cut_off_completion_is_committed_without_output_limit_recovery() {
@@ -1585,7 +1637,7 @@ fn cut_off_completion_is_committed_without_output_limit_recovery() {
         cut_off_completion(&completion, "fragment"),
         completed(turn_id, vec![json!({"type": "text", "text": "fragment"})])
             .observe(cut_off_committed(turn_id, &completion, "fragment"))
-            .observe(turn_completed(turn_id, "fragment")),
+            .observe(turn_completed_at_output_limit(turn_id, "fragment")),
     );
 
     // Assert
@@ -1595,7 +1647,7 @@ fn cut_off_completion_is_committed_without_output_limit_recovery() {
 ///
 /// *Prepare*: Output limit recovery allows one retry, and the first answer is cut off.
 /// *Do*: Restore from a checkpoint while the retry is pending, then cut off the retried answer as well.
-/// *Assert*: The spent retry survives the checkpoint, so the second cut-off answer is committed.
+/// *Assert*: The spent retry survives the checkpoint, so the second cut-off answer is committed, with the `output_limit` stop reason.
 ///
 #[test]
 fn output_limit_recovery_budget_survives_checkpoint_restore() {
@@ -1622,7 +1674,7 @@ fn output_limit_recovery_budget_survives_checkpoint_restore() {
             vec![json!({"type": "text", "text": "second fragment"})],
         )
         .observe(cut_off_committed(turn_id, &second, "second fragment"))
-        .observe(turn_completed(turn_id, "second fragment")),
+        .observe(turn_completed_at_output_limit(turn_id, "second fragment")),
     );
 
     // Assert

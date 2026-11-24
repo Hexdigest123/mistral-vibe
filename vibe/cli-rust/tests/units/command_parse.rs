@@ -76,6 +76,7 @@ fn commands_a_turn_never_reads_run_while_busy_and_the_others_wait_for_idle() {
         "/status",
         "/whoami",
         "/copy",
+        "/raw",
         "/log",
         "/debug",
         "/rename",
@@ -85,7 +86,9 @@ fn commands_a_turn_never_reads_run_while_busy_and_the_others_wait_for_idle() {
         "/log-level",
         "/voice",
         "/proxy-setup",
-        "/remote-project",
+        "/branch",
+        "/fork",
+        "/skills",
     ] {
         assert!(is_side_channel(command), "{command} runs while busy");
     }
@@ -98,13 +101,10 @@ fn commands_a_turn_never_reads_run_while_busy_and_the_others_wait_for_idle() {
         "/compact",
         "/rewind",
         "/reload",
-        "/teleport",
         "/mcp",
         "/connectors",
         "/plugins",
         "/reload-plugins",
-        "/branch",
-        "/fork",
     ] {
         assert!(!is_side_channel(command), "{command} waits for idle");
     }
@@ -117,7 +117,8 @@ fn side_channel_settings_wait_for_running_jobs() {
         "/log-level",
         "/voice",
         "/proxy-setup",
-        "/remote-project",
+        "/branch",
+        "/skills",
     ] {
         assert!(waits_for_jobs(command), "{command} waits for jobs");
     }

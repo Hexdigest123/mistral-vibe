@@ -29,10 +29,9 @@ handshake = {
     )
 }
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
 
 # Final frame: back on Main, the main loader and the main context gauge return.
-screen_contains = ("Generating", "0/600k tokens (0%)")
+screen_contains = ("Generating", "ctx        0/600k")
 screen_excludes = ("Viewing Explore 1", "18k/600k", "12.5k/600k")
 
 timeline: Timeline = [
@@ -44,7 +43,8 @@ timeline: Timeline = [
     child_session_updated("idle", context_tokens=18_000),
     turn_completed(),
     {"release": 5},  # the running turn plus the running child; the rest held
-    "\x1b[B",  # Down — focus the list on the Main row
+    "\x18",  # Ctrl+X — focus the rail on its agents item
+    "\r",  # Enter — open the subagent list on the Main row
     "\x1b[B",  # Down — highlight the child row
     "\r",  # Enter — the child's Running loader and 12.5k context replace the main ones
     {

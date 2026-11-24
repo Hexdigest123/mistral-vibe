@@ -177,7 +177,7 @@ class RustKnowledgeFolderDefinition(RustProtocolModel):
 class RustAgentTypeDefinition(RustProtocolModel):
     name: str
     description: str
-    path: str
+    path: str = Field(default="", exclude_if=lambda value: not value)
 
 
 class RustHarnessHookToolKey(RustProtocolModel):
@@ -420,6 +420,11 @@ RustOutputLimitRecovery = Annotated[
 
 class RustTurnSettings(RustProtocolModel):
     max_iterations: Annotated[int, Field(gt=0)] | None = None
+    # Omitted while unset, as Core omits it, so configs and digests recorded
+    # before the setting existed still match.
+    max_identical_tool_failures: Annotated[int, Field(gt=0)] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     # Omitted while disabled, as Core omits it, so configs and digests recorded
     # before the setting existed still match.
     output_limit_recovery: RustOutputLimitRecovery = Field(
@@ -479,6 +484,24 @@ class RustModelFacts(RustProtocolModel):
         return self
 
 
+class RustCompactionModelWindow(RustProtocolModel):
+    """The window of a separate compaction model: what a summary request may hold."""
+
+    context_window: int = Field(gt=0)
+    summary_budget: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_budget(self) -> Self:
+        if self.summary_budget >= self.context_window:
+            raise ValueError("0 < summary_budget < context_window must hold")
+        return self
+
+
+class RustInstructionsSettings(RustProtocolModel):
+    max_tokens: int = Field(gt=0)
+    max_threshold_percent: int = Field(ge=1, le=100)
+
+
 class RustContextSettings(RustProtocolModel):
     compaction: RustCompactionPolicy
     notifications: RustNotificationSettings = Field(
@@ -489,6 +512,15 @@ class RustContextSettings(RustProtocolModel):
     # `model_facts.input_modalities`; omitted when compaction uses the agent
     # model.
     compaction_model_input_modalities: list[RustInputModality] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # The window of a separate compaction model, which sizes summary requests;
+    # omitted when compaction uses the agent model.
+    compaction_model_window: RustCompactionModelWindow | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    # The bound on the live instructions; omitted means Core's defaults.
+    instructions: RustInstructionsSettings | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -548,10 +580,33 @@ class RustToolSettings(RustProtocolModel):
     bash_timeout: RustBashTimeoutSettings | None = None
 
 
+class RustCustomGuidance(RustProtocolModel):
+    """Guidance text used as written. Empty text omits that paragraph."""
+
+    intro: str
+    autonomy: str
+
+
+type RustGuidanceSettings = Literal["none", "stock"] | RustCustomGuidance
+
+
+class RustPromptSettings(RustProtocolModel):
+    guidance: RustGuidanceSettings = "none"
+
+
 class RustHarnessSettings(RustProtocolModel):
     turn: RustTurnSettings
     context: RustContextSettings
     tools: RustToolSettings
+    prompts: RustPromptSettings = Field(default_factory=RustPromptSettings)
+
+
+# Letters, digits, `.`, `_`, `:` and `-`: a note shows a key in a tag attribute
+# without escaping.
+RustInstructionsKey = Annotated[
+    str, Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
+]
+RustInstructionsContent = Annotated[str, Field(pattern=r"\S")]
 
 
 class RustHarnessConfig(RustProtocolModel):
@@ -804,6 +859,7 @@ class RustSystemMessage(RustProtocolModel):
 class RustUserMessage(RustProtocolModel):
     role: Literal["user"] = "user"
     content: list[RustContentBlock] = Field(min_length=1)
+    context: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 class RustAssistantMessage(RustProtocolModel):
@@ -1010,6 +1066,16 @@ RustExternalToolCall = Annotated[
 ]
 
 
+class RustOutputType(RustProtocolModel):
+    """The JSON Schema one Turn's answer must match."""
+
+    name: str = Field(min_length=1)
+    # Named `schema` on the wire; `schema` would shadow a BaseModel attribute.
+    json_schema: JsonObject = Field(
+        validation_alias="schema", serialization_alias="schema"
+    )
+
+
 class RustLLMCallAction(RustProtocolModel):
     type: Literal["llm_call"] = "llm_call"
     action_id: str
@@ -1029,6 +1095,10 @@ class RustLLMCallAction(RustProtocolModel):
     iteration: int = Field(ge=0)
     max_iterations: Annotated[int, Field(gt=0)] | None
     model_input: RustModelInputUpdate
+    # The Turn's output type, on its agent calls only; omitted when unset.
+    output_type: RustOutputType | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def validate_purpose(self) -> Self:
@@ -1060,6 +1130,10 @@ class RustRuntimeBuiltinToolCallAction(RustProtocolModel):
     turn_id: str
     call_id: str
     call: RustRuntimeBuiltinToolCall
+    # The `run_typescript` call whose program made this call; None for a direct call.
+    parent_call_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class RustProvidedToolCallAction(RustProtocolModel):
@@ -1068,6 +1142,10 @@ class RustProvidedToolCallAction(RustProtocolModel):
     turn_id: str
     call_id: str
     call: RustProvidedToolCall
+    # The `run_typescript` call whose program made this call; None for a direct call.
+    parent_call_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class RustFilesystemWriteOperation(RustProtocolModel):
@@ -1113,6 +1191,9 @@ class RustPreToolCallHookInput(RustProtocolModel):
 class RustPostToolCallHookInput(RustProtocolModel):
     tool_call: RustHookToolCall
     tool_result: RustToolResult
+    # Sessions stored by earlier releases hold pending post-tool hook actions
+    # without a duration; those report 0.
+    duration_ms: int = Field(default=0, ge=0)
 
 
 class RustHookCallActionBase(RustProtocolModel):
@@ -1183,6 +1264,8 @@ class RustToolExecutionStartedObservation(RustProtocolModel):
     type: Literal["tool_execution_started"] = "tool_execution_started"
     turn_id: str
     call_id: str
+    # Core runs this tool itself: no tool call Action reaches the Runtime for it.
+    executed_by_core: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 class RustToolExecutionFinishedObservation(RustProtocolModel):
@@ -1217,7 +1300,9 @@ class RustAgentResultError(RustProtocolModel):
     details: JsonValue = None
 
 
-type RustTurnStopReason = Literal["iteration_limit", "skipped"]
+type RustTurnStopReason = Literal[
+    "iteration_limit", "skipped", "rejected", "output_limit", "repeated_tool_failure"
+]
 
 
 class RustCompletedAgentResult(RustProtocolModel):
@@ -1411,7 +1496,11 @@ class RustContextCompactionFailedObservation(RustProtocolModel):
 
 
 type RustWarningCode = Literal[
-    "request_too_long", "compaction_summary_cut_off", "compaction_inputs_reduced"
+    "request_too_long",
+    "compaction_summary_cut_off",
+    "compaction_inputs_reduced",
+    "post_tool_call_result_inconsistent",
+    "pre_tool_call_arguments_invalid",
 ]
 
 
@@ -1598,6 +1687,9 @@ class RustUserMessageEvent(RustProtocolModel):
     turn_id: str = Field(min_length=1)
     content: list[RustContentBlock] = Field(min_length=1)
     mode: Literal["queue", "steer"]
+    output_type: RustOutputType | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class RustCurrentAgentTaskContext(RustProtocolModel):
@@ -1649,6 +1741,17 @@ class RustAgentMessageEvent(RustProtocolModel):
 class RustContextMessageEvent(RustProtocolModel):
     type: Literal["context_message"] = "context_message"
     content: list[RustContentBlock] = Field(min_length=1)
+
+
+class RustInstructionsUpsertEvent(RustProtocolModel):
+    type: Literal["instructions_upsert"] = "instructions_upsert"
+    key: RustInstructionsKey
+    content: RustInstructionsContent
+
+
+class RustInstructionsDeleteEvent(RustProtocolModel):
+    type: Literal["instructions_delete"] = "instructions_delete"
+    key: RustInstructionsKey
 
 
 class RustCompactEvent(RustProtocolModel):
@@ -1878,6 +1981,8 @@ RustEvent = Annotated[
     RustUserMessageEvent
     | RustAgentMessageEvent
     | RustContextMessageEvent
+    | RustInstructionsUpsertEvent
+    | RustInstructionsDeleteEvent
     | RustCompactEvent
     | RustReconfigureEvent
     | RustNotificationEvent
@@ -2086,13 +2191,23 @@ def _is_programmatic_identifier(value: str) -> bool:
 
 
 def _is_skill_name(value: str) -> bool:
-    namespace, separator, skill_name = value.partition(":")
+    qualifier, separator, skill_name = value.partition(":")
     if not separator:
         return _is_unqualified_skill_name(value)
     return (
         ":" not in skill_name
-        and _is_programmatic_identifier(namespace)
+        and _is_skill_qualifier(qualifier)
         and _is_unqualified_skill_name(skill_name)
+    )
+
+
+def _is_skill_qualifier(value: str) -> bool:
+    # Usually the name of the plugin that provides the skill, such as
+    # `acme-tools`; a programmatic identifier such as a tool namespace is
+    # accepted too.
+    return bool(value) and all(
+        character.isascii() and (character.isalnum() or character in "-._$")
+        for character in value
     )
 
 
@@ -2160,6 +2275,7 @@ __all__ = [
     "RustCompactEvent",
     "RustCompactingTurn",
     "RustCompactingTurn",
+    "RustCompactionModelWindow",
     "RustCompactionPolicy",
     "RustCompletedAgentResult",
     "RustCompletedTurn",
@@ -2183,6 +2299,7 @@ __all__ = [
     "RustContextCompactionFailedObservation",
     "RustContextMessageEvent",
     "RustContextSettings",
+    "RustCustomGuidance",
     "RustDeterminismContext",
     "RustDisabledCommandEnvironment",
     "RustDisabledCompactionPolicy",
@@ -2211,6 +2328,7 @@ __all__ = [
     "RustFilesystemWriteResult",
     "RustFixedImageCostRule",
     "RustGitBashCommandEnvironment",
+    "RustGuidanceSettings",
     "RustHarnessCapabilitySet",
     "RustHarnessConfig",
     "RustHarnessConfigUpdate",
@@ -2234,6 +2352,9 @@ __all__ = [
     "RustImageCostRule",
     "RustInMemoryBashCommandEnvironment",
     "RustInputConflictRejection",
+    "RustInstructionsDeleteEvent",
+    "RustInstructionsSettings",
+    "RustInstructionsUpsertEvent",
     "RustInterruptEvent",
     "RustInterruptedTurn",
     "RustInvalidCommandRejection",
@@ -2294,6 +2415,7 @@ __all__ = [
     "RustPreToolCallHookAction",
     "RustPreToolCallHookResult",
     "RustProgrammaticToolSettings",
+    "RustPromptSettings",
     "RustProtocolError",
     "RustProtocolModel",
     "RustProvidedToolCall",

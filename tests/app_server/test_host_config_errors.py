@@ -26,7 +26,11 @@ async def _picker_read_error(
     method: str, *, process_services: ProcessServices
 ) -> RequestFailure:
     handler = HostRequestHandler(
-        HarnessFilesManager(sources=("user",)), org_config=process_services.org_config
+        HarnessFilesManager(sources=("user",)),
+        org_config=process_services.org_config,
+        worktrees=process_services.worktrees,
+        experiments=process_services.experiments,
+        model_catalog=process_services.model_catalog,
     )
     with pytest.raises(RequestFailure) as raised:
         await handler.dispatch(
@@ -107,4 +111,29 @@ async def test_a_value_the_schema_refuses_is_a_configuration_error(
     assert error.data == {"kind": "configuration"}
     assert str(error).startswith(
         "Cannot load the Vibe config. auto_compact_threshold: 0 is not allowed."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", _PICKER_READS)
+async def test_an_mcp_server_without_a_name_is_a_configuration_error(
+    config_dir: Path, method: str, process_services: ProcessServices
+) -> None:
+    # Prepare
+    config_file = config_dir / "config.toml"
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8") + "\n[[mcp_servers]]\n",
+        encoding="utf-8",
+    )
+
+    # Do
+    error = await _picker_read_error(method, process_services=process_services)
+
+    # Assert
+    assert error.code is ProtocolErrorCode.INVALID_PARAMS
+    assert error.data == {"kind": "configuration"}
+    assert str(error) == (
+        "Cannot load the Vibe config. Invalid configuration: an entry of"
+        " mcp_servers from user-toml has no 'name'. Add 'name' to every"
+        " [[mcp_servers]] entry."
     )

@@ -1,7 +1,6 @@
 //! Client-to-server prompt-queue requests: enqueue, replace and remove.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde_json::json;
 
@@ -105,7 +104,7 @@ pub fn resume(app: &mut App, client: &Arc<Client>) {
         return;
     };
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let _ = request(
             &client,
             method::TURN_QUEUE_RESUME,
@@ -157,12 +156,18 @@ fn remove_at(app: &mut App, client: &Arc<Client>, index: usize) {
         .iter()
         .any(|remaining| remaining.server_message_id == item.server_message_id)
     {
-        app.queue.revise_group(&item.server_message_id);
-        replacement::replace_group(app, client, &item.server_message_id);
+        // The server echoes the merged entry under the group's id, so it must name a prompt still shown.
+        let server_message_id = if item.message_id == item.server_message_id {
+            app.queue.rekey_group(&item.server_message_id)
+        } else {
+            item.server_message_id
+        };
+        app.queue.revise_group(&server_message_id);
+        replacement::replace_group(app, client, &server_message_id);
         return;
     }
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = TurnQueueRemoveParams {
             session_id,
             queue_item_id,
@@ -188,7 +193,7 @@ fn send(app: &mut App, client: &Arc<Client>, message_id: String, text: String) {
     };
     if matches!(app.session.status, Status::Ready) && !app.compacting {
         app.set_status(Status::Generating {
-            since: Instant::now(),
+            since: crate::clock::now(),
         });
     }
     let client = client.clone();

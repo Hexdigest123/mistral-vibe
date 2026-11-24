@@ -1,4 +1,4 @@
-//! Outbound TLS trust policy for Vibe-owned HTTP clients (ADR 0015).
+//! Outbound TLS trust policy for Vibe-owned HTTP clients and uv subprocesses (ADR 0015).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,6 +28,29 @@ pub fn tls_trust_store() -> TlsTrustStore {
     }
 }
 
+/// ADR 0015: a uv subprocess trusts the system store too; a user's own uv choice wins.
+pub fn apply_uv_tls_trust(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    if uv_needs_system_certs() {
+        command.env("UV_SYSTEM_CERTS", "true");
+    }
+    command
+}
+
+/// A uv command line for the user to run, with `--system-certs` under the same rule.
+pub fn uv_command_hint(command: &str) -> String {
+    match command.strip_prefix("uv ") {
+        Some(rest) if uv_needs_system_certs() => format!("uv --system-certs {rest}"),
+        _ => command.to_owned(),
+    }
+}
+
+fn uv_needs_system_certs() -> bool {
+    let user_chose = ["UV_SYSTEM_CERTS", "UV_NATIVE_TLS"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    tls_trust_store() == TlsTrustStore::System && !user_chose
+}
+
 /// ADR 0015: pin the effective trust roots on any Vibe-owned HTTP client.
 pub fn apply_tls_trust(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     apply_tls_trust_for(builder, tls_trust_store())
@@ -40,7 +63,7 @@ pub fn apply_tls_trust_for(
 ) -> reqwest::ClientBuilder {
     let custom = custom_root_certificates();
     match trust {
-        TlsTrustStore::System => builder.tls_certs_merge(custom),
+        TlsTrustStore::System => builder.tls_certs_merge(bundled_root_certificates().chain(custom)),
         TlsTrustStore::BundledWebPki => {
             builder.tls_certs_only(bundled_root_certificates().chain(custom))
         }

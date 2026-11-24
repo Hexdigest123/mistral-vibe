@@ -4,7 +4,13 @@ import asyncio
 
 import pytest
 
+from mistralai_vibe_local_harness.vibe.completion_profile import WireFormat
 from tests.conftest import build_test_vibe_config
+from tests.stubs.fake_sign_in import (
+    SIGNED_IN_HEADERS,
+    FakeSignIn,
+    signed_in_credentials,
+)
 from tests.stubs.fake_utility_completion import FakeUtilityCompletion
 from vibe.core.config import ModelConfig, ProviderConfig, UtilityFeature
 from vibe.core.llm.model_probe import MODEL_AVAILABILITY
@@ -327,9 +333,51 @@ class TestRunUtilityCompletion:
         (event,) = telemetry.request_events
         assert event["call_type"] == "title_generation"
         assert event["model"] == "mistral-small"
+        assert event["reasoning_effort"] == "off"
         assert event["nb_context_chars"] == len("system prompt") + len("user prompt")
         assert event["nb_context_messages"] == 2
         assert event["nb_prompt_chars"] == len("user prompt")
+
+    @pytest.mark.asyncio
+    async def test_request_sent_reports_the_reasoning_the_request_sends(
+        self, monkeypatch
+    ) -> None:
+        # A model that cannot stop reasoning runs at its lowest level when no
+        # level is configured, so the configured "off" must not be reported.
+        class RecordingTelemetry(TelemetryClient):
+            def __init__(self) -> None:
+                super().__init__(config_getter=build_test_vibe_config)
+                self.request_events: list[dict] = []
+
+            def send_request_sent(self, **kwargs) -> None:
+                self.request_events.append(kwargs)
+
+        completion = FakeUtilityCompletion("ok").install(monkeypatch)
+        telemetry = RecordingTelemetry()
+        config = build_test_vibe_config(
+            models=[
+                ModelConfig(name="mistral-large-4", provider="mistral", alias="large")
+            ],
+            active_model="large",
+            utility_models={"title": "large"},
+        )
+
+        await run_utility_completion(
+            config=config,
+            system_prompt="system prompt",
+            user_content="user prompt",
+            max_tokens=24,
+            request_timeout_seconds=1.0,
+            retry_budget_seconds=0.0,
+            feature=UtilityFeature.TITLE,
+            telemetry=telemetry,
+        )
+
+        (event,) = telemetry.request_events
+        (request,) = completion.requests
+        sent = request.route.reasoning_setting(WireFormat.MISTRAL)
+        assert sent == "low"
+        assert event["reasoning_effort"] == sent
 
     @pytest.mark.asyncio
     async def test_without_a_telemetry_client_no_event_is_emitted(
@@ -515,7 +563,7 @@ class _RecordingSource:
         self.verdicts = verdicts or {}
         self.asked: list[list[str]] = []
 
-    async def check(self, *, provider, models, timeout_seconds):
+    async def check(self, *, provider, models, timeout_seconds, credentials=None):
         self.asked.append([model.name for model in models])
         return self.verdicts
 
@@ -696,3 +744,245 @@ class TestFeatureLabelsTheCall:
         aliases = [candidate.alias for candidate in FAST_MODEL_CANDIDATES]
 
         assert len(set(aliases)) == len(aliases)
+
+
+class TestSignedInConnection:
+    """A Desktop connection signed in through OIDC, with no API key."""
+
+    @pytest.mark.asyncio
+    async def test_the_probe_finds_the_fast_model_without_a_key(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        _install_source(
+            monkeypatch, _RecordingSource({FAST_MODEL_CANDIDATES[0].name: True})
+        )
+        config = _custom_front_config()
+        credentials = signed_in_credentials()
+
+        await ensure_utility_models_probed(config, credentials=credentials)
+        model, provider = select_utility_model(
+            config, feature=UtilityFeature.SMART_APPROVE, credentials=credentials
+        )
+
+        assert model.name == FAST_MODEL_CANDIDATES[0].name
+        assert provider.name == "mistral"
+
+    def test_the_public_api_uses_the_fast_model_without_a_key(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        config = build_test_vibe_config()
+
+        model, _ = select_utility_model(config, credentials=signed_in_credentials())
+
+        assert model.name == FAST_MODEL_CANDIDATES[0].name
+
+    def test_a_signed_out_connection_keeps_the_active_model(self, monkeypatch) -> None:
+        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        config = build_test_vibe_config()
+
+        model, _ = select_utility_model(
+            config, credentials=signed_in_credentials(FakeSignIn(signed_in=False))
+        )
+
+        assert model.alias == config.get_active_model().alias
+
+    @pytest.mark.asyncio
+    async def test_a_completion_sends_the_sign_in_without_a_key(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        completion = FakeUtilityCompletion("named").install(monkeypatch)
+
+        content = await run_utility_completion(
+            config=build_test_vibe_config(),
+            system_prompt="system",
+            user_content="user",
+            max_tokens=24,
+            request_timeout_seconds=1.0,
+            retry_budget_seconds=0.0,
+            skip_if_no_key=True,
+            credentials=signed_in_credentials(),
+        )
+
+        assert content == "named"
+        [request] = completion.requests
+        assert request.route.model == FAST_MODEL_CANDIDATES[0].name
+        assert dict(request.credential.headers) == SIGNED_IN_HEADERS
+
+    @pytest.mark.asyncio
+    async def test_skip_if_no_key_skips_a_signed_out_connection(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("MISTRAL_API_KEY", "process-key")
+        FakeUtilityCompletion(
+            error=AssertionError("no request when signed out")
+        ).install(monkeypatch)
+
+        content = await run_utility_completion(
+            config=build_test_vibe_config(),
+            system_prompt="system",
+            user_content="user",
+            max_tokens=24,
+            request_timeout_seconds=1.0,
+            retry_budget_seconds=0.0,
+            skip_if_no_key=True,
+            credentials=signed_in_credentials(FakeSignIn(signed_in=False)),
+        )
+
+        assert content is None
+
+    @pytest.mark.asyncio
+    async def test_a_third_party_provider_still_needs_its_key(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        FakeUtilityCompletion(error=AssertionError("no request without a key")).install(
+            monkeypatch
+        )
+
+        content = await run_utility_completion(
+            config=_anthropic_only_config(),
+            system_prompt="system",
+            user_content="user",
+            max_tokens=24,
+            request_timeout_seconds=1.0,
+            retry_budget_seconds=0.0,
+            skip_if_no_key=True,
+            credentials=signed_in_credentials(),
+        )
+
+        assert content is None
+
+
+def _title_model_config():
+    """A session whose title model has its own sampling and offers thinking off."""
+    title_model = ModelConfig(
+        name="house-large-1",
+        provider="mistral",
+        alias="house-large",
+        temperature=0.7,
+        top_p=0.9,
+        thinking="high",
+        thinking_levels=["off", "low", "high"],
+    )
+    config = build_test_vibe_config(
+        models=[
+            ModelConfig(
+                name="mistral-vibe-cli-latest",
+                provider="mistral",
+                alias="devstral-latest",
+            ),
+            title_model,
+        ],
+        active_model="devstral-latest",
+    )
+    return config, title_model
+
+
+class TestCallerSettings:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("feature", "call_type"),
+        [(None, "worktree_title"), (UtilityFeature.SMART_APPROVE, None)],
+    )
+    async def test_without_them_the_call_is_greedy_on_the_selected_model(
+        self, monkeypatch, feature, call_type
+    ) -> None:
+        """*Prepare*: A session whose active model has its own sampling.
+        *Do*: Run a utility completion as worktree naming and as a Smart
+            Approve classifier call do, with none of the caller settings.
+        *Assert*: It runs on the fast model, greedily, with no top_p, at the
+            model's configured thinking level.
+        """
+        # Prepare
+        config, _ = _title_model_config()
+        completion = FakeUtilityCompletion("ok").install(monkeypatch)
+
+        # Do
+        await run_utility_completion(
+            config=config,
+            system_prompt="system",
+            user_content="user",
+            max_tokens=24,
+            request_timeout_seconds=1.0,
+            retry_budget_seconds=0.0,
+            feature=feature,
+            call_type=call_type,
+        )
+
+        # Assert
+        [request] = completion.requests
+        assert request.route.model == FAST_MODEL_CANDIDATES[0].name
+        assert request.route.temperature == 0.0
+        assert request.route.top_p is None
+        assert request.route.thinking == "off"
+        assert request.route.request_thinking is None
+
+    @pytest.mark.asyncio
+    async def test_a_fixed_model_runs_with_its_own_sampling_and_thinking_off(
+        self, monkeypatch
+    ) -> None:
+        """*Prepare*: A session whose title model has its own sampling.
+        *Do*: Run a title call on that model, at its own temperature, with
+            thinking off, as the session title call does.
+        *Assert*: The request goes to that model, not a fast one, with its
+            temperature and top_p, thinking off, and the title label.
+        """
+        # Prepare
+        config, title_model = _title_model_config()
+        completion = FakeUtilityCompletion("Billing retries").install(monkeypatch)
+
+        # Do
+        content = await run_utility_completion(
+            config=config,
+            system_prompt="system",
+            user_content="user",
+            max_tokens=1024,
+            request_timeout_seconds=6.0,
+            retry_budget_seconds=10.0,
+            feature=UtilityFeature.TITLE,
+            fixed_model=(title_model, config.get_provider_for_model(title_model)),
+            use_model_temperature=True,
+            thinking="off",
+        )
+
+        # Assert
+        [request] = completion.requests
+        assert content == "Billing retries"
+        assert request.route.model == "house-large-1"
+        assert request.route.temperature == 0.7
+        assert request.route.top_p == 0.9
+        assert request.route.reasoning_setting(WireFormat.MISTRAL) == "off"
+        assert request.config.max_tokens == 1024
+        assert request.metadata is not None
+        assert request.metadata["call_type"] == "title_generation"
+
+    @pytest.mark.asyncio
+    async def test_without_a_thinking_level_a_fixed_model_keeps_its_own(
+        self, monkeypatch
+    ) -> None:
+        """*Prepare*: A session whose title model thinks at ``high``.
+        *Do*: Run a call on that model with no thinking level.
+        *Assert*: The request keeps the model's ``high``.
+        """
+        # Prepare
+        config, title_model = _title_model_config()
+        completion = FakeUtilityCompletion("ok").install(monkeypatch)
+
+        # Do
+        await run_utility_completion(
+            config=config,
+            system_prompt="system",
+            user_content="user",
+            max_tokens=24,
+            request_timeout_seconds=1.0,
+            retry_budget_seconds=0.0,
+            fixed_model=(title_model, config.get_provider_for_model(title_model)),
+        )
+
+        # Assert
+        [request] = completion.requests
+        assert request.route.reasoning_setting(WireFormat.MISTRAL) == "high"
+        assert request.route.temperature == 0.0

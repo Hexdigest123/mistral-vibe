@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::Frame;
 
-use super::{bottom_bar, selection, theme, todo};
+use super::{bottom_bar, goal_row, selection, theme};
 use crate::app::App;
 use crate::mouse::{self, MouseTarget};
 use crate::selection::RegionId;
@@ -17,19 +17,24 @@ pub enum Kind {
     Approval,
     Question,
     Voice,
+    Branch,
     ProxySetup,
     Theme,
     Model,
     LogLevel,
     Thinking,
-    Artifacts,
+    Loops,
     Resume,
+    Storage,
     Rewind,
     Mcp,
     Plugins,
+    TrustedFolders,
+    Skills,
+    Context,
     McpOAuth,
     ConnectorAuth,
-    RemoteProject,
+    Goal,
 }
 
 impl Kind {
@@ -38,14 +43,13 @@ impl Kind {
         match self {
             Kind::Approval => MouseTarget::Approval,
             Kind::Question => MouseTarget::Question,
-            Kind::RemoteProject => MouseTarget::RemoteProject,
             Kind::ProxySetup => MouseTarget::ProxySetup,
             _ => MouseTarget::BottomApp,
         }
     }
 }
 
-/// Draw the transcript, loading row, todo row and bottom bar around the
+/// Draw the transcript, loading row, goal resume row and bottom bar around the
 /// `box_height` rows of the `kind` box that `draw_box` paints.
 pub(crate) fn draw(
     app: &mut App,
@@ -56,7 +60,7 @@ pub(crate) fn draw(
     draw_box: impl FnOnce(&mut App, &mut Frame, Rect),
 ) {
     f.buffer_mut().set_style(area, theme::screen_style());
-    let [transcript, loading, box_area, bar, todo_row] = chunks(app, area, box_height);
+    let [transcript, loading, goal, box_area, bar] = chunks(app, area, box_height);
     // The input box has no focus while an app replaces it.
     crate::selection::blur_composer(app);
     // A box selection is screen-anchored: another app, or a box that moved or
@@ -71,6 +75,7 @@ pub(crate) fn draw(
     let content = content(box_area);
     app.view.bottom_app_selection_region = selection::frame_region(content);
     app.view.bottom_app_selection_chrome.clear();
+    app.view.bottom_app_selection_halves = None;
     app.view.bottom_app_selection_folds = crate::selection::Folds::default();
     draw_box(app, f, box_area);
     for track in mouse::scrollbar_tracks(app, content) {
@@ -78,7 +83,7 @@ pub(crate) fn draw(
         app.view.bottom_app_selection_chrome.extend(cells);
     }
     selection::overlay_region(app, f, RegionId::BottomApp);
-    todo::draw_row(app, f, todo_row);
+    goal_row::draw(app, f, goal);
     bottom_bar::draw(app, f, bar);
 }
 
@@ -93,16 +98,14 @@ pub(crate) fn content(area: Rect) -> Rect {
     }
 }
 
-/// `[transcript, loading, box, bottom_bar, todo_row]`: the todo row sits above
-/// the box, but last here so the shared indices hold.
+/// `[transcript, loading, goal_row, box, bottom_bar]`, top to bottom.
 fn chunks(app: &App, area: Rect, box_height: u16) -> [Rect; 5] {
-    let chunks = Layout::vertical([
+    Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(super::loading_height(app, area.width)),
-        Constraint::Length(todo::row_height(app)),
+        Constraint::Length(goal_row::height(app)),
         Constraint::Length(box_height),
-        Constraint::Length(1),
+        Constraint::Length(super::reverse_search::height(app, area.width)),
     ])
-    .split(area);
-    [chunks[0], chunks[1], chunks[3], chunks[4], chunks[2]]
+    .areas(area)
 }

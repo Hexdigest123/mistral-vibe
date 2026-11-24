@@ -10,7 +10,7 @@ pub use option_gesture::option_gesture;
 pub use scrollbar::{drag_scroll, register_scrollbar, scrollbar_tracks};
 
 pub(crate) use capture::cancel_capture;
-pub use dispatch::toggle_effect_at;
+pub use dispatch::{open_link, toggle_effect_at};
 
 use std::sync::Arc;
 
@@ -22,8 +22,8 @@ use crate::app::App;
 use crate::selection;
 use crate::server::Client;
 use crate::{
-    approval, completion_manager, config, log_level_picker, model_picker, resume_picker,
-    theme_picker, thinking_picker,
+    approval, completion_manager, config, log_level_picker, model_picker, theme_picker,
+    thinking_picker,
 };
 use dispatch::dispatch;
 pub(crate) use dispatch::option_list;
@@ -38,23 +38,38 @@ pub(crate) const MOUSE_SCROLL_STEP: u16 = 2;
 pub enum MouseTarget {
     Blocked,
     Transcript,
-    Toast,
+    JumpToBottom,
+    StickyPrompt,
     Composer,
     Completion,
     Approval,
     Question,
     Loading,
+    GoalRow,
     ThemePicker,
     ModelPicker,
     ThinkingPicker,
+    TasksPanel,
+    RailWindow,
     LogLevelPicker,
     ArtifactsModal,
-    ResumePicker,
-    RemoteProject,
+    Loops,
+    /// The highlighted loop's instructions under or beside the `/loop` rows, scrolled on their own.
+    LoopsDetails,
+    /// The `/loop` add or edit form: a click focuses a field and moves its caret.
+    LoopsForm,
+    GoalConfirm,
+    SessionsPage,
+    /// The Sessions page preview's scrollbar: a drag scrolls its conversation.
+    SessionsPreview,
     ProxySetup,
     BottomApp,
     Mcp,
     Plugins,
+    TrustedFolders,
+    Skills,
+    /// The body under the `/skills` rows, scrolled on its own.
+    SkillsBody,
     McpOAuth,
     ConnectorAuth,
     DebugConsole,
@@ -63,13 +78,14 @@ pub enum MouseTarget {
     ReleaseNotes,
     Trust,
     BottomBar,
-    TodoRow,
+    Rail,
     TodoSidebar,
     OnboardingThemeList,
     OnboardingPreview,
     OnboardingLinks,
     OnboardingInputs,
     SubagentList,
+    CodePreview,
 }
 
 /// Render-time hit-test metadata for one screen region.
@@ -148,7 +164,13 @@ pub fn handle(
     event: MouseEvent,
 ) {
     let (event, row) = pixels::to_cells(event);
-    if let Some(target) = route_at(app, event, row) {
+    let target = route_at(app, event, row);
+    // Below the last row the pointer rests on nothing, though its cell clamps onto the footer.
+    let off_grid = event.kind == MouseEventKind::Moved && pixels::past_last_row(row);
+    if off_grid {
+        app.view.mouse_position = None;
+    }
+    if let Some(target) = target.filter(|_| !off_grid) {
         dispatch(app, client, config_tx, target, event);
     }
 }
@@ -167,6 +189,7 @@ pub fn route_at(app: &mut App, event: MouseEvent, row: f64) -> Option<MouseTarge
         if app.view.mouse.capture.is_some() {
             cancel_capture(app, true);
         }
+        crate::code_preview::hover(app);
     }
     if handle_wheel(app, event) {
         return None;
@@ -175,6 +198,8 @@ pub fn route_at(app: &mut App, event: MouseEvent, row: f64) -> Option<MouseTarge
         MouseEventKind::Down(MouseButton::Left) => {
             cancel_capture(app, true);
             selection::honor_pending_copy(app);
+            app.view.copy_light.stop();
+            crate::code_preview::press(app, at);
             if scrollbar::contains_track(app, at) {
                 if scrollbar::begin(app, at, row) {
                     app.view.mouse.capture = Some(Capture::Scrollbar);
@@ -212,7 +237,7 @@ pub fn route_at(app: &mut App, event: MouseEvent, row: f64) -> Option<MouseTarge
         _ => {
             let target = target_at(app, at);
             if event.kind == MouseEventKind::Moved && target != Some(MouseTarget::SubagentList) {
-                app.subagents.list.mouse_session_id = None;
+                crate::subagents::list::set_hover(app, None);
             }
             target
         }
@@ -242,7 +267,9 @@ fn handle_wheel(app: &mut App, event: MouseEvent) -> bool {
         // The console's wheel scrolls its log and may load older pages, which
         // needs the client: dispatch (not this client-free router) runs it.
         MouseTarget::DebugConsole => return false,
-        MouseTarget::Transcript => scroll_chat(app, up, MOUSE_SCROLL_STEP),
+        MouseTarget::Transcript | MouseTarget::JumpToBottom | MouseTarget::StickyPrompt => {
+            scroll_chat(app, up, MOUSE_SCROLL_STEP)
+        }
         MouseTarget::Composer => scroll_input(app, up),
         MouseTarget::Completion => completion_manager::wheel(app, !up, MOUSE_SCROLL_STEP as usize),
         MouseTarget::ThemePicker => theme_picker::navigate(app, !up),
@@ -250,17 +277,27 @@ fn handle_wheel(app: &mut App, event: MouseEvent) -> bool {
         MouseTarget::ThinkingPicker => thinking_picker::navigate(app, !up),
         MouseTarget::LogLevelPicker => log_level_picker::navigate(app, !up),
         MouseTarget::ArtifactsModal => crate::artifacts_modal::navigate(app, !up),
-        MouseTarget::ResumePicker => resume_picker::wheel(app, !up),
+        MouseTarget::Loops => crate::loops::navigate(app, !up),
+        MouseTarget::LoopsDetails => app.loops.details.scroll_by(!up, MOUSE_SCROLL_STEP as usize),
+        MouseTarget::GoalConfirm => crate::goal::step(app, !up),
+        MouseTarget::SessionsPage | MouseTarget::SessionsPreview => {
+            crate::sessions_page::mouse::wheel(app, event, !up)
+        }
         MouseTarget::Mcp
-        | MouseTarget::RemoteProject
+        | MouseTarget::Skills
         | MouseTarget::Config
         | MouseTarget::SubagentList
+        | MouseTarget::TasksPanel
         | MouseTarget::Question => {
             if let Some(list) = option_list(app, target) {
                 list.wheel(!up, MOUSE_SCROLL_STEP as usize);
             }
         }
         MouseTarget::Plugins => crate::plugins::wheel(app, !up),
+        MouseTarget::TrustedFolders => crate::trusted_folders::wheel(app, !up),
+        MouseTarget::SkillsBody => {
+            crate::skills_browser::wheel_body(app, !up, MOUSE_SCROLL_STEP as usize)
+        }
         MouseTarget::ReleaseNotes => crate::release_notes::wheel(app, !up),
         MouseTarget::ProxySetup => app.proxy_setup.wheel(up, MOUSE_SCROLL_STEP as usize),
         MouseTarget::ConfigEditor => crate::config_edit::wheel(app, if up { -1 } else { 1 }),
@@ -274,12 +311,15 @@ fn handle_wheel(app: &mut App, event: MouseEvent) -> bool {
             };
         }
         MouseTarget::Approval => approval::wheel(app, !up),
+        MouseTarget::RailWindow => crate::rail::scroll(app, !up, MOUSE_SCROLL_STEP as usize),
+        MouseTarget::CodePreview => crate::code_preview::wheel(app, up),
         // The wizard's own regions never reach the loop: the wizard is a
         // pre-session surface with its own mouse handling.
         MouseTarget::Blocked
         | MouseTarget::Loading
-        | MouseTarget::Toast
+        | MouseTarget::GoalRow
         | MouseTarget::BottomApp
+        | MouseTarget::LoopsForm
         | MouseTarget::McpOAuth
         | MouseTarget::ConnectorAuth
         | MouseTarget::BottomBar
@@ -287,7 +327,7 @@ fn handle_wheel(app: &mut App, event: MouseEvent) -> bool {
         | MouseTarget::OnboardingPreview
         | MouseTarget::OnboardingLinks
         | MouseTarget::OnboardingInputs
-        | MouseTarget::TodoRow => {}
+        | MouseTarget::Rail => {}
     }
     true
 }

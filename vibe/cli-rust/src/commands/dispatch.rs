@@ -10,13 +10,10 @@ use super::simple::{
     DATA_RETENTION_MESSAGE,
 };
 use super::stress;
-use super::submission::{clear_and_remember, NOTICE_TIMEOUT_SECS};
-use crate::app::App;
+use super::submission::clear_and_remember;
+use crate::app::{App, Severity};
 use crate::server::Client;
-use crate::{
-    config, log_level_picker, mcp, model_picker, paste_image, resume_picker, rewind, theme_picker,
-    ui,
-};
+use crate::{config, log_level_picker, mcp, model_picker, paste_image, rewind, theme_picker, ui};
 
 pub(super) fn run_command(
     app: &mut App,
@@ -35,30 +32,50 @@ pub(super) fn run_command(
         "/proxy-setup" => crate::proxy_setup::open(app, client),
         "/theme" => theme_picker::open(app),
         "/model" => match command_args(value) {
+            // Fork feature (AGENTS.md "Fork features"): `/model refresh` re-lists
+            // the `discover = true` providers' models.
             super::model_refresh::REFRESH => super::model_refresh::refresh(app, client),
-            _ => model_picker::open(app),
+            _ => model_picker::open_with_catalog_check(app, client),
         },
-        "/thinking" => crate::thinking_picker::open(app),
-        "/remote-project" => crate::vibe_code_project::open(app, client),
-        "/teleport" => crate::teleport::command(app, client),
+        "/thinking" => super::thinking::command(app, client, command_args(value)),
         "/log-level" => log_level_picker::open(app),
         "/debug" => crate::debug_console::toggle(app, client),
-        "/resume" | "/continue" => resume_picker::open(app, client),
+        "/resume" | "/continue" => {
+            crate::sessions_page::open(app, client, crate::sessions_page::Trigger::ResumeCommand)
+        }
+        "/sessions" => {
+            crate::sessions_page::open(app, client, crate::sessions_page::Trigger::SessionsCommand)
+        }
+        "/storage" => crate::storage_panel::open(app, client),
         "/rewind" => rewind::command(app, client),
+        "/cd" => super::cd::run(app, client, command_args(value)),
         "/branch" | "/fork" => super::branch::branch_session(app, client),
         "/mcp" | "/connectors" => mcp::show(app, client, value),
         "/plugins" => crate::plugins::show(app, client),
+        "/trusted-folders" => crate::trusted_folders::show(app, client),
+        "/context" => crate::context_app::open(app, client),
         "/reload-plugins" => crate::plugins::reload(app, client),
+        "/skills" => crate::skills_browser::show(app, client),
+        "/agent" => super::agent::command(app, client, command_args(value)),
         "/leanstall" => super::leanstall::install_lean(app, client),
         "/unleanstall" => super::leanstall::uninstall_lean(app, client),
-        "/help" => add_text(app, &help_text()),
+        "/help" => add_text(app, &help_text(app)),
         "/clear" | "/new" | "/clean" => clear_history(app, client, value),
         "/compact" => super::compact::start_compact(app, client, value),
         "/copy" => copy_last_agent_message(app),
+        "/raw" => super::raw::command(app, command_args(value)),
         "/paste-image" => paste_image::request(app, true),
         "/status" => super::provider_auth::status(app, client),
         "/log" => read_log(app, client),
         "/rename" => rename_session(app, client, value),
+        "/loop" => crate::loops::open(app),
+        "/goal" => crate::goal::command(app, client, command_args(value)),
+        "/pr" if app.artifacts_modal.enabled => crate::artifacts_modal::show(app, client),
+        "/pr" => ui::notice::show_sticky(
+            app,
+            Severity::Warning,
+            "Turn on enable_pr_monitoring to use /pr",
+        ),
         "/reload" => reload_config(app, client),
         "/retry" => {
             let args = command_args(value);
@@ -70,10 +87,10 @@ pub(super) fn run_command(
             let args = command_args(value);
             stress::toggle(app, client, args);
         }
-        _ => ui::notice::show(
+        _ => ui::notice::show_sticky(
             app,
+            Severity::Warning,
             &format!("Command {command} is not implemented"),
-            NOTICE_TIMEOUT_SECS,
         ),
     }
     false

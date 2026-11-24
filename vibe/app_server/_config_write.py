@@ -34,7 +34,11 @@ def model_after_write(config: VibeConfigSchema, model_alias: str | None) -> str:
 
 
 def model_config_write_ops(
-    config: VibeConfigSchema, *, model_alias: str | None, reasoning_effort: str | None
+    config: VibeConfigSchema,
+    *,
+    model_alias: str | None,
+    reasoning_effort: str | None,
+    default_thinking: str | None = None,
 ) -> list[ConfigWriteOpWire]:
     """The writes a model pick makes, from the pick itself.
 
@@ -42,9 +46,17 @@ def model_config_write_ops(
     one being picked, or the current one when only thinking changes -- so the
     two travel together and only this function needs to know the paths.
 
+    A level equal to that model's ``default_thinking`` is not stored, so the
+    model keeps following its default as the catalog or GrowthBook changes it:
+    the pick removes the level instead, which does nothing when none is saved.
+    Removing it rather than skipping the write keeps a level saved earlier from
+    staying in force over the default the user just picked.
+
     An empty alias is how this configuration says "follow the default", and
     writing it is the only way to unpin a session, so it is passed through
-    rather than looked up.
+    rather than looked up. A durable write of the pin names the model the way
+    the target file already does (an old name while it is there), via
+    ``ConfigSchema.layer_write_op``.
 
     Raises ``ValueError`` for a model this configuration does not offer.
     """
@@ -57,12 +69,11 @@ def model_config_write_ops(
             ConfigWriteOpWire(op="set", path=ACTIVE_MODEL_PATH, value=model_alias)
         )
     if reasoning_effort is not None:
-        target = model_after_write(config, model_alias)
-        ops.append(
-            ConfigWriteOpWire(
-                op="set", path=model_thinking_path(target), value=reasoning_effort
-            )
-        )
+        path = model_thinking_path(model_after_write(config, model_alias))
+        if reasoning_effort != default_thinking:
+            ops.append(ConfigWriteOpWire(op="set", path=path, value=reasoning_effort))
+        else:
+            ops.append(ConfigWriteOpWire(op="remove", path=path))
     return ops
 
 
@@ -150,17 +161,13 @@ def config_write_ops_to_patches(
     *,
     sparse_override_model_aliases: set[str],
 ) -> list[PatchOp]:
-    # A model no layer redefines needs its identity materialized: a sparse
-    # field-only override of one would be an orphan no layer completes on the
-    # next launch. Held per alias, not just for the active model: a pick that
-    # names another model writes that model's fields before it becomes the
-    # active one. Multiple field writes targeting the same alias in one batch
-    # fold into a single upsert so earlier changes are not silently
-    # overwritten.
-    #
-    # Every other model takes a bare field write: durable layers reconstruct
-    # it, and the catalog or GrowthBook layer re-fetches it — copied identity
-    # would keep a model running after its layer drops it (VIBE-4877).
+    # A model outside ``sparse_override_model_aliases`` (no layer rebuilds it
+    # at launch) needs its identity materialized; every other model takes a
+    # bare field write. Held per
+    # alias, not just for the active model: a pick that names another model
+    # writes that model's fields before it becomes the active one. Multiple
+    # field writes targeting the same alias in one batch fold into a single
+    # upsert so earlier changes are not silently overwritten.
     pending: dict[tuple[str | None, str], tuple[ModelConfig, dict[str, Any]]] = {}
     operations: list[PatchOp] = []
 

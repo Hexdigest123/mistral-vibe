@@ -33,7 +33,7 @@ fn tool_call_completion(action_id: &str, call_id: &str) -> Value {
                 "arguments_json": "{\"path\":\"original.txt\"}",
             }],
             "finish_reason": "tool_call",
-            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+            "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         },
     })
 }
@@ -168,6 +168,78 @@ fn provided_tool_name_collisions_reject_session_creation() {
 }
 
 ///
+/// *Prepare*: A provided tool's input schema sets top-level types other than `object`, by its
+/// `type`, by `anyOf`/`oneOf` branches (also nested) or by a local `$ref`; other schemas have
+/// the type `object` or set no type.
+/// *Do*: Create a Harness session with each schema.
+/// *Assert*: Session creation rejects the first kind with an error naming the tool and its schema,
+/// and accepts the second kind.
+///
+#[test]
+fn input_schema_whose_type_is_not_object_rejects_session_creation() {
+    // Prepare
+    let config_with_schema = |input_schema: Value| {
+        let mut config = config();
+        config.capabilities.tool_groups = serde_json::from_value(json!([{
+            "name": "client",
+            "tools": [{
+                "name": "release_notes",
+                "description": "Provided tool.",
+                "input_schema": input_schema,
+                "exposure": "direct",
+            }],
+        }]))
+        .expect("the tool group remains structurally valid");
+        config
+    };
+    // Every Runtime checks the same cases, from the shared fixture.
+    let cases: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/tool-input-schema-types.json"
+        ))
+        .expect("the shared schema fixture reads"),
+    )
+    .expect("the shared schema fixture is JSON");
+    let refused = cases["not_object"]
+        .as_array()
+        .expect("the fixture lists schemas whose type is not object")
+        .clone();
+    let accepted = cases["object"]
+        .as_array()
+        .expect("the fixture lists schemas whose type is object or unset")
+        .clone();
+    assert!(!refused.is_empty() && !accepted.is_empty());
+
+    // Do
+    let refused_errors = refused
+        .iter()
+        .map(|schema| {
+            HarnessSession::create(config_with_schema(schema.clone()))
+                .err()
+                .expect("a schema whose type is not object rejects session creation")
+        })
+        .collect::<Vec<_>>();
+    let accepted_results = accepted
+        .iter()
+        .map(|schema| HarnessSession::create(config_with_schema(schema.clone())).err())
+        .collect::<Vec<_>>();
+
+    // Assert
+    for (schema, error) in refused.iter().zip(refused_errors) {
+        assert_eq!(
+            error,
+            format!(
+                "tool \"client.release_notes\": input schema type must be \"object\", got {schema}"
+            )
+        );
+    }
+    for (schema, error) in accepted.iter().zip(accepted_results) {
+        assert_eq!(error, None, "schema {schema} is accepted");
+    }
+}
+
+///
 /// *Prepare*: A direct filesystem call is pending with a private path argument.
 /// *Do*: Inspect the session through the public Core interface.
 /// *Assert*: Inspection identifies the pending Runtime tool but exposes neither its arguments nor the private path.
@@ -194,7 +266,7 @@ fn tool_inspection_identifies_the_route_without_exposing_arguments() {
                     "arguments_json": "{\"path\":\"secret.txt\"}",
                 }],
                 "finish_reason": "tool_call",
-                "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+                "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
             },
         }),
     )));
@@ -321,20 +393,19 @@ fn direct_tool_hooks_commit_only_the_transformed_result() {
 ///
 /// *Prepare*: A direct filesystem call is waiting on a pre-tool hook.
 /// *Do*: Continue the hook with arguments that violate the original Core-owned schema.
-/// *Assert*: The serialized command is rejected with the existing exact error and the pending hook remains unchanged.
+/// *Assert*: Core warns with the hook bindings, commits a failure the model reads, never runs the tool, and continues the Turn.
 ///
 #[test]
-fn invalid_pre_tool_hook_arguments_preserve_the_pending_call() {
+fn invalid_pre_tool_hook_arguments_fail_the_call_and_continue_the_turn() {
     // Prepare
     let (mut session, hook_action_id) = pending_direct_pre_hook(
         config_with_direct_tool_hooks(),
         "turn-invalid-hook-arguments",
         "call-invalid-hook-arguments",
     );
-    let before = inspection_value(&session);
 
     // Do
-    let rejected = serde_json::to_value(session.apply(input(
+    let failed = accepted_value(session.apply(input(
         3,
         json!({
             "type": "hook_completed",
@@ -347,33 +418,62 @@ fn invalid_pre_tool_hook_arguments_preserve_the_pending_call() {
                 },
             },
         }),
-    )))
-    .expect("rejection serializes");
-    let after = inspection_value(&session);
+    )));
 
     // Assert
+    let message = "A pre_tool_call hook returned arguments for `file_system.read_file` that do \
+                   not satisfy its input schema: the array value is not of type \"object\". The tool did not run.";
+    let observations = failed["transition"]["observations"]
+        .as_array()
+        .expect("observations are an array");
+    assert_eq!(observations.len(), 3);
     assert_eq!(
-        rejected,
+        observations[0],
         json!({
-            "type": "rejected",
-            "rejection": {
-                "code": "invalid_command",
-                "error": {
-                    "code": "invalid_command",
-                    "message": "pre-tool hook arguments do not satisfy the original tool schema: [] is not of type \"object\"",
-                    "retryable": false,
-                    "details": null,
-                },
+            "type": "warning",
+            "turn_id": "turn-invalid-hook-arguments",
+            "code": "pre_tool_call_arguments_invalid",
+            "message": message,
+            "details": {
+                "call_id": "call-invalid-hook-arguments",
+                "tool": "file_system.read_file",
+                "hook_binding_ids": ["pre-tool"],
             },
         })
     );
-    assert_eq!(after, before);
+    assert_eq!(observations[1]["type"], "tool_result_committed");
+    assert_eq!(observations[1]["call_id"], "call-invalid-hook-arguments");
+    assert_eq!(observations[1]["call"]["arguments"]["path"], "original.txt");
+    assert_eq!(
+        observations[1]["result"],
+        json!({
+            "type": "failure",
+            "content": [{"type": "text", "text": message}],
+            "error": {
+                "code": "pre_tool_call_arguments_invalid",
+                "message": message,
+                "retryable": false,
+                "details": null,
+            },
+        })
+    );
+    assert_eq!(observations[2]["type"], "tool_execution_finished");
+    assert_eq!(observations[2]["result"], observations[1]["result"]);
+    let action = &failed["transition"]["next"]["directives"][0]["action"];
+    assert_eq!(action["type"], "llm_call");
+    let model_input =
+        serde_json::to_string(&action["model_input"]).expect("model input serializes");
+    assert!(model_input.contains("The tool did not run."));
+    let serialized = serde_json::to_string(&failed).expect("transition serializes");
+    assert!(!serialized.contains("runtime_builtin_tool_call"));
+    assert_eq!(failed["transition"]["turn"]["status"], "running");
 }
 
 ///
 /// *Prepare*: A provided direct tool with a Core-tracked input schema is waiting on a pre-tool hook.
 /// *Do*: Continue the hook with arguments that violate that configured schema.
-/// *Assert*: The provided-tool contract is resolved from the session catalog and rejected without advancing the call.
+/// *Assert*: The provided-tool contract is resolved from the session catalog, the call fails without running,
+/// and neither the failure nor the warning quotes the rejected value.
 ///
 #[test]
 fn invalid_provided_tool_hook_arguments_use_the_resolved_catalog() {
@@ -412,15 +512,14 @@ fn invalid_provided_tool_hook_arguments_use_the_resolved_catalog() {
                     "arguments_json": "{\"query\":\"planning\"}",
                 }],
                 "finish_reason": "tool_call",
-                "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+                "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
             },
         }),
     )));
     let hook_action_id = dispatched_action_id(&hook_pending).to_string();
-    let before = inspection_value(&session);
 
     // Do
-    let rejected = serde_json::to_value(session.apply(input(
+    let failed = accepted_value(session.apply(input(
         3,
         json!({
             "type": "hook_completed",
@@ -429,19 +528,29 @@ fn invalid_provided_tool_hook_arguments_use_the_resolved_catalog() {
                 "hook": "pre_tool_call",
                 "output": {
                     "type": "continue",
-                    "effective_arguments": [],
+                    "effective_arguments": {"query": ["sk-live-secret"]},
                 },
             },
         }),
-    )))
-    .expect("rejection serializes");
+    )));
 
     // Assert
+    let observations = &failed["transition"]["observations"];
+    assert_eq!(observations[0]["type"], "warning");
+    assert_eq!(observations[0]["details"]["tool"], "calendar.find_event");
+    assert_eq!(observations[1]["type"], "tool_result_committed");
     assert_eq!(
-        rejected["rejection"]["error"]["message"],
-        "pre-tool hook arguments do not satisfy the original tool schema: [] is not of type \"object\""
+        observations[1]["result"]["error"]["message"],
+        "A pre_tool_call hook returned arguments for `calendar.find_event` that do not \
+         satisfy its input schema: at /query: the array value is not of type \"string\". The tool did not \
+         run."
     );
-    assert_eq!(inspection_value(&session), before);
+    let serialized = serde_json::to_string(&failed).expect("transition serializes");
+    assert!(!serialized.contains("sk-live-secret"));
+    assert_eq!(
+        failed["transition"]["next"]["directives"][0]["action"]["type"],
+        "llm_call"
+    );
 }
 
 ///
@@ -460,7 +569,20 @@ fn invalid_runtime_builtin_output_preserves_the_exact_failure() {
     let completion_action_id = dispatched_action_id(&started).to_string();
     let tool_pending = accepted_value(session.apply(input(
         2,
-        tool_call_completion(&completion_action_id, "call-invalid-output"),
+        json!({
+            "type": "completion_succeeded",
+            "action_id": completion_action_id,
+            "result": {
+                "parts": [{
+                    "type": "tool_call",
+                    "id": "call-invalid-output",
+                    "name": "write_file",
+                    "arguments_json": "{\"path\":\"original.txt\",\"content\":\"updated\"}",
+                }],
+                "finish_reason": "tool_call",
+                "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+            },
+        }),
     )));
     let tool_action = &tool_pending["transition"]["next"]["directives"][0]["action"];
     let tool_action_id = tool_action["action_id"]
@@ -495,7 +617,7 @@ fn invalid_runtime_builtin_output_preserves_the_exact_failure() {
         committed["result"]["error"],
         json!({
             "code": "runtime_builtin_output_schema_mismatch",
-            "message": "Runtime built-in file_system.read_file returned structured content that does not satisfy its Core-owned output schema: [] is not of type \"object\"",
+            "message": "Runtime built-in file_system.write_file returned structured content that does not satisfy its Core-owned output schema: [] is not of type \"object\"",
             "retryable": false,
             "details": null,
         })
@@ -611,6 +733,10 @@ fn restored_direct_pre_tool_skip_commits_failure_without_runtime_execution() {
     assert_eq!(observations[0]["result"]["error"]["code"], "tool_skipped");
     assert_eq!(
         observations[0]["result"]["content"][0]["text"],
+        "file access denied"
+    );
+    assert_eq!(
+        observations[0]["result"]["error"]["message"],
         "file access denied"
     );
     assert_eq!(observations[1]["type"], "tool_execution_finished");

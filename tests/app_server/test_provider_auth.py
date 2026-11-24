@@ -12,15 +12,19 @@ import os
 from pathlib import Path
 import socket
 import threading
+import time
 
 import keyring
 from keyring.errors import KeyringError
+from pydantic import SecretStr
 import pytest
 
 from tests.conftest import build_test_vibe_config
+from tests.stubs.fake_keyring import FakeKeyring
 import vibe.app_server._provider_auth as provider_auth_module
 from vibe.app_server._provider_auth import (
     SourceProbe,
+    active_credential_source,
     build_provider_auth_view,
     read_provider_auth,
     sanitize_api_base,
@@ -42,9 +46,12 @@ from vibe.core.config import (
     record_env_value_origin,
 )
 from vibe.core.types import Backend
+from vibe.setup.auth._oidc_config import OidcConfig
+from vibe.setup.auth._oidc_credentials import OidcTokens
 import vibe.setup.auth.api_key_persistence as api_key_persistence
 from vibe.setup.auth.api_key_persistence import persist_api_key
 from vibe.utils.api_keys import ApiKeySource, resolve_api_key_with_origin
+from vibe.utils.oidc_marker import OIDC_API_KEY
 
 _API_KEY_ENV_VAR = "ANTHROPIC_API_KEY"
 
@@ -793,6 +800,271 @@ class TestReadProviderAuth:
 
         assert _kinds(view) == [(ProviderCredentialSourceKind.PROCESS_ENV, "in_use")]
         assert "env-key" not in view.model_dump_json()
+
+
+def _mistral_config() -> VibeConfigSchema:
+    provider = ProviderConfig(
+        name="mistral",
+        api_base="https://api.mistral.ai/v1",
+        api_key_env_var="MISTRAL_API_KEY",
+        backend=Backend.MISTRAL,
+    )
+    model = ModelConfig(
+        name="mistral-medium-latest", provider="mistral", alias="mistral-medium"
+    )
+    return build_test_vibe_config(
+        providers=[provider], models=[model], active_model="mistral-medium"
+    )
+
+
+def _record_probes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record ``.env`` probes; the keyring is observed through its backend."""
+    probed: list[str] = []
+
+    def _env_file(_path: Path, _var: str) -> SourceProbe:
+        probed.append("env_file")
+        return SourceProbe(value=None)
+
+    monkeypatch.setattr(provider_auth_module, "probe_env_file", _env_file)
+    return probed
+
+
+class TestCliOidcSource:
+    """With ``VIBE_CLI_OIDC_ENABLED``, ``MISTRAL_API_KEY`` resolves from the
+    CLI OIDC sign-in and never reads an API-key source, so the view reports the
+    sign-in and inspects nothing else.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cli_oidc_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VIBE_CLI_OIDC_ENABLED", "1")
+        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+
+    @pytest.mark.asyncio
+    async def test_signed_in_session_is_reported_over_a_keyring_api_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        keyring_reads: list[tuple[str, str]] = []
+
+        def _api_key_in_keyring(service: str, username: str) -> str | None:
+            keyring_reads.append((service, username))
+            return "keyring-api-key"
+
+        # The real keyring probe runs against an API key stored for the
+        # variable: the read itself is the bug.
+        monkeypatch.setattr(keyring, "get_password", _api_key_in_keyring)
+        probed = _record_probes(monkeypatch)
+        monkeypatch.setattr(
+            "vibe.setup.auth._oidc_runtime.read_stored_oidc_credential",
+            lambda: OIDC_API_KEY,
+        )
+        config = _mistral_config()
+
+        view = await read_provider_auth(config)
+        source = await active_credential_source(
+            config.get_provider_for_model(config.get_active_model())
+        )
+
+        assert _kinds(view) == [(ProviderCredentialSourceKind.CLI_OIDC, "in_use")]
+        assert source is ProviderCredentialSourceKind.CLI_OIDC
+        assert keyring_reads == []
+        assert probed == []
+        resolved = resolve_api_key_with_origin("MISTRAL_API_KEY")
+        assert resolved is not None
+        assert resolved[1].source is ApiKeySource.OIDC
+
+    @pytest.mark.asyncio
+    async def test_signed_out_session_lists_no_api_key_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Resolution never falls back to the API key, so neither does the view."""
+        monkeypatch.setattr(
+            keyring, "get_password", lambda service, username: "keyring-api-key"
+        )
+        probed = _record_probes(monkeypatch)
+        monkeypatch.setattr(
+            "vibe.setup.auth._oidc_runtime.read_stored_oidc_credential", lambda: None
+        )
+        config = _mistral_config()
+
+        view = await read_provider_auth(config)
+        source = await active_credential_source(
+            config.get_provider_for_model(config.get_active_model())
+        )
+
+        assert view.sources == []
+        assert source is None
+        assert probed == []
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_session_store_reports_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        release = threading.Event()
+
+        def _hang() -> str | None:
+            release.wait(timeout=10)
+            return OIDC_API_KEY
+
+        monkeypatch.setattr(provider_auth_module, "_SOURCE_DEADLINE_SECONDS", 0.05)
+        monkeypatch.setattr(
+            "vibe.setup.auth._oidc_runtime.read_stored_oidc_credential", _hang
+        )
+        try:
+            view = await read_provider_auth(_mistral_config())
+        finally:
+            release.set()
+
+        assert _kinds(view) == [(ProviderCredentialSourceKind.CLI_OIDC, "unavailable")]
+
+    @pytest.mark.asyncio
+    async def test_other_providers_keep_their_api_key_sources(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(_API_KEY_ENV_VAR, "env-key")
+        monkeypatch.setattr(provider_auth_module, "env_value_origin", lambda _key: None)
+        monkeypatch.setattr(
+            provider_auth_module,
+            "probe_keyring",
+            lambda _var: SourceProbe(value="keyring-key"),
+        )
+        monkeypatch.setattr(
+            provider_auth_module,
+            "probe_env_file",
+            lambda _path, _var: SourceProbe(value=None),
+        )
+
+        view = await read_provider_auth(_api_key_config())
+
+        assert _kinds(view) == [
+            (ProviderCredentialSourceKind.PROCESS_ENV, "in_use"),
+            (ProviderCredentialSourceKind.OS_KEYRING, "present"),
+        ]
+
+
+_OIDC_SLOT = ("ai.mistral.vibe.oidc", "cli-oidc:v1:tokens")
+_API_KEY_SLOT = ("ai.mistral.vibe", "MISTRAL_API_KEY")
+
+
+def _stored_session(
+    *,
+    issuer: str | None = None,
+    client_id: str | None = None,
+    audience: str | None = None,
+) -> str:
+    config = OidcConfig.from_env()
+    return OidcTokens(
+        issuer=issuer or config.issuer,
+        client_id=client_id or config.client_id,
+        audience=audience or config.audience,
+        subject="user",
+        access_token=SecretStr("access-secret"),
+        refresh_token=None,
+        id_token=SecretStr("id-secret"),
+        expires_at=time.time() + 3600,
+    ).model_dump_json()
+
+
+class TestCliOidcStoredSession:
+    """The sign-in read through the real OIDC keyring slot, not a stub.
+
+    The OS keyring is an in-memory backend; everything between it and the
+    view (the slot, the token cache, the issuer/client/audience match, and
+    the error handling) is the production path.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cli_oidc_enabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in list(os.environ):
+            if name.startswith("VIBE_CLI_OIDC_"):
+                monkeypatch.delenv(name)
+        monkeypatch.setenv("VIBE_CLI_OIDC_ENABLED", "1")
+        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.delenv("VIBE_TEST_DISABLE_KEYRING", raising=False)
+
+    @pytest.mark.asyncio
+    async def test_a_stored_session_is_read_from_the_oidc_keyring_slot(self) -> None:
+        backend = FakeKeyring()
+        backend.store[_OIDC_SLOT] = _stored_session()
+        backend.store[_API_KEY_SLOT] = "keyring-api-key"
+        keyring.set_keyring(backend)
+
+        view = await read_provider_auth(_mistral_config())
+
+        assert _kinds(view) == [(ProviderCredentialSourceKind.CLI_OIDC, "in_use")]
+        assert backend.reads == [_OIDC_SLOT]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "other",
+        [
+            {"issuer": "https://other.test"},
+            {"client_id": "other-client"},
+            {"audience": "https://other.test"},
+        ],
+        ids=["issuer", "client_id", "audience"],
+    )
+    async def test_a_session_for_another_registration_reads_as_signed_out(
+        self, other: dict[str, str]
+    ) -> None:
+        backend = FakeKeyring()
+        backend.store[_OIDC_SLOT] = _stored_session(**other)
+        backend.store[_API_KEY_SLOT] = "keyring-api-key"
+        keyring.set_keyring(backend)
+
+        view = await read_provider_auth(_mistral_config())
+
+        assert view.sources == []
+        assert _API_KEY_SLOT not in backend.reads
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_keyring_reports_the_session_unavailable(self) -> None:
+        backend = FakeKeyring(error=KeyringError("Secret Service is locked"))
+        keyring.set_keyring(backend)
+        config = _mistral_config()
+
+        view = await read_provider_auth(config)
+        source = await active_credential_source(
+            config.get_provider_for_model(config.get_active_model())
+        )
+        resolved = resolve_api_key_with_origin("MISTRAL_API_KEY")
+
+        assert _kinds(view) == [(ProviderCredentialSourceKind.CLI_OIDC, "unavailable")]
+        # setup/status reports only an in-use source, so it stays empty.
+        assert source is None
+        # Resolution keeps its contract: no credential, and no API-key fallback.
+        assert resolved is None
+        # A failed read is not cached: the view, setup/status and resolution
+        # each retried the OIDC slot, and none read the API-key slot.
+        assert backend.reads == [_OIDC_SLOT, _OIDC_SLOT, _OIDC_SLOT]
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_stored_session_reports_the_session_unavailable(
+        self,
+    ) -> None:
+        backend = FakeKeyring()
+        backend.store[_OIDC_SLOT] = "not json"
+        keyring.set_keyring(backend)
+
+        view = await read_provider_auth(_mistral_config())
+
+        assert _kinds(view) == [(ProviderCredentialSourceKind.CLI_OIDC, "unavailable")]
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_oidc_configuration_reports_the_session_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Signing in would hit the same configuration error, so the sign-in
+        is reported as not inspectable rather than as signed out.
+        """
+        backend = FakeKeyring()
+        backend.store[_OIDC_SLOT] = _stored_session()
+        keyring.set_keyring(backend)
+        monkeypatch.setenv("VIBE_CLI_OIDC_ISSUER", "http://insecure.test")
+
+        view = await read_provider_auth(_mistral_config())
+
+        assert _kinds(view) == [(ProviderCredentialSourceKind.CLI_OIDC, "unavailable")]
 
 
 class TestWireModel:

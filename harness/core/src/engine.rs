@@ -21,6 +21,7 @@ use crate::core::HarnessSession;
 use crate::core::Inspection;
 #[cfg(test)]
 use crate::core::ProgrammaticToolSettings;
+use crate::core::RestoreError;
 #[cfg(test)]
 use crate::core::SubagentMode;
 #[cfg(test)]
@@ -97,14 +98,14 @@ impl HarnessEngine {
         checkpoint: Checkpoint,
         resume_input_id: u64,
         moved_from: Option<HarnessConfig>,
-    ) -> Result<SessionHandle, String> {
+    ) -> Result<SessionHandle, RestoreError> {
         let session = HarnessSession::restore_moved_from(
             config,
             checkpoint,
             resume_input_id,
             moved_from.as_ref(),
         )?;
-        self.insert(session)
+        Ok(self.insert(session)?)
     }
 
     pub(crate) fn apply(
@@ -211,10 +212,12 @@ mod tests {
     fn config(task_id: &str) -> HarnessConfig {
         HarnessConfig {
             task_id: task_id.to_string(),
+            action_id_namespace: None,
             system_instructions: "system".to_string(),
             settings: HarnessSettings {
                 turn: TurnSettings {
                     max_iterations: Some(8),
+                    max_identical_tool_failures: None,
                     output_limit_recovery: Default::default(),
                 },
                 context: ContextSettings {
@@ -226,6 +229,8 @@ mod tests {
                     },
                     model_facts: crate::core::testing::test_model_facts(),
                     compaction_model_input_modalities: None,
+                    compaction_model_window: None,
+                    instructions: Default::default(),
                 },
                 tools: ToolSettings {
                     max_wait_ms: 3_600_000,

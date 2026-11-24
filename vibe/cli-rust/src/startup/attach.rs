@@ -7,12 +7,11 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::Attach;
-use crate::cli::StartupResume;
+use crate::cli::{StartModel, StartupResume};
 use crate::server::{
     method, request_error::resume_failure_message, AgentConfig, Client, Notification,
     RequestFailure, RpcError, SessionStartParams, HISTORY_LIMIT,
 };
-use crate::startup::StartupEvent;
 use crate::worktree::WorktreeInfo;
 
 /// Why `session/start` failed, for the handshake to classify.
@@ -32,47 +31,62 @@ pub(super) async fn attach_session(
     client: &Arc<Client>,
     resume: StartupResume,
     agent_config: AgentConfig,
-    list_error: Option<String>,
+    start_model: &StartModel,
 ) -> Result<(Value, Attach), StartError> {
-    let started = start_session(client, agent_config.clone()).await?;
-    rebind(client, started, resume, &agent_config, list_error)
+    let started = start_session(client, agent_config.clone(), &resume, start_model).await?;
+    rebind(client, started, resume, &agent_config)
         .await
         .map_err(StartError::Other)
 }
 
 /// Start the fresh session a resume rebinds onto.
+///
+/// With a resume intent it is only a warm-up: the server opens it for the user
+/// (session_start, new-session telemetry) once it gets a message, so a resume
+/// that replaces it reports nothing for it.
 pub(super) async fn start_session(
     client: &Arc<Client>,
     agent_config: AgentConfig,
+    resume: &StartupResume,
+    start_model: &StartModel,
 ) -> Result<Value, StartError> {
     let start = SessionStartParams {
         agent_config,
         history_limit: HISTORY_LIMIT,
-        model: None,
-        session_only: false,
+        model: start_model.model.clone(),
+        reasoning_effort: start_model.thinking.clone(),
+        session_only: *start_model != StartModel::default(),
+        kind: start_kind(resume),
     };
     let params = serde_json::to_value(&start).map_err(|e| StartError::Other(e.into()))?;
     let result = client
-        .request_err(method::SESSION_START, params)
+        .request(method::SESSION_START, params)
         .await
-        .map_err(|err| {
-            if err.is_unauthorized() {
-                StartError::Auth(Box::new(err))
-            } else if err.is_config_error() {
-                StartError::Config(Box::new(err))
-            } else {
-                StartError::Other(anyhow::anyhow!(
-                    "session/start failed: [{}] {}",
-                    err.code(),
-                    err.message
-                ))
-            }
-        })?;
+        .map_err(start_error)?;
     result
         .get("state")
         .cloned()
         .with_context(|| "session/start response missing state")
         .map_err(StartError::Other)
+}
+
+/// Keeps the failure typed, so the startup report tells a server refusal from a dead server.
+fn start_error(error: anyhow::Error) -> StartError {
+    match error.downcast::<RequestFailure>() {
+        Ok(RequestFailure::Rpc(rpc)) if rpc.is_unauthorized() => StartError::Auth(Box::new(rpc)),
+        Ok(RequestFailure::Rpc(rpc)) if rpc.is_config_error() => StartError::Config(Box::new(rpc)),
+        Ok(failure) => {
+            StartError::Other(anyhow::Error::new(failure).context("session/start failed"))
+        }
+        Err(error) => StartError::Other(error),
+    }
+}
+
+/// The `session/start` kind: `ephemeral` for a warm-up a resume replaces at
+/// once. The picker's session is the user's own until they pick another, so it
+/// starts as a normal one, ready from the start.
+pub fn start_kind(resume: &StartupResume) -> Option<&'static str> {
+    matches!(resume, StartupResume::ById(_) | StartupResume::Continue).then_some("ephemeral")
 }
 
 /// Rebind onto the saved session the resume intent names, or keep the fresh
@@ -82,17 +96,11 @@ pub(super) async fn rebind(
     started: Value,
     resume: StartupResume,
     agent_config: &AgentConfig,
-    list_error: Option<String>,
 ) -> Result<(Value, Attach)> {
-    let (method, params) = match (resume, list_error) {
-        (_, Some(error)) => return Ok((started, Attach::Failed(error))),
-        (StartupResume::ById(id), None) => {
-            (method::SESSION_RESUME, resume_params(&id, agent_config))
-        }
+    let (method, params) = match resume {
+        StartupResume::ById(id) => (method::SESSION_RESUME, resume_params(&id, agent_config)),
         // The server picks the session: this terminal's last one in the folder, else the latest.
-        (StartupResume::Continue, None) => {
-            (method::SESSION_CONTINUE, continue_params(agent_config))
-        }
+        StartupResume::Continue => (method::SESSION_CONTINUE, continue_params(agent_config)),
         _ => return Ok((started, Attach::Started)),
     };
     // The full agent config rides on resume too, so flags survive the rebind.
@@ -167,11 +175,9 @@ async fn state_of(client: &Arc<Client>, method: &str, params: Value) -> Result<V
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn settle_worktree_session(
     client: &Arc<Client>,
-    event_tx: &mpsc::Sender<StartupEvent>,
     notifications: Option<(mpsc::Receiver<Notification>, mpsc::Sender<Notification>)>,
     resume: &StartupResume,
     agent_config: &AgentConfig,
-    mut list_error: Option<String>,
     state: Value,
 ) -> Result<(
     Value,
@@ -182,40 +188,28 @@ pub(super) async fn settle_worktree_session(
 )> {
     let (mut stream, bridge) =
         notifications.context("a worktree run hands its notification stream to the handshake")?;
-    let deadline = tokio::time::Instant::now() + crate::worktree_gate::SETTLE_WAIT;
+    let deadline = tokio::time::Instant::from_std(crate::clock::real_now())
+        + crate::worktree_gate::SETTLE_WAIT;
     let (settle, waited) = crate::worktree_gate::absorb_until_settled(&mut stream, deadline)
         .await
-        .map_err(anyhow::Error::msg)?;
+        .map_err(|message| anyhow::Error::new(super::failure::ServerFailure(message)))?;
     let settled = settle.cwd;
     let prepared = settle.worktree;
     let absorbed = waited.notifications;
     // The event loop reads the bridge; everything past the settle flows on.
-    tokio::spawn(async move {
+    crate::work::spawn_daemon(async move {
         while let Some(notification) = stream.recv().await {
             if bridge.send(notification).await.is_err() {
                 break;
             }
         }
     });
-    if matches!(resume, StartupResume::Picker) {
-        match client
-            .request(method::SESSION_LIST, json!({ "cwd": settled }))
-            .await
-        {
-            Ok(value) => event_tx
-                .send(StartupEvent::Sessions(Box::new(value)))
-                .await
-                .context("startup event receiver closed")?,
-            Err(error) => list_error = Some(format!("Failed to list sessions: {error}")),
-        }
-    }
     // The rebind's agentConfig names the worktree directory, not the checkout
     // the run started in; the settled cwd is that directory.
     let mut rebound_config = agent_config.clone();
     if let Some(settled) = settled.as_ref() {
         rebound_config.cwd = Some(settled.clone());
     }
-    let (state, attach) =
-        rebind(client, state, resume.clone(), &rebound_config, list_error).await?;
+    let (state, attach) = rebind(client, state, resume.clone(), &rebound_config).await?;
     Ok((state, attach, settled, prepared, absorbed))
 }

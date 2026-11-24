@@ -222,6 +222,11 @@ class CatalogueEntry:
     max_output_tokens: int | None = None
     input_modalities: tuple[InputModality, ...] | None = None
     reasoning: ReasoningSupport | None = None
+    # Whether the model takes a JSON schema output format; None when the catalogue
+    # does not say.
+    structured_output: bool | None = None
+    # The model the catalogue says the id serves, such as an alias's current one.
+    name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +237,7 @@ class KnownModel:
     max_output_tokens: int | None = None
     input_modalities: tuple[InputModality, ...] | None = None
     reasoning: ReasoningSupport | None = None
+    image_cost: ImageCostRule | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -66,7 +66,9 @@ def compile_profile(
             "which every completion needs"
         )
     entry = catalogue or CatalogueEntry()
-    known = find_known_model(model, known_models) or KnownModel()
+    # The card's name finds the row an alias serves today; the id is the fallback.
+    named = find_known_model(entry.name, known_models) if entry.name else None
+    known = named or find_known_model(model, known_models) or KnownModel()
     warnings: list[CompletionWarning] = []
     sources: dict[str, Source] = {}
 
@@ -109,6 +111,9 @@ def compile_profile(
         default=None,
     )
     setting = _reasoning_setting(explicit.reasoning, explicit.reasoning_levels, adapter)
+    image_cost, sources["image_cost"] = _first(
+        None, None, known.image_cost, default=FixedImageCost()
+    )
 
     wire_max_tokens = (
         (explicit.max_tokens or max_output or REQUIRED_MAX_TOKENS_FALLBACK)
@@ -149,7 +154,7 @@ def compile_profile(
         input_modalities=_accepted_modalities(
             model_modalities, adapter.input_modalities
         ),
-        image_cost=FixedImageCost(),
+        image_cost=image_cost,
     )
     provider_format = ProviderFormat(
         wire=adapter.wire,

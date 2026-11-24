@@ -9,13 +9,13 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 env = {"SSH_TTY": "/dev/pts/0"}
 
 # The drag below selects "Ra" without folding the group the triple click left open.
 expected_clipboard = "Ra"
-screen_rows = {10: "⏷ Ran 3 commands", 11: "⎢ ⏵ Ran ls dir1"}
+screen_rows = {10: "⏷ Ran 3 commands", 11: "│ ⏵ Ran ls dir1"}
 
 # SGR row 11 is the group header: the arrow at column 1, "Ran" from column 3.
 _HEADER = 11
@@ -32,9 +32,13 @@ timeline: Timeline = [
     *(bash(f"ls dir{index}", f"file{index}.txt") for index in range(1, 4)),
     assistant_msg("Listed."),
     turn_completed(),
+    take_snapshot(),
     # A double click unfolds then folds the group, selecting nothing.
     _clicks(2),
+    take_snapshot(),
     # A triple click toggles three times and leaves it open.
     _clicks(3),
+    take_snapshot(),
     f"\x1b[<0;3;{_HEADER}M\x1b[<32;4;{_HEADER}M\x1b[<0;4;{_HEADER}m",
+    take_snapshot(),
 ]

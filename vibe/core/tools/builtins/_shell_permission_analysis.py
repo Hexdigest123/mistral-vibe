@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 import re
+import shlex
+from typing import SupportsIndex
 
-from tree_sitter import Language, Node, Parser
-import tree_sitter_bash as tsbash
+from tree_sitter import Node
 
 from vibe.core.tools.arity import known_session_pattern_arity
 from vibe.core.tools.builtins._shell_command_policy import has_option_guardrails
+from vibe.core.utils.bash_parser import bash_parser, walk
 
 _SUPPORTED_COMMAND_PARTS = {
     "command_name",
@@ -18,6 +19,163 @@ _SUPPORTED_COMMAND_PARTS = {
     "raw_string",
     "concatenation",
 }
+
+
+class ShellArgument(str):
+    """A decoded word retaining where this occurrence has live wildcards.
+
+    Path policy returns words, attached option slices, and separated path lists.
+    Preserve provenance through those operations so equal pattern/file values
+    and quoted/unquoted occurrences remain distinct until the policy binds them.
+    """
+
+    def __new__(
+        cls,
+        value: str,
+        glob_positions: frozenset[int],
+        source_index: int,
+        source_positions: tuple[int, ...] | None = None,
+        dynamic: bool = False,
+    ) -> ShellArgument:
+        argument = super().__new__(cls, value)
+        argument.glob_positions = glob_positions
+        argument.source_index = source_index
+        argument.source_positions = (
+            tuple(range(len(value))) if source_positions is None else source_positions
+        )
+        argument.dynamic = dynamic
+        return argument
+
+    glob_positions: frozenset[int]
+    source_index: int
+    source_positions: tuple[int, ...]
+    dynamic: bool
+
+    def __getitem__(self, key: SupportsIndex | slice) -> str:
+        value = super().__getitem__(key)
+        if not isinstance(key, slice):
+            return value
+        positions = frozenset(
+            offset
+            for offset, original in enumerate(range(*key.indices(len(self))))
+            if original in self.glob_positions
+        )
+        return ShellArgument(
+            value,
+            positions,
+            self.source_index,
+            self.source_positions[key],
+            self.dynamic,
+        )
+
+    def partition(self, sep: str) -> tuple[str, str, str]:
+        before, separator, after = super().partition(sep)
+        if not separator:
+            return self, separator, after
+        start = len(before)
+        return self[:start], self[start : start + len(sep)], self[start + len(sep) :]
+
+    def split(self, sep: str | None = None, maxsplit: SupportsIndex = -1) -> list[str]:
+        parts = super().split(sep, maxsplit)
+        values: list[str] = []
+        cursor = 0
+        for part in parts:
+            start = self.find(part, cursor)
+            values.append(self[start : start + len(part)])
+            cursor = start + len(part) + (len(sep) if sep is not None else 0)
+        return values
+
+
+def _unquoted_word(node: Node, word: Node) -> bool:
+    if word.type != "word" or node.type in {"string", "raw_string"}:
+        return False
+    ancestor = word.parent if word != node else node
+    while ancestor is not None and ancestor != node:
+        if ancestor.type in {
+            "string",
+            "raw_string",
+            "command",
+            "command_substitution",
+            "process_substitution",
+        }:
+            return False
+        ancestor = ancestor.parent
+    return ancestor == node
+
+
+def shell_read_commands(command: str) -> list[str]:
+    """Commands as written, including operands the approval analyzer omits."""
+    root = bash_parser().parse(command.encode("utf-8")).root_node
+    return [_text(node) for node in walk(root) if node.type == "command"]
+
+
+def _glob_positions(node: Node) -> frozenset[int]:
+    positions: set[int] = set()
+    for word in walk(node):
+        if not _unquoted_word(node, word):
+            continue
+        for match in re.finditer(r"(?<!\\)(?:\\\\)*([?*\[])", _text(word)):
+            prefix = (
+                _text(node).encode()[: word.start_byte - node.start_byte].decode()
+                + _text(word)[: match.start(1)]
+            )
+            try:
+                prefix_words = shlex.split(prefix + "x")
+            except ValueError:
+                continue
+            if len(prefix_words) == 1:
+                positions.add(len(prefix_words[0]) - 1)
+    return frozenset(positions)
+
+
+def shell_arguments(command: str, tokens: list[str] | None = None) -> list[str]:
+    """Annotate each decoded occurrence before authoritative path-role binding."""
+    root = bash_parser().parse(command.encode("utf-8")).root_node
+    arguments: list[str] = []
+    for node in walk(root):
+        if node.parent is None or node.parent.type != "command":
+            continue
+        ancestor = node.parent.parent
+        while ancestor is not None and ancestor.type != "command":
+            ancestor = ancestor.parent
+        if ancestor is not None:
+            continue
+        # The grammar reads ``.e{n,}v`` as a plain concatenation, but the shell
+        # expands it into several words, so it cannot be one literal path.
+        dynamic = (
+            _contains_dynamic(node)
+            or bool(_zsh_sensitive_node_reason(node))
+            or _node_approval_reason(node) == "brace expansion"
+        )
+        if node.type not in _SUPPORTED_COMMAND_PARTS and not dynamic:
+            continue
+        try:
+            decoded = shlex.split(_text(node))
+        except ValueError:
+            decoded = []
+        if len(decoded) != 1:
+            if tokens is not None:
+                continue
+            # The AST keeps a substitution containing spaces as one operand.
+            # Its unresolved text is for role binding, never a file grant.
+            decoded = [_text(node)]
+            dynamic = True
+        arguments.append(
+            ShellArgument(
+                decoded[0], _glob_positions(node), len(arguments), dynamic=dynamic
+            )
+        )
+    if tokens is None:
+        return arguments
+    if arguments == tokens:
+        return arguments
+    if tokens and tokens[-1] == "<redirect>" and arguments == tokens[:-1]:
+        # _read_command appends this scope marker; it is not a shell argument.
+        return [*arguments, ShellArgument("<redirect>", frozenset(), len(arguments))]
+    # Uncorrelated syntax is gated by the command analyzer's exact approval.
+    # It must never synthesize wildcard eligibility or grants for neighbors.
+    return tokens
+
 
 # ``redirected_statement`` is only a wrapper around a command and its redirects;
 # every redirect kind it can hold is named here or handled by
@@ -127,10 +285,10 @@ def redirect_writes(
     root; to any other POSIX shell those are relative paths.
     """
     source = command.encode("utf-8")
-    root = _get_parser().parse(source).root_node
+    root = bash_parser().parse(source).root_node
     faithful = not root.has_error and not _continues_code_line(source, root)
     writes: list[RedirectWrite] = []
-    for node in _walk(root):
+    for node in walk(root):
         if node.type != "file_redirect":
             continue
         target = _redirect_target(node)
@@ -151,16 +309,6 @@ def redirect_writes(
     return tuple(dict.fromkeys(writes))
 
 
-def _walk(root: Node) -> list[Node]:
-    nodes: list[Node] = []
-    pending = [root]
-    while pending:
-        node = pending.pop()
-        nodes.append(node)
-        pending.extend(reversed(node.children))
-    return nodes
-
-
 def _text(node: Node) -> str:
     return node.text.decode("utf-8") if node.text is not None else ""
 
@@ -168,7 +316,7 @@ def _text(node: Node) -> str:
 def _continues_code_line(source: bytes, root: Node) -> bool:
     data = [
         (node.start_byte, node.end_byte)
-        for node in _walk(root)
+        for node in walk(root)
         if node.type in _DATA_NODES
     ]
     return any(
@@ -460,14 +608,9 @@ def _read_command(node: Node) -> _CommandRead:
     )
 
 
-@lru_cache(maxsize=1)
-def _get_parser() -> Parser:
-    return Parser(Language(tsbash.language()))
-
-
 def analyze_shell_command(command: str) -> ShellPermissionAnalysis:
     """Extract commands and fail closed on syntax the policy cannot model."""
-    tree = _get_parser().parse(command.encode("utf-8"))
+    tree = bash_parser().parse(command.encode("utf-8"))
     commands: list[str] = []
     approval_reasons: set[str] = set()
     invalidates_scope = False

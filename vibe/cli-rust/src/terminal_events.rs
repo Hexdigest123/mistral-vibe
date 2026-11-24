@@ -71,13 +71,26 @@ fn read_terminal(
     let mut filter = TerminalInputFilter::default();
     let mut bursts = KeyBurst::default();
     let mut coalesce = pixels::Coalesce::default();
+    crate::platform::keep_key_records();
+    let mut typed = crate::typeahead::read(&mut filter);
+    let submit = crate::typeahead::take_submit(&mut typed);
+    if cfg!(windows) {
+        typed = bursts.push(typed, crate::clock::real_now());
+        typed.extend(bursts.finish());
+    }
+    for event in typed.into_iter().chain(submit) {
+        if !deliver(tx, pauses, event) {
+            return;
+        }
+    }
     while !tx.is_closed() {
         if let Ok(pause) = pauses.try_recv() {
             serve(pause);
             continue;
         }
+        crate::platform::keep_key_records();
         let timeout = bursts.deadline().map_or(POLL_INTERVAL, |deadline| {
-            deadline.saturating_duration_since(Instant::now())
+            deadline.saturating_duration_since(crate::clock::real_now())
         });
         let mut pending = match crossterm::event::poll(timeout) {
             // Leave the event queued for whoever reads the terminal after the TUI.
@@ -96,7 +109,7 @@ fn read_terminal(
             }
         };
         detection.observe(&mut filter, deadline);
-        let now = Instant::now();
+        let now = crate::clock::real_now();
         pending.extend(filter.flush_expired(now));
         // Windows consoles never bracket pastes: they arrive as raw key presses.
         if cfg!(windows) {

@@ -14,6 +14,7 @@ fn interactive_defaults() {
     let config = config_from(&["vibe-rs"]);
     assert_eq!(config.cwd.as_deref(), Some("/work"));
     assert_eq!(config.agent, None);
+    assert_eq!(config.approval_policy, None);
     assert!(!config.auto_approve);
     assert!(config.enabled_tools.is_empty());
     assert!(config.disabled_tools.is_empty());
@@ -34,10 +35,18 @@ fn interactive_yolo_without_agent_is_a_session_wide_bypass() {
 }
 
 #[test]
-fn interactive_smart_approve_selects_agent_when_no_explicit_agent() {
+fn interactive_smart_approve_selects_the_policy() {
     let config = config_from(&["vibe-rs", "--smart-approve"]);
-    assert_eq!(config.agent.as_deref(), Some("smart-approve"));
+    assert_eq!(config.agent, None);
+    assert_eq!(config.approval_policy.as_deref(), Some("smart-approve"));
     assert!(!config.auto_approve);
+}
+
+#[test]
+fn interactive_approval_policy_flag_is_sent_with_the_agent() {
+    let config = config_from(&["vibe-rs", "--agent", "lean", "--approval-policy", "ask"]);
+    assert_eq!(config.agent.as_deref(), Some("lean"));
+    assert_eq!(config.approval_policy.as_deref(), Some("ask"));
 }
 
 #[test]
@@ -64,4 +73,26 @@ fn interactive_add_dir_rejects_missing_paths() {
         .interactive_agent_config(None, None, None)
         .unwrap_err();
     assert!(error.to_string().contains("--add-dir"));
+}
+
+#[test]
+fn model_and_thinking_apply_to_the_new_session() {
+    let cli = Cli::parse_from(["vibe-rs", "--model", "devstral-small", "--thinking", "high"]);
+
+    let start = cli.start_model().unwrap();
+
+    assert_eq!(start.model.as_deref(), Some("devstral-small"));
+    assert_eq!(start.thinking.as_deref(), Some("high"));
+}
+
+#[test]
+fn model_with_a_resume_is_a_usage_error() {
+    for resume in [&["-c"][..], &["--resume"][..], &["--resume", "abc"][..]] {
+        let mut args = vec!["vibe-rs", "--model", "devstral-small"];
+        args.extend_from_slice(resume);
+
+        let err = Cli::parse_from(args).start_model().unwrap_err();
+
+        assert_eq!(err, "--model only applies to a new session");
+    }
 }

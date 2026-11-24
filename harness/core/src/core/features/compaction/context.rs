@@ -2,6 +2,7 @@ use super::transcript::{Item, OMITTED_LEVEL, ViewTexts, message_items, reduce};
 use super::{CompactionBudget, Prompts};
 use crate::core::config::{ImageCostRule, ImageDeliveryMode};
 use crate::core::error::CoreError;
+use crate::core::features::instructions::live_notes;
 use crate::core::model_input_budget::{APPROX_BYTES_PER_TOKEN, estimate_model_input_tokens};
 use crate::core::model_input_projection::is_image_content;
 use crate::core::step_protocol::ToolDefinition;
@@ -11,8 +12,8 @@ use crate::core::wire::message::{Message, StoredMessage};
 
 /// The tokens the carried user messages take at most, newest first.
 const USER_CARRY_TOKENS: usize = 20_000;
-/// The carry takes at most the room the system prompt, the tools and the
-/// preamble leave, divided by this.
+/// The carry takes at most the room the system prompt, the tools, the
+/// preamble and the live instructions leave, divided by this.
 const USER_CARRY_ROOM_SHARE: u64 = 4;
 /// The share of the room, in percent, a cut summary keeps.
 const TRUNCATED_SUMMARY_SHARE: u64 = 95;
@@ -72,7 +73,7 @@ fn prompt_history(messages: &[StoredMessage]) -> Result<&[StoredMessage], CoreEr
     if !prompt.is_injected()
         || !matches!(
             &prompt.message,
-            Message::User { content } if is_prompt_content(content)
+            Message::User { content, .. } if is_prompt_content(content)
         )
     {
         return Err(CoreError::invalid_command(
@@ -91,7 +92,7 @@ pub(super) fn prompt_extra_instructions(
     messages: &[StoredMessage],
 ) -> Result<Option<String>, CoreError> {
     prompt_history(messages)?;
-    let Some(Message::User { content }) = messages.last().map(|stored| &stored.message) else {
+    let Some(Message::User { content, .. }) = messages.last().map(|stored| &stored.message) else {
         return Err(CoreError::invariant(
             "compaction context is missing its prompt message",
         ));
@@ -241,15 +242,8 @@ pub(in crate::core) fn minimum_replacement_fits(
         return Ok(true);
     };
     let texts = RebuildTexts::new(prompts);
-    let (kept, carried) = rebuild_parts(canonical_messages, &generated_system, tools, budget)?;
-    let fitter = KeptFitter {
-        kept,
-        system_message: &generated_system,
-        carried: &carried,
-        tools,
-        budget,
-        texts: &texts,
-    };
+    let parts = rebuild_parts(canonical_messages, &generated_system, tools, budget)?;
+    let fitter = KeptFitter::new(&parts, &generated_system, tools, budget, &texts);
     let Some(cut) = fitter.cut_summary("x", token_threshold)? else {
         return Ok(false);
     };
@@ -304,6 +298,18 @@ pub(in crate::core) struct Reduction {
     pub reduced_messages: usize,
     /// The reduced view's level.
     pub view: &'static str,
+    /// A message of the current Turn, such as its input, its steering, or its own replies
+    /// and tool results, is shown only in the reduced view, not as a message of its own.
+    pub turn_message_reduced: bool,
+}
+
+/// Whether the reduced messages among `kept` include one of the current Turn's: a message
+/// with the newest Turn index among them. Earlier Turns' messages carry older indexes.
+fn reduces_turn_message(kept: &[StoredMessage], is_reduced: impl Fn(usize) -> bool) -> bool {
+    let current = kept.iter().filter_map(|stored| stored.turn_index).max();
+    kept.iter().enumerate().any(|(index, stored)| {
+        is_reduced(index) && (current.is_none() || stored.turn_index == current)
+    })
 }
 
 /// Why and how far the summary was cut: the `compaction_summary_cut_off`
@@ -335,13 +341,15 @@ impl SummaryCutCause {
     }
 }
 
-/// The rebuilt history: the system prompt, the most recent user messages
-/// before the last reply, the summary, then the last reply and everything
-/// after it as it was. The summary covers the history up to the reply only,
-/// so the reply's tool results and newer messages go back after it.
+/// The rebuilt history: the system prompt, the newest note of each live
+/// instructions key, the most recent user messages before the last reply,
+/// the summary, then the last reply and everything after it as it was,
+/// without instructions notes. The summary covers the history up to the
+/// reply only, so the reply's tool results and newer messages go back after
+/// it.
 ///
-/// The system prompt, the tools and the carried user messages are fixed
-/// parts. What does not fit under the threshold gives way in this order:
+/// The system prompt, the tools, the live instructions and the carried user
+/// messages are fixed parts. What does not fit under the threshold gives way in this order:
 /// 1. the messages after the summary: the whole exchange first (the reply
 ///    with its tool results), then the later messages, oldest first. They
 ///    come back as one reduced view in their place, at the first level of
@@ -360,15 +368,8 @@ fn fitted_replacement(
     budget: CompactionBudget,
     texts: &RebuildTexts,
 ) -> Result<Option<Rebuilt>, CoreError> {
-    let (kept, carried) = rebuild_parts(canonical_messages, &system_message, tools, budget)?;
-    let fitter = KeptFitter {
-        kept,
-        system_message: &system_message,
-        carried: &carried,
-        tools,
-        budget,
-        texts,
-    };
+    let parts = rebuild_parts(canonical_messages, &system_message, tools, budget)?;
+    let fitter = KeptFitter::new(&parts, &system_message, tools, budget, texts);
     let (text, cause) = match summary {
         Summary::Complete(text) => (text, SummaryCutCause::TooLong),
         Summary::CutOff(text) => (text, SummaryCutCause::CutOff),
@@ -385,8 +386,13 @@ fn fitted_replacement(
                 }),
             ),
         };
-        let mut messages = head(system_message.clone(), &carried, &summary_text);
-        messages.extend(kept.iter().cloned());
+        let mut messages = rebuilt_history_head(
+            system_message.clone(),
+            &parts.instructions,
+            &parts.carried,
+            &summary_text,
+        );
+        messages.extend(parts.kept.iter().cloned());
         return Ok(Some(Rebuilt {
             messages,
             summary: text.to_string(),
@@ -432,35 +438,57 @@ fn fitted_replacement(
     Ok(Some(Rebuilt {
         messages,
         summary: text.to_string(),
-        reduction: (!kept.is_empty()).then_some(Reduction {
-            reduced_messages: kept.len(),
+        reduction: (!parts.kept.is_empty()).then_some(Reduction {
+            reduced_messages: parts.kept.len(),
             view: OMITTED_LEVEL,
+            turn_message_reduced: reduces_turn_message(&parts.kept, |_| true),
         }),
         summary_cut,
     }))
 }
 
-/// The messages after the last reply, which the rebuild keeps after the
-/// summary, and the user messages it carries before the summary.
-fn rebuild_parts<'m>(
-    canonical_messages: &'m [StoredMessage],
+/// What a rebuild is made of besides the system prompt and the summary.
+struct RebuildParts {
+    /// The last reply and every message after it, without instructions
+    /// notes.
+    kept: Vec<StoredMessage>,
+    /// The user messages carried before the summary.
+    carried: Vec<StoredMessage>,
+    /// The newest note of each live instructions key, in the order keys were
+    /// last updated, carried right after the system prompt.
+    instructions: Vec<StoredMessage>,
+}
+
+fn rebuild_parts(
+    canonical_messages: &[StoredMessage],
     system_message: &StoredMessage,
     tools: &[ToolDefinition],
     budget: CompactionBudget,
-) -> Result<(&'m [StoredMessage], Vec<StoredMessage>), CoreError> {
-    let (summarized, kept) = split_at_last_reply(canonical_messages);
+) -> Result<RebuildParts, CoreError> {
+    let (summarized, tail) = split_at_last_reply(canonical_messages);
+    let instructions = live_notes(canonical_messages);
     let carried = collect_user_messages(
         summarized,
-        carry_tokens(system_message, tools, budget)?,
+        carry_tokens(system_message, &instructions, tools, budget)?,
         budget.image_delivery,
         budget.image_cost,
     )?;
-    Ok((kept, carried))
+    let kept = tail
+        .iter()
+        .filter(|stored| stored.instructions.is_none())
+        .cloned()
+        .collect();
+    Ok(RebuildParts {
+        kept,
+        carried,
+        instructions,
+    })
 }
 
 /// The tokens the carried user messages may take, newest first: at most
 /// [`USER_CARRY_TOKENS`], and at most [`USER_CARRY_ROOM_SHARE`] of the room
-/// the system prompt, the tools and the preamble leave. The carry is decided
+/// the system prompt, the tools, the preamble and the live instructions
+/// (`instructions`) leave. The carry is decided
 /// once, before the summary and the messages after it, and never gives way
 /// to them.
 ///
@@ -470,14 +498,16 @@ fn rebuild_parts<'m>(
 /// with it or is refused.
 fn carry_tokens(
     system_message: &StoredMessage,
+    instructions: &[StoredMessage],
     tools: &[ToolDefinition],
     budget: CompactionBudget,
 ) -> Result<usize, CoreError> {
     let Some(token_threshold) = budget.token_threshold else {
         return Ok(USER_CARRY_TOKENS);
     };
-    let preamble = head(system_message.clone(), &[], "");
-    let fixed = estimate(&preamble[..2], tools, budget)?;
+    let mut fixed_parts = rebuilt_history_head(system_message.clone(), instructions, &[], "");
+    fixed_parts.pop();
+    let fixed = estimate(&fixed_parts, tools, budget)?;
     let room = token_threshold.saturating_sub(fixed) / USER_CARRY_ROOM_SHARE;
     Ok(usize::try_from(room)
         .unwrap_or(usize::MAX)
@@ -493,17 +523,37 @@ fn noted(text: &str, note: &str) -> String {
 type Fitted = (Vec<StoredMessage>, Option<Reduction>);
 
 /// Fits the messages after the summary under the threshold, after the fixed
-/// parts: the system prompt, the tools and the carried user messages.
+/// parts: the system prompt, the tools, the carried user messages and the
+/// live instructions.
 struct KeptFitter<'a> {
     kept: &'a [StoredMessage],
     system_message: &'a StoredMessage,
     carried: &'a [StoredMessage],
+    instructions: &'a [StoredMessage],
     tools: &'a [ToolDefinition],
     budget: CompactionBudget,
     texts: &'a RebuildTexts<'a>,
 }
 
-impl KeptFitter<'_> {
+impl<'a> KeptFitter<'a> {
+    fn new(
+        parts: &'a RebuildParts,
+        system_message: &'a StoredMessage,
+        tools: &'a [ToolDefinition],
+        budget: CompactionBudget,
+        texts: &'a RebuildTexts<'a>,
+    ) -> Self {
+        Self {
+            kept: &parts.kept,
+            system_message,
+            carried: &parts.carried,
+            instructions: &parts.instructions,
+            tools,
+            budget,
+            texts,
+        }
+    }
+
     /// The rebuilt history with `summary` whole: the fewest dropped units
     /// after the summary whose reduced view fits, and what was reduced.
     /// `None` when even the omitted line does not fit beside the summary.
@@ -517,7 +567,12 @@ impl KeptFitter<'_> {
                 .copied()
                 .collect::<Vec<_>>();
             reduced.sort_unstable();
-            let mut messages = head(self.system_message.clone(), self.carried, summary);
+            let mut messages = rebuilt_history_head(
+                self.system_message.clone(),
+                self.instructions,
+                self.carried,
+                summary,
+            );
             let view_index = messages.len();
             messages.extend(
                 (0..kept.len())
@@ -558,6 +613,9 @@ impl KeptFitter<'_> {
                     Some(Reduction {
                         reduced_messages: reduced.len(),
                         view: view.level(),
+                        turn_message_reduced: reduces_turn_message(kept, |index| {
+                            reduced.binary_search(&index).is_ok()
+                        }),
                     }),
                 )));
             }
@@ -598,7 +656,12 @@ impl KeptFitter<'_> {
     /// The fixed parts, `summary` and, when messages follow the last reply,
     /// the omitted line in their place.
     fn minimal(&self, summary: &str) -> Vec<StoredMessage> {
-        let mut messages = head(self.system_message.clone(), self.carried, summary);
+        let mut messages = rebuilt_history_head(
+            self.system_message.clone(),
+            self.instructions,
+            self.carried,
+            summary,
+        );
         if !self.kept.is_empty() {
             messages.push(view_message(self.texts.view.omitted));
         }
@@ -672,17 +735,20 @@ pub(super) fn cut_at_line_end(text: &str, max_bytes: usize) -> &str {
     }
 }
 
-/// The system prompt, the carried user messages and the summary: the parts
-/// every rebuilt history starts with.
-fn head(
+/// The system prompt, the live instructions, the carried user messages and
+/// the summary: the parts every rebuilt history starts with. The live
+/// instructions are standing instructions, so they go with the system prompt.
+fn rebuilt_history_head(
     system_message: StoredMessage,
+    instructions: &[StoredMessage],
     carried: &[StoredMessage],
     summary: &str,
 ) -> Vec<StoredMessage> {
-    let mut messages = vec![
-        system_message,
-        StoredMessage::injected(Message::user_text(PREVIOUS_USER_MESSAGES_PREAMBLE)),
-    ];
+    let mut messages = vec![system_message];
+    messages.extend(instructions.iter().cloned());
+    messages.push(StoredMessage::injected(Message::user_text(
+        PREVIOUS_USER_MESSAGES_PREAMBLE,
+    )));
     messages.extend(carried.iter().cloned());
     messages.push(StoredMessage::injected(Message::user_text(format!(
             "{PREVIOUS_USER_MESSAGES_CLOSE}\n\nHere is a summary of what has happened so far:\n\n{COMPACTION_SUMMARY_OPEN}\n{summary}\n{COMPACTION_SUMMARY_CLOSE}"
@@ -844,7 +910,7 @@ fn estimate_user_message_tokens(
 }
 
 fn truncate_text_user_message(message: &Message, max_tokens: usize) -> Option<Message> {
-    let Message::User { content } = message else {
+    let Message::User { content, .. } = message else {
         return None;
     };
     let text = content
@@ -1010,11 +1076,11 @@ fn longest_fitting_cut(
 }
 
 fn holds_image(message: &Message) -> bool {
-    matches!(message, Message::User { content } if content.iter().any(is_image_content))
+    matches!(message, Message::User { content, .. } if content.iter().any(is_image_content))
 }
 
 fn text_user_message(message: &Message) -> Option<String> {
-    let Message::User { content } = message else {
+    let Message::User { content, .. } = message else {
         return None;
     };
     content

@@ -157,7 +157,7 @@ fn config_reload_that_flips_voice_mode_records_the_toggle() {
 }
 
 #[tokio::test]
-async fn stop_session_sends_queued_events_before_session_stop() {
+async fn stop_session_sends_queued_events_and_marks_the_session_seen_before_session_stop() {
     let (app, mut rx) = app_with_telemetry();
     telemetry::slash_command_used(&app, "/exit", "builtin");
     telemetry::user_cancelled_action(&app, "interrupt_agent");
@@ -182,6 +182,7 @@ async fn stop_session_sends_queued_events_before_session_stop() {
                 json!("telemetry/record"),
                 json!(event::USER_CANCELLED_ACTION)
             ),
+            (json!("session/markAsSeen"), Value::Null),
             (json!("session/stop"), Value::Null),
         ]
     );
@@ -271,4 +272,25 @@ async fn approving_records_nothing() {
     approval::handle_key(&mut app, &stub(), key(KeyCode::Char('y')));
     assert!(answers.recv().await.is_some(), "y sends the approval");
     assert!(drained(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn raw_command_records_a_toggle_only_when_the_mode_changes() {
+    let (mut app, mut rx) = app_with_telemetry();
+    app.session.status = Status::Ready;
+    let (config_tx, _config_rx) = mpsc::channel(1);
+    let mut toggles = |app: &mut App, input: &str| {
+        app.chat_input.load_full_text(input.to_owned());
+        vibe_rs::commands::submission::submit(app, &stub(), &config_tx);
+        drained(&mut rx)
+            .into_iter()
+            .filter(|event| event.name == event::RAW_MODE_TOGGLED)
+            .map(|event| event.properties["enabled"].clone())
+            .collect::<Vec<Value>>()
+    };
+
+    assert_eq!(toggles(&mut app, "/raw on"), [json!(true)]);
+    assert!(toggles(&mut app, "/raw on").is_empty(), "already on");
+    assert_eq!(toggles(&mut app, "/raw"), [json!(false)]);
+    assert!(toggles(&mut app, "/raw maybe").is_empty(), "usage error");
 }

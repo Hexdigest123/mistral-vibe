@@ -1,6 +1,5 @@
 //! `/leanstall` and `/unleanstall`: wire types, short-circuits, round-trips, and input gating.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +12,8 @@ use vibe_rs::commands::{submission, CommandEvent};
 use vibe_rs::config;
 use vibe_rs::server::request_error::describe;
 use vibe_rs::server::{
-    AgentSummary, AgentType, AgentsListResponse, Client, RequestFailure, RpcError,
+    AgentSummary, AgentType, AgentsListResponse, ApprovalPolicySummary, Client, RequestFailure,
+    RpcError,
 };
 
 use crate::support::{messages, stub};
@@ -48,6 +48,14 @@ fn agents_list_response_reads_the_active_agent_and_the_list() {
     assert_eq!(response.agents, vec![agent("default"), agent("lean")]);
 }
 
+fn policy(name: &str) -> ApprovalPolicySummary {
+    ApprovalPolicySummary {
+        name: name.to_owned(),
+        display_name: name.to_owned(),
+        ..ApprovalPolicySummary::default()
+    }
+}
+
 fn app_with(agents: &[&str]) -> App {
     let mut app = App::default();
     app.session.session_id = Some("session".to_owned());
@@ -60,10 +68,6 @@ fn row(role: &str, text: &str) -> Vec<(String, String)> {
     vec![(role.to_owned(), text.to_owned())]
 }
 
-fn pending_commits(app: &App) -> u32 {
-    app.pending_commits.load(Ordering::Relaxed)
-}
-
 #[test]
 fn install_when_lean_is_present_answers_locally() {
     let mut app = app_with(&["default", "lean"]);
@@ -72,8 +76,7 @@ fn install_when_lean_is_present_answers_locally() {
         messages(&app),
         row("command_status", "Lean agent is already installed.")
     );
-    assert_eq!(pending_commits(&app), 0, "no request is started");
-    assert!(!app.agents.installing);
+    assert!(!app.agents.installing, "no request is started");
 }
 
 #[test]
@@ -84,8 +87,7 @@ fn uninstall_when_lean_is_absent_answers_locally() {
         messages(&app),
         row("command_status", "Lean agent is not installed.")
     );
-    assert_eq!(pending_commits(&app), 0, "no request is started");
-    assert!(!app.agents.installing);
+    assert!(!app.agents.installing, "no request is started");
 }
 
 #[tokio::test]
@@ -122,7 +124,6 @@ async fn install_and_uninstall_round_trip_their_method_for_lean() {
             event.result.is_err(),
             "the stub's null is not an agent list"
         );
-        assert_eq!(pending_commits(&app), 1, "the reducer releases the commit");
         leanstall::apply_event(&mut app, *event);
         assert!(!app.agents.installing);
         assert_eq!(app.agents.all.len(), present.len());
@@ -162,8 +163,7 @@ fn replay_after_startup_switch(command: &str) -> App {
 #[tokio::test]
 async fn a_deferred_leanstall_does_not_race_the_startup_switch() {
     let app = replay_after_startup_switch("/leanstall");
-    assert!(!app.agents.installing);
-    assert_eq!(pending_commits(&app), 0, "no request is started");
+    assert!(!app.agents.installing, "no request is started");
     assert_eq!(
         messages(&app).last(),
         Some(&("command_error".to_owned(), leanstall::SWITCHING.to_owned()))
@@ -210,8 +210,9 @@ fn an_answer_replaces_the_agents_and_reports_its_direction() {
     ] {
         let mut app = app_with(&["default"]);
         let response = AgentsListResponse {
-            active: agent("ask"),
-            agents: vec![agent("ask"), agent("lean")],
+            active: agent("lean"),
+            agents: vec![agent("default"), agent("lean")],
+            ..AgentsListResponse::default()
         };
         leanstall::apply_event(
             &mut app,
@@ -242,20 +243,25 @@ fn a_failure_shows_the_bare_server_message_and_keeps_the_agents() {
 }
 
 #[test]
-fn a_refused_switch_is_dropped_only_when_the_install_moves_the_running_agent() {
-    for (active, refused) in [("default", Some("lean")), ("lean", None)] {
+fn a_refused_switch_is_dropped_only_when_the_install_moves_the_running_policy() {
+    for (active, refused) in [("ask", Some("auto-approve")), ("accept-edits", None)] {
         let mut app = app_with(&["default", "lean"]);
-        app.agents.refused = Some("lean".to_owned());
+        app.agents.active_policy = policy("ask");
+        app.agents.refused = Some("auto-approve".to_owned());
         leanstall::apply_event(
             &mut app,
             Event {
                 installed: true,
                 result: Ok(AgentsListResponse {
-                    active: agent(active),
+                    active: agent("default"),
                     agents: vec![agent("default"), agent("lean")],
+                    active_approval_policy: Some(policy(active)),
+                    approval_policies: Some(vec![policy("ask"), policy("accept-edits")]),
                 }),
             },
         );
         assert_eq!(app.agents.refused.as_deref(), refused, "{active} runs");
+        assert_eq!(app.agents.active_policy.name, active);
+        assert_eq!(app.agents.policies.len(), 2);
     }
 }

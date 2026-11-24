@@ -18,6 +18,13 @@ pub struct PublicTurn {
     pub status: Option<String>,
     pub queue_item_id: Option<String>,
     pub stop_reason: Option<String>,
+    /// Why a hook ended the turn without an answer (`pre_agent`, `pre_llm`).
+    pub skip_reason: Option<String>,
+    /// Why a hook rejected the turn's answer (strict `post_llm`).
+    pub reject_reason: Option<String>,
+    pub budget_stop_reason: Option<String>,
+    /// The text of the answer that ended the turn, never a draft a hook sent back.
+    pub final_answer: Option<String>,
     #[serde(deserialize_with = "crate::utils::json::null_default")]
     pub error: TurnError,
 }
@@ -45,6 +52,18 @@ impl PublicTurn {
 
     pub fn error_message(&self) -> Option<&str> {
         self.error.message.as_deref()
+    }
+
+    /// The answer a hook gave in place of the model's: its skip or reject reason.
+    pub fn hook_answer(&self) -> Option<&str> {
+        self.skip_reason
+            .as_deref()
+            .or(self.reject_reason.as_deref())
+    }
+
+    /// The turn's answer for a headless run: its final answer, else a hook's reason.
+    pub fn answer(&self) -> Option<&str> {
+        self.final_answer.as_deref().or(self.hook_answer())
     }
 
     /// The error code of a failed turn.

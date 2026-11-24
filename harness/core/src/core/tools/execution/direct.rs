@@ -32,7 +32,7 @@ pub(crate) fn direct_tool_execution_from_resolved_tools(
     let hook_binding_ids =
         tools.hook_binding_ids(HookPoint::PreToolCall, Some(&external_call.hook_tool_key()));
     Ok(if hook_binding_ids.is_empty() {
-        PendingExternalCall::pending(external_call)
+        PendingExternalCall::pending(external_call, Some(determinism.time_unix_ms))
     } else {
         PendingExternalCall::awaiting_pre_hook(external_call, hook_binding_ids)
     })
@@ -241,6 +241,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 output_schema: None,
                 exposure: ProvidedToolExposure::Programmatic,
+                direct_name: None,
             }],
         });
         let state = advance(

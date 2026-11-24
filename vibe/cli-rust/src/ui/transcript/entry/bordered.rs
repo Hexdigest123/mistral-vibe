@@ -11,6 +11,8 @@ use crate::utils::text;
 
 /// Columns a tool border occupies: the glyph under its toggle arrow, then one pad.
 pub(super) const BORDER_WIDTH: u16 = 2;
+/// Columns the inset closing border of a notice or interrupt occupies.
+pub(super) const INSET_WIDTH: u16 = 4;
 /// Columns the result container keeps free on the right.
 const RESULT_MARGIN: u16 = 2;
 
@@ -21,14 +23,14 @@ pub(super) fn body_width(width: u16) -> u16 {
         .saturating_sub(RESULT_MARGIN)
 }
 
-/// The tool border opening one row; `⎣` closes the run, as `ExpandingBorder` does.
+/// The tool border opening one row; `└` closes the run.
 pub(super) fn prefix(last: bool, style: Style) -> Span<'static> {
-    Span::styled(if last { "⎣ " } else { "⎢ " }, style)
+    Span::styled(if last { "└ " } else { "│ " }, style)
 }
 
 /// The closing border of a notice or interrupt, two cells in.
 pub(super) fn inset_prefix(style: Style) -> Span<'static> {
-    Span::styled("  ⎣ ", style)
+    Span::styled("  └ ", style)
 }
 
 pub(super) fn push_group_header(
@@ -52,7 +54,7 @@ pub(super) fn push_group_header(
         Span::styled(format!("{marker} "), marker_style),
         // One row, so hit-testing and cached heights never depend on the label.
         Span::styled(
-            text::ellipsize(&group.label(running), usize::from(width).saturating_sub(2)),
+            text::ellipsize(&group.label(), usize::from(width).saturating_sub(2)),
             label_style,
         ),
     ]));

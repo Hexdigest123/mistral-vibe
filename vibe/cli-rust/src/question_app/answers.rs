@@ -12,7 +12,7 @@ use super::{
     is_within_grace_period, other_option_idx, other_text, show_pending, switch_question,
     QuestionSource,
 };
-use crate::app::{App, ToastSeverity};
+use crate::app::App;
 
 /// The server's reply to a question's `callback/result`; `retry` reopens a rejected answer.
 pub struct Event {
@@ -240,10 +240,6 @@ fn respond(app: &mut App, client: &Arc<Client>, result: UserQuestionResult) {
     show_pending(app);
     let address = match source {
         Some(QuestionSource::Callback(address)) => address,
-        Some(QuestionSource::TeleportPush) => {
-            settle_loading(app);
-            return crate::teleport::answer_push(app, client, &result);
-        }
         None => return settle_loading(app),
     };
     let retry = (!result.cancelled).then(|| (address.clone(), request));
@@ -268,11 +264,7 @@ pub fn apply_event(app: &mut App, event: Event) {
         return settle_loading(app);
     };
     tracing::warn!(error, "failed to answer user_input callback");
-    app.show_toast(
-        format!("Failed to answer question: {error}"),
-        ToastSeverity::Warning,
-        crate::approval::RESPONSE_ERROR_TOAST_SECS,
-    );
+    crate::notices::failed(app, &format!("Failed to answer question: {error}"));
     let Some((address, request)) = event.retry else {
         return settle_loading(app);
     };

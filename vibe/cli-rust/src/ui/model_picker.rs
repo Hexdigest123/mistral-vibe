@@ -25,7 +25,13 @@ const CHROME_ROWS: u16 = 7;
 /// Draw the whole screen with the picker replacing the input box; the chat
 /// shrinks to make room for the bottom-app.
 pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
-    let height = box_height(app, area.height);
+    // The box grows one row when the footer hints wrap, so the last hint stays visible.
+    let footer = crate::search_field::hints(
+        app.model_picker.search.focused,
+        !app.model_picker.search.query.is_empty(),
+        HINTS,
+    );
+    let height = box_height(app, area.height) + hint_line::extra(&footer, area.width);
     let kind = super::bottom_app::Kind::Model;
     super::bottom_app::draw(app, f, area, height, kind, draw_box);
 }
@@ -59,19 +65,30 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
     let w = area.width;
     let h = area.height;
 
-    f.buffer_mut().set_string(
+    let (title_end, _) = f.buffer_mut().set_stringn(
         bx + 2,
         by + 1,
         "Select Model",
+        w.saturating_sub(4) as usize,
         Style::default()
             .fg(theme::primary())
             .bg(theme::background())
             .add_modifier(Modifier::BOLD),
     );
+    if app.model_picker.checks_in_flight > 0 {
+        let style = theme::muted_style().bg(theme::background());
+        let room = (bx + w).saturating_sub(title_end + 2) as usize;
+        let label = format!("  · {}", crate::model_picker::CHECKING_LABEL);
+        f.buffer_mut()
+            .set_stringn(title_end, by + 1, label, room, style);
+    }
 
     draw_search(app, f, Rect::new(bx + 3, by + 2, w.saturating_sub(6), 1));
 
-    let visible = h.saturating_sub(CHROME_ROWS) as usize;
+    let search = &app.model_picker.search;
+    let footer = crate::search_field::hints(search.focused, !search.query.is_empty(), HINTS);
+    let chrome = CHROME_ROWS + hint_line::extra(&footer, w);
+    let visible = h.saturating_sub(chrome) as usize;
     let top = by + 4;
     let total = option_count(app);
     let list_area = Rect::new(bx + 1, top, w.saturating_sub(2), visible as u16);
@@ -122,7 +139,7 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect) {
 
     let search = &app.model_picker.search;
     let help = crate::search_field::hints(search.focused, !search.query.is_empty(), HINTS);
-    hint_line::draw(f, bx + 2, by + h - 2, &help);
+    hint_line::draw_above(f, bx + 2, by + h - 2, w.saturating_sub(4), &help);
 }
 
 /// The search row under the title; the field owns its clicks.

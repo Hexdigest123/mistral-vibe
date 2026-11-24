@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import Protocol, runtime_checkable
 
+from pydantic import JsonValue
+
 from vibe.app_server._account import AccountGateway
 from vibe.app_server._identity import IdentityGateway
 from vibe.app_server._model import ProtocolModel
@@ -14,8 +16,14 @@ from vibe.app_server.protocol import (
     SessionPeerArchiveResponse,
     SessionPeerListParams,
     SessionPeerListResponse,
+    SessionPeerMarkSeenParams,
+    SessionPeerMarkSeenResponse,
     SessionPeerReadParams,
     SessionPeerReadResponse,
+    SessionPeerRenameParams,
+    SessionPeerRenameResponse,
+    SessionPeerRestoreParams,
+    SessionPeerRestoreResponse,
     SessionPeerSendParams,
     SessionPeerSendResponse,
     SessionSpawnParams,
@@ -60,6 +68,25 @@ class SessionBackendServices(Protocol):
     async def archive_peer_sessions(
         self, params: SessionPeerArchiveParams
     ) -> SessionPeerArchiveResponse: ...
+
+    async def restore_peer_sessions(
+        self, params: SessionPeerRestoreParams
+    ) -> SessionPeerRestoreResponse: ...
+
+    async def rename_peer_session(
+        self, params: SessionPeerRenameParams
+    ) -> SessionPeerRenameResponse: ...
+
+    async def mark_peer_sessions_seen(
+        self, params: SessionPeerMarkSeenParams
+    ) -> SessionPeerMarkSeenResponse: ...
+
+
+@runtime_checkable
+class SessionBackendClientOwner(Protocol):
+    """Optional owner of the connection: its entrypoint and reported account."""
+
+    def client_owner(self) -> JsonValue: ...
 
 
 @runtime_checkable

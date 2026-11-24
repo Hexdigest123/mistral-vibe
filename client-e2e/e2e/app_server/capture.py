@@ -14,10 +14,10 @@ import subprocess
 import tempfile
 
 from e2e.app_server.config import (
-    BATCH_KEYS,
+    ACK_PREFIX,
     CLIENT_BIN,
     COLUMNS,
-    IDLE_MARKER,
+    FENCE_KEY,
     MINIMAL_HOME_CONFIG,
     REPLAY_BIN,
     REPLAY_NOW_MS,
@@ -32,7 +32,15 @@ from e2e.pty.screen import Snapshot
 # The client probes the terminal background (OSC 11) and falls back to the OS
 # appearance, so a scenario that renders before the config lands would follow
 # the host. Answer dark by default; a scenario overrides it by query string.
-_DEFAULT_TERMINAL_RESPONSES = {"\x1b]11;?\x07": "\x1b]11;rgb:0000/0000/0000\x1b\\"}
+# The startup probe (terminal_probe) reads until the Device Attributes (DA1)
+# reply, which every terminal sends; unanswered, each launch waits out the
+# 500 ms tty_query timeout. Answer as a VT220 with color and leave the probe's
+# other queries (palette, pixel reports, XTVERSION) unanswered, as a terminal
+# without those features would.
+_DEFAULT_TERMINAL_RESPONSES = {
+    "\x1b]11;?\x07": "\x1b]11;rgb:0000/0000/0000\x1b\\",
+    "\x1b[c": "\x1b[?62;22c",
+}
 
 # setup/* is per-scenario: every interactive run sends a pre-session
 # setup/status (the base fixture's hasApiKey:true keeps the wizard closed),
@@ -45,11 +53,14 @@ _COMPARED_METHODS = frozenset({
     "connector_catalog/toggle",
     "feedback/record",
     "feedback/shouldShow",
+    "goal/clear",
+    "goal/set",
     "mcp_catalog/add",
     "mcp_catalog/login",
     "mcp_catalog/logout",
     "mcp_catalog/toggle",
     "session/agent/update",
+    "session/approvalPolicy/update",
     "session/compact",
     "session/shellCommand",
     "session/turn/enqueue",
@@ -80,6 +91,9 @@ class Capture:
     snapshots: list[Snapshot]
     actions: list[Action]
     requests: list[Request]
+    final: Snapshot
+    """The last settled frame, which screen and clipboard expectations check."""
+    titles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,6 +103,8 @@ class HeadlessCapture:
     stderr: str
     returncode: int
     requests: list[Request]
+    stdout_text: str = ""
+    """Raw stdout, for a text run that prints only once the turn completes."""
 
 
 def capture_scenario(scenario: Scenario, launch: Launcher = exec_launch) -> Capture:
@@ -108,10 +124,11 @@ def capture_scenario(scenario: Scenario, launch: Launcher = exec_launch) -> Capt
             env=env,
             rows=ROWS,
             columns=COLUMNS,
-            idle_marker=IDLE_MARKER,
+            ack_prefix=ACK_PREFIX,
+            fence_key=FENCE_KEY,
             steps=tuple(step.text for step in scenario.steps),
             resizes=tuple(step.resize for step in scenario.steps),
-            batch_keys=None if scenario.settle_per_key else BATCH_KEYS,
+            settle_per_key=scenario.settle_per_key,
             exit_after_last_step=scenario.exit_after_last_step,
             terminal_responses=tuple(
                 (query.encode(), response.encode())
@@ -124,21 +141,24 @@ def capture_scenario(scenario: Scenario, launch: Launcher = exec_launch) -> Capt
                 (trigger.encode(), reply.encode())
                 for trigger, reply in scenario.exit_responses.items()
             ),
+            typeahead=scenario.typeahead,
         )
         try:
-            snapshots = capture(
+            frames = capture(
                 spec,
                 releases=tuple(step.release for step in scenario.steps),
                 releases_after=tuple(step.release_after for step in scenario.steps),
-                capture_startup=scenario.capture_startup,
-                capture_steps=scenario.capture_steps,
+                startup_label=scenario.startup_snapshot,
+                step_labels=tuple(step.snapshot for step in scenario.steps),
                 step_fd=step_fd,
                 launch=launch,
             )
             return Capture(
-                snapshots,
+                frames.snapshots,
                 _read_actions(action_log),
                 _read_requests(request_log, scenario.request_methods),
+                frames.final,
+                frames.titles,
             )
         finally:
             if step_fd is not None:
@@ -157,11 +177,29 @@ def _headless_events(scenario: Scenario) -> list[AppServerEvent]:
     events = batches[0]
     if events[-1].get("method") != "turn/completed":
         raise ValueError("headless scenario must end with turn/completed")
+    if (scenario.headless_stdout is None) == (not scenario.stdout_before_completion):
+        raise ValueError(
+            "headless scenario needs exactly one of stdout_before_completion (JSONL)"
+            " or headless_stdout (text)"
+        )
     return events
 
 
+def _text_capture(process: subprocess.Popen[str], request_log: Path) -> HeadlessCapture:
+    """Capture a text run's whole stdout once it exits."""
+    stdout_text, stderr = process.communicate(timeout=10)
+    return HeadlessCapture(
+        stdout_before_completion=[],
+        stdout=[],
+        stderr=stderr,
+        returncode=process.returncode,
+        requests=_read_logged_requests(request_log),
+        stdout_text=stdout_text,
+    )
+
+
 def capture_headless_scenario(scenario: Scenario) -> HeadlessCapture:
-    """Capture JSONL before releasing the scenario's final `turn/completed`."""
+    """Capture JSONL before releasing the final `turn/completed`, or all stdout without any."""
     events = _headless_events(scenario)
 
     with _isolated_home() as home, replay_fixture(scenario) as fixture:
@@ -180,6 +218,9 @@ def capture_headless_scenario(scenario: Scenario) -> HeadlessCapture:
             text=True,
         )
         try:
+            if scenario.headless_stdout is not None:
+                os.write(step_fd, b"\0" * len(events))
+                return _text_capture(process, request_log)
             os.write(step_fd, b"\0" * (len(events) - 1))
             if process.stdout is None:
                 raise RuntimeError("headless client stdout is unavailable")
@@ -244,6 +285,9 @@ def _environment(
     environment = os.environ.copy()
     # The pin is server-owned (clients learn it via setup/status); a host-set value would leak into goldens.
     environment.pop("VIBE_CUSTOM_CONSOLE_URL", None)
+    # A host tmux would receive copies through `tmux load-buffer` instead of the PTY.
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
     environment.update({
         "TERM": "xterm-256color",
         # Pin truecolor so the host's COLORTERM never decides the rendered colors.

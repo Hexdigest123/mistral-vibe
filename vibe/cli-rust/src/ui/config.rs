@@ -4,9 +4,10 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use super::notice::Notice;
 use super::{config_edit, config_options, list_cursor, scrollbar, theme};
 use crate::app::App;
 use crate::config::{self, ConfigField};
@@ -76,7 +77,6 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
         .border_style(primary)
         .title(title);
     f.render_widget(block, box_area);
@@ -85,10 +85,21 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     let cy = by + 2; // border + padding-top 1
 
     draw_search(app, f, Rect::new(cx, cy, w - 6, 1));
-    draw_options(app, f, bx, cy + 2, w, by + h - 2);
     let search = &app.config_screen.search;
     let help = search_field::hints(search.focused, !search.query.is_empty(), HELP);
-    super::hint_line::draw_clipped(f, cx, by + h - 2, w - 6, &help);
+    let footer = match app.config_screen.status {
+        Some(_) => 1,
+        None => super::hint_line::height(&help, w - 6),
+    };
+    let footer_y = (by + h - 1).saturating_sub(footer);
+    draw_options(app, f, bx, cy + 2, w, footer_y);
+    match &mut app.config_screen.status {
+        Some(status) => {
+            let covered = app.config_screen.edit.is_some();
+            draw_status(f, Rect::new(cx, by + h - 2, w - 6, 1), status, covered)
+        }
+        None => super::hint_line::draw(f, Rect::new(cx, footer_y, w - 6, footer), &help),
+    }
     config_edit::draw(app, f, area);
 }
 
@@ -181,6 +192,17 @@ fn draw_options(app: &mut App, f: &mut Frame, bx: u16, top: u16, w: u16, help_y:
             offset as u16,
         );
     }
+}
+
+/// A failure or refusal in place of the key hints, in the inline notice's color.
+fn draw_status(f: &mut Frame, area: Rect, status: &mut Notice, covered: bool) {
+    // The nested edit dialog may cover this row: wait until it closes to count it seen.
+    if !covered {
+        status.mark_shown();
+    }
+    let style = super::notice::style(status.severity).bg(theme::surface());
+    let message = crate::utils::text::ellipsize(&status.text, usize::from(area.width));
+    f.buffer_mut().set_string(area.x, area.y, message, style);
 }
 
 /// A centered section rule with the dim dashes and a brighter bold label.

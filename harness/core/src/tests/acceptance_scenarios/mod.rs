@@ -15,12 +15,17 @@ mod hooks;
 mod image_input;
 mod large_output;
 mod model_wait;
+mod output_type;
 mod permissions;
+mod post_tool_results;
 mod program_timing;
+mod read_file_images;
 mod recovery;
+mod repeated_tool_failure;
 mod runtime_driver;
 mod steering;
 mod tool_argument_validation;
+mod tool_duration;
 mod turn_lifecycle;
 
 use runtime_driver::*;
@@ -52,7 +57,7 @@ fn tool_call_completion(action_id: &str, calls: Vec<Value>) -> Value {
         "result": {
             "parts": calls,
             "finish_reason": "tool_call",
-            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+            "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         },
     })
 }
@@ -189,7 +194,7 @@ fn text_candidate(text: &str) -> Value {
             "content": [{"type": "text", "text": text}],
         },
         "finish_reason": "stop",
-        "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+        "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
     })
 }
 
@@ -215,7 +220,7 @@ fn tool_calls_candidate(calls: &[Value]) -> Value {
     json!({
         "message": {"role": "assistant", "content": content},
         "finish_reason": "tool_call",
-        "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
+        "usage": {"input_tokens": 0, "output_tokens": 20, "total_tokens": 20, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
     })
 }
 
@@ -226,6 +231,23 @@ fn assistant_tool_calls_committed(turn_id: &str, action: &Value, calls: &[Value]
         "action_id": action_id(action),
         "candidate": tool_calls_candidate(calls),
     })
+}
+
+fn assistant_program_committed(
+    turn_id: &str,
+    action: &Value,
+    call_id: &str,
+    source: &str,
+) -> Value {
+    assistant_tool_calls_committed(
+        turn_id,
+        action,
+        &[tool_call(
+            call_id,
+            "run_typescript",
+            json!({"code": source}),
+        )],
+    )
 }
 
 fn tool_result_committed(turn_id: &str, action: &Value, result: Value) -> Value {
@@ -244,6 +266,16 @@ fn tool_execution_started(turn_id: &str, call_id: &str) -> Value {
         "type": "tool_execution_started",
         "turn_id": turn_id,
         "call_id": call_id,
+    })
+}
+
+/// A model tool call that Core runs itself (`run_typescript`, `search_tool_functions`).
+fn core_tool_execution_started(turn_id: &str, call_id: &str) -> Value {
+    json!({
+        "type": "tool_execution_started",
+        "turn_id": turn_id,
+        "call_id": call_id,
+        "executed_by_core": true,
     })
 }
 
@@ -300,6 +332,15 @@ fn turn_completed_at_iteration_limit(turn_id: &str, output: Vec<Value>) -> Value
     })
 }
 
+fn turn_completed_at_output_limit(turn_id: &str, text: &str) -> Value {
+    json!({
+        "type": "turn_completed",
+        "turn_id": turn_id,
+        "output": [{"type": "text", "text": text}],
+        "stop_reason": "output_limit",
+    })
+}
+
 fn turn_completed_skipped(turn_id: &str, reason: Vec<Value>) -> Value {
     json!({
         "type": "turn_completed",
@@ -313,6 +354,14 @@ fn model_user_text(text: &str) -> Value {
     json!({
         "role": "user",
         "content": [{"type": "text", "text": text}],
+    })
+}
+
+fn model_context_text(text: &str) -> Value {
+    json!({
+        "role": "user",
+        "content": [{"type": "text", "text": text}],
+        "context": true,
     })
 }
 

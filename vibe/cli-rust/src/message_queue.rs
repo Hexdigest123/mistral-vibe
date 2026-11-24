@@ -30,6 +30,7 @@ pub use steering::{
 };
 
 use crate::app::App;
+use crate::clock::UiInstant;
 use crate::server::ImageAttachment;
 
 /// A prompt the server accepted and has not promoted to a turn yet.
@@ -78,12 +79,12 @@ pub struct QueueController {
     pub(crate) steering: Option<String>,
     /// Retry the requested steer after the latest queue contents are accepted.
     pub(crate) steer_after_replace: bool,
-    /// One prompt submitted while a queue mutation is in flight.
-    pub(crate) deferred_prompt: Option<String>,
+    /// One prompt submitted while a queue mutation is in flight, and whether the queue was held then.
+    pub(crate) deferred_prompt: Option<(String, bool)>,
     /// Whether the server holds the queue until the user resumes it.
     pub paused: bool,
     /// When the user interrupted a turn the server had not started yet.
-    pub interrupt_on_start: Option<std::time::Instant>,
+    pub interrupt_on_start: Option<UiInstant>,
     /// Highlighted prompt in queue mode, by message id, or `None` when closed.
     pub selected: Option<String>,
     /// Whether Enter loaded the highlighted prompt into the input for editing.
@@ -112,6 +113,11 @@ impl QueueController {
 
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// Whether the queue header offers the paused-queue shortcuts: queue mode rebinds Enter and Up.
+    pub fn header_shortcuts(&self) -> bool {
+        self.paused && self.selected.is_none()
     }
 
     pub(crate) fn promotion_pending(&self, queue_item_id: &str) -> bool {

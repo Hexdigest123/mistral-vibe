@@ -13,11 +13,30 @@ from typing import BinaryIO, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from mistralai_vibe_local_harness.vibe._paths import PRIVATE_DIRECTORY_MODE
+
 SEGMENT_BYTES = 8 * 1024 * 1024
 RETAINED_SEGMENTS = 8
 MAX_CURSOR = 9_007_199_254_740_991
 MAX_PAGE_BYTES = 64_000
 _SEGMENT_NAME_WIDTH = 20
+
+_written_bytes = 0
+_written_bytes_lock = threading.Lock()
+
+
+def written_output_bytes() -> int:
+    """Monotonic: pruning never lowers it, so the difference between two readings
+    bounds how much this process grew output storage in between.
+    """
+    with _written_bytes_lock:
+        return _written_bytes
+
+
+def _count_written(size: int) -> None:
+    global _written_bytes
+    with _written_bytes_lock:
+        _written_bytes += size
 
 
 class OutputUnavailableError(Exception):
@@ -97,10 +116,12 @@ class ProcessOutputStore:
     ) -> ProcessOutputStore:
         process_root = session_root / "processes" / process_id
         _require_safe_process_path(session_root, process_root, process_id)
-        process_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        process_root.mkdir(mode=0o700)
+        process_root.parent.mkdir(
+            mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True
+        )
+        process_root.mkdir(mode=PRIVATE_DIRECTORY_MODE)
         segments_root = process_root / "segments"
-        segments_root.mkdir(mode=0o700)
+        segments_root.mkdir(mode=PRIVATE_DIRECTORY_MODE)
         state = ProcessOutputStateV1(
             process_id=process_id,
             output_start_cursor=0,
@@ -147,8 +168,10 @@ class ProcessOutputStore:
     ) -> ProcessOutputStore:
         process_root = session_root / "processes" / process_id
         _require_safe_process_path(session_root, process_root, process_id)
-        process_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        process_root.mkdir(mode=0o700, exist_ok=True)
+        process_root.parent.mkdir(
+            mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True
+        )
+        process_root.mkdir(mode=PRIVATE_DIRECTORY_MODE, exist_ok=True)
         _require_real_directory(process_root)
         try:
             end = _read_state(
@@ -234,6 +257,7 @@ class ProcessOutputStore:
                     if not count:
                         raise OSError("process output segment write made no progress")
                     written += count
+                _count_written(written)
                 writer.flush()
                 end = self._state.output_end_cursor + len(chunk)
                 self._state = self._state.model_copy(update={"output_end_cursor": end})
@@ -508,6 +532,7 @@ def _replace_state(path: Path, state: ProcessOutputStateV1) -> None:
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "wb") as file:
+            _count_written(len(data))
             file.write(data)
             file.flush()
             os.fsync(file.fileno())

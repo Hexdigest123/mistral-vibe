@@ -25,6 +25,7 @@ use vibe_rs::mouse;
 use vibe_rs::server::Client;
 use vibe_rs::ui::theme;
 
+use crate::feedback_support::notice_text;
 use crate::support::{ctrl, key, mouse, press, send_mouse, stub};
 
 fn entry(id: &str, level: &str, message: &str) -> LogEntry {
@@ -974,15 +975,12 @@ fn the_console_paints_a_scrollbar_only_when_the_log_overflows() {
     let mut terminal = Terminal::new(TestBackend::new(120, 14)).expect("terminal");
     terminal.draw(|frame| app.draw(frame)).expect("draw");
     // Twenty single-row entries overflow the 12-row body: the scrollbar's
-    // track is registered and its thumb paints a reversed cell.
+    // track is registered and its thumb paints cells in the thumb color.
     let body = app.debug_console.body_area;
     assert!(!mouse::scrollbar_tracks(&app, body).is_empty());
     let buffer = terminal.backend().buffer();
-    let thumb = (body.y..body.bottom()).any(|row| {
-        buffer[(body.right() - 1, row)]
-            .modifier
-            .contains(Modifier::REVERSED)
-    });
+    let thumb =
+        (body.y..body.bottom()).any(|row| buffer[(body.right() - 1, row)].fg == theme::scrollbar());
     assert!(thumb, "no scrollbar thumb in the body's right column");
     // A log that fits the body paints no scrollbar: no track, no thumb.
     app.debug_console.entries.truncate(2);
@@ -991,11 +989,8 @@ fn the_console_paints_a_scrollbar_only_when_the_log_overflows() {
     let body = app.debug_console.body_area;
     assert!(mouse::scrollbar_tracks(&app, body).is_empty());
     let buffer = terminal.backend().buffer();
-    let thumb = (body.y..body.bottom()).any(|row| {
-        buffer[(body.right() - 1, row)]
-            .modifier
-            .contains(Modifier::REVERSED)
-    });
+    let thumb =
+        (body.y..body.bottom()).any(|row| buffer[(body.right() - 1, row)].fg == theme::scrollbar());
     assert!(!thumb, "a fitting log still paints a scrollbar thumb");
 }
 
@@ -1028,12 +1023,7 @@ fn a_wheel_over_the_console_header_or_border_does_not_scroll_the_log() {
 fn a_click_released_off_the_log_body_does_not_copy() {
     let (mut app, _terminal) = drawn_console_app();
     let click = |kind: MouseEventKind, column: u16, row: u16| mouse(kind, column, row);
-    let copied = |app: &App| {
-        app.overlays
-            .toasts
-            .iter()
-            .any(|toast| toast.text == "Copied to clipboard")
-    };
+    let copied = |app: &App| notice_text(app).is_some_and(|text| text.starts_with("Copied"));
     // A click on a log line copies it.
     send_mouse(
         &mut app,
@@ -1044,7 +1034,7 @@ fn a_click_released_off_the_log_body_does_not_copy() {
         click(MouseEventKind::Up(MouseButton::Left), 80, 3),
     );
     assert!(copied(&app));
-    app.overlays.toasts.clear();
+    vibe_rs::ui::notice::clear(&mut app);
     // The router keeps the pressed target wherever the pointer is released,
     // but a release off the body (the border, or outside the panel) copies
     // nothing.

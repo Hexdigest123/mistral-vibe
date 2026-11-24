@@ -1,13 +1,14 @@
 //! The shared list search model: `/` focuses, Esc leaves then clears, list keys pass through.
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
+use ratatui::layout::Rect;
 use serde_json::json;
 use tokio::sync::mpsc;
 use vibe_rs::app::App;
-use vibe_rs::search_field::{self, Outcome, Search};
+use vibe_rs::search_field::{self, Outcome, Press, Search};
 use vibe_rs::{config, config_fields, plugins};
 
-use crate::support::{key, stub};
+use crate::support::{down, key, mouse, stub, up};
 
 fn press(search: &mut Search, code: KeyCode) -> Outcome {
     search_field::handle_key(search, &key(code))
@@ -57,6 +58,19 @@ fn escape_leaves_the_field_then_clears_the_filter_then_passes() {
 }
 
 #[test]
+fn handled_runs_the_filter_hook_only_when_the_query_changed() {
+    for (outcome, handled, ran) in [
+        (Outcome::Pass, false, false),
+        (Outcome::Consumed, true, false),
+        (Outcome::Filtered, true, true),
+    ] {
+        let mut hook = false;
+        assert_eq!(outcome.handled(|| hook = true), handled);
+        assert_eq!(hook, ran);
+    }
+}
+
+#[test]
 fn hints_follow_the_search_state() {
     let list = [
         ("↑↓/jk", "navigate"),
@@ -78,6 +92,64 @@ fn hints_follow_the_search_state() {
         search_field::hints(false, true, &list)[4],
         ("Esc", "clear search")
     );
+}
+
+#[test]
+fn a_focused_field_drops_the_keys_it_types() {
+    let list = [
+        ("↑↓/jk", "navigate"),
+        ("Space", "disable"),
+        ("Backspace", "remove"),
+        ("Esc", "close"),
+    ];
+    assert_eq!(
+        search_field::hints(true, false, &list),
+        [("↑↓", "navigate"), ("Esc", "leave search")]
+    );
+}
+
+fn row_field() -> Search {
+    Search {
+        area: Rect::new(3, 2, 20, 1),
+        ..Search::default()
+    }
+}
+
+#[test]
+fn a_press_on_the_shown_field_focuses_it_and_one_on_an_option_leaves_it() {
+    let mut search = row_field();
+    let on_field = down(5, 2);
+    assert_eq!(
+        search_field::press(&mut search, &on_field, true, false),
+        Press::Field
+    );
+    assert!(search.focused);
+    let on_option = down(5, 6);
+    assert_eq!(
+        search_field::press(&mut search, &on_option, true, true),
+        Press::Option
+    );
+    assert!(!search.focused);
+}
+
+#[test]
+fn a_hidden_field_a_miss_a_release_and_other_buttons_leave_focus_alone() {
+    let mut search = row_field();
+    let hidden = search_field::press(&mut search, &down(5, 2), false, false);
+    assert_eq!(hidden, Press::Other);
+    assert!(!search.focused, "a field off screen takes no press");
+    search.focused = true;
+    for event in [
+        down(40, 9),
+        up(5, 2),
+        mouse(MouseEventKind::Down(MouseButton::Right), 5, 2),
+    ] {
+        assert_eq!(
+            search_field::press(&mut search, &event, true, false),
+            Press::Other
+        );
+        assert!(search.focused, "{event:?}");
+    }
 }
 
 fn config_app() -> App {

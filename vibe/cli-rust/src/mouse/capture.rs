@@ -7,19 +7,16 @@ use crate::selection;
 /// End the captured gesture, keeping (and copying) the selection in flight or aborting it.
 pub(crate) fn cancel_capture(app: &mut App, keep_selection: bool) {
     if let Some(Capture::Target(target)) = app.view.mouse.capture.take() {
-        if target == MouseTarget::RemoteProject {
-            app.vibe_code_project.list.cancel();
-            app.vibe_code_project.dragged_field = None;
-        }
         if matches!(
             target,
             MouseTarget::Transcript
-                | MouseTarget::Toast
                 | MouseTarget::Composer
                 | MouseTarget::Trust
-                | MouseTarget::RemoteProject
                 | MouseTarget::BottomBar
                 | MouseTarget::Loading
+                | MouseTarget::CodePreview
+                | MouseTarget::GoalRow
+                | MouseTarget::RailWindow
                 | MouseTarget::Question
                 | MouseTarget::Approval
                 | MouseTarget::BottomApp
@@ -29,9 +26,17 @@ pub(crate) fn cancel_capture(app: &mut App, keep_selection: bool) {
                 | MouseTarget::ThinkingPicker
                 | MouseTarget::LogLevelPicker
                 | MouseTarget::ArtifactsModal
-                | MouseTarget::ResumePicker
+                | MouseTarget::Loops
+                | MouseTarget::GoalConfirm
+                | MouseTarget::SessionsPage
+                | MouseTarget::SessionsPreview
                 | MouseTarget::Mcp
                 | MouseTarget::Plugins
+                | MouseTarget::TrustedFolders
+                | MouseTarget::Skills
+                | MouseTarget::SkillsBody
+                | MouseTarget::LoopsDetails
+                | MouseTarget::LoopsForm
                 | MouseTarget::McpOAuth
                 | MouseTarget::ConnectorAuth
         ) {

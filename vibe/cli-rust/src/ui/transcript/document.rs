@@ -10,22 +10,24 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 use super::viewport::{document_height, measure};
 use super::{entry, paint};
 use crate::app::App;
-use crate::selection::{fold, Fold, Folds};
+use crate::selection::{fold, Fold, Folds, RowChrome};
 
 pub(crate) struct SelectionSlice {
     pub buffer: Buffer,
     pub area: Rect,
-    pub gutters: Vec<(u16, u16, u16)>,
+    pub chrome: Vec<RowChrome>,
+    /// `[top, bottom)` rows of `/raw` agent messages.
+    pub raw: Vec<(u16, u16)>,
     pub folds: Folds,
     /// Sorted spacing rows (block margins) a copy skips.
     pub margins: Vec<u16>,
 }
 
 /// Lines painted as one block, with their folds and the indexes of their spacing rows.
-struct Painted<'a> {
-    lines: &'a [Line<'static>],
-    folds: &'a [Option<Fold>],
-    gaps: &'a [usize],
+pub(super) struct Painted<'a> {
+    pub lines: &'a [Line<'static>],
+    pub folds: &'a [Option<Fold>],
+    pub gaps: &'a [usize],
 }
 
 pub(crate) fn selection_slice(app: &App) -> Option<SelectionSlice> {
@@ -39,8 +41,7 @@ pub(crate) fn selection_slice(app: &App) -> Option<SelectionSlice> {
     // The child view's selection must extract the child's document: the
     // render swap is over by the time the overlay runs.
     let (transcript, cache) = crate::subagents::active_transcript(app);
-    let config = view.banner.view(&app.session.startup_config, width);
-    let banner = super::banner(app, config, width, transcript.is_empty());
+    let banner = super::banner(app, width, transcript.is_empty());
     let layout = cache.layout(transcript.revision(), width)?;
     let spacer = view.queue_spacer;
     let total = document_height(banner.lines(), layout, width).saturating_add(spacer.height);
@@ -61,7 +62,8 @@ pub(crate) fn selection_slice(app: &App) -> Option<SelectionSlice> {
         end.saturating_sub(start).saturating_add(1),
     );
     let mut buffer = Buffer::empty(area);
-    let mut gutters = Vec::new();
+    let mut chrome = Vec::new();
+    let mut raw = Vec::new();
     let mut folds = Folds {
         x: area.x,
         rows: Vec::new(),
@@ -89,7 +91,7 @@ pub(crate) fn selection_slice(app: &App) -> Option<SelectionSlice> {
     margins.extend(banner_height..entries_top);
     let spacer_top = entries_top.saturating_add(spacer.at);
     margins.extend(spacer_top..spacer_top.saturating_add(spacer.height));
-    for positioned in &layout.entries {
+    for positioned in layout.entries.iter().filter(|entry| entry.height > 0) {
         let y = entries_top.saturating_add(spacer.offset(positioned.top));
         if y >= area.bottom() {
             break;
@@ -100,27 +102,30 @@ pub(crate) fn selection_slice(app: &App) -> Option<SelectionSlice> {
         let Some(value) = transcript.entry(positioned.index) else {
             continue;
         };
-        let entry_expanded = view.expanded.contains(value.id);
-        let group_expanded = value
-            .group
-            .as_ref()
-            .is_some_and(|group| view.expanded.contains(&group.key));
-        if value.group.is_none() || group_expanded {
-            if let Some(gutter) = entry::diff_gutter(&value, entry_expanded) {
-                gutters.push((y, y.saturating_add(positioned.height), gutter));
-            }
+        let details = layout.details_of(positioned.index);
+        let expansion = entry::ExpansionView::of(&view.expanded, &value, details, view.raw);
+        let railed = expansion.details.is_some_and(|step| step.expanded);
+        let own =
+            (expansion.content_visible(&value)).then(|| entry::chrome(&value, expansion.entry));
+        // The `Worked for` header, then a tool group's, each paint a gap and a header row first.
+        let opens = |shown: bool| 2 * i32::from(shown);
+        let rail = i32::from(y) + opens(details.is_some_and(|d| d.first == value.index));
+        let content = rail + opens(railed && value.group.as_ref().is_some_and(|g| g.first));
+        let rows = (rail, content, i32::from(y) + i32::from(positioned.height));
+        super::viewport::push_chrome(&mut chrome, rows, railed, own.unwrap_or_default());
+        if entry::is_raw(&value, view.raw) {
+            raw.push((y, y.saturating_add(positioned.height)));
         }
         let queue = entry::QueueView {
             selected: app.queue.selected.as_deref() == Some(value.id),
-            paused: app.queue.paused,
+            paused: app.queue.header_shortcuts(),
+            // The header's keys are chrome: a copy across it takes only its label.
+            hints: &[],
         };
         let rendered = entry::render(
             &value,
             width,
-            entry::ExpansionView {
-                entry: entry_expanded,
-                group: group_expanded,
-            },
+            expansion,
             view.pulse_frame,
             queue,
             app.rewind.entry_id.as_deref() == Some(value.id),
@@ -149,7 +154,8 @@ pub(crate) fn selection_slice(app: &App) -> Option<SelectionSlice> {
     Some(SelectionSlice {
         buffer,
         area,
-        gutters,
+        chrome,
+        raw,
         folds,
         margins,
     })
@@ -181,7 +187,7 @@ pub(super) fn hang_cells(
 }
 
 /// Record the fold and margin rows of `painted`, laid out from row `top`, through the `visible` rows.
-fn push_rows(
+pub(super) fn push_rows(
     rows: &mut Vec<(u16, Fold)>,
     margins: &mut Vec<u16>,
     top: u16,

@@ -6,23 +6,29 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::startup;
-use super::status::{
-    push_command_error, push_command_status, push_compact_status, push_teleport_status,
-};
+use super::status::{push_command_error, push_command_status, push_compact_status};
 use super::user::{push_user, UserView};
-use super::{QueueView, RenderedEntry};
+use super::RenderedEntry;
 use crate::selection::{fold, Fold};
 use crate::server::MessageEntry;
 use crate::transcript::TranscriptEntry;
 use crate::ui::markdown::{self, LinkedLines};
 use crate::ui::theme;
 
+/// The per-frame state a message renders with.
+#[derive(Clone, Copy)]
+pub(super) struct MessageView {
+    pub selected: bool,
+    pub expanded: bool,
+    /// `/raw`: an agent message shows its Markdown source.
+    pub raw: bool,
+}
+
 pub(super) fn render(
     entry: &TranscriptEntry<'_>,
     message: &MessageEntry,
     width: u16,
-    queue: QueueView,
-    rewind: bool,
+    view: MessageView,
     pulse_frame: usize,
     cache: Option<&mut markdown::MarkdownCache>,
 ) -> RenderedEntry {
@@ -32,16 +38,22 @@ pub(super) fn render(
             &mut lines,
             message,
             width,
-            UserView::of(entry, queue.selected || rewind),
+            UserView::of(entry, view.selected, view.expanded),
         ),
-        "teleport_user" => push_user(&mut lines, message, width, UserView::default()),
-        "teleport_status" | "teleport_complete" => push_teleport_status(
-            &mut lines,
-            &message_text(message),
-            message.role == "teleport_complete",
-            entry.entry.in_progress(),
-            pulse_frame,
-        ),
+        "assistant" if view.raw => {
+            let build = || super::raw::lines(&message_text(message), width);
+            let prepared = match cache {
+                Some(cache) => cache.prepare_wrapped(
+                    entry.index,
+                    entry.rev,
+                    width,
+                    theme::active_index(),
+                    build,
+                ),
+                None => Arc::new(markdown::PreparedMarkdown::from_wrapped(build(), width)),
+            };
+            return RenderedEntry::prepared(prepared, false);
+        }
         "command_result" => push_command_result(&mut lines, &message_text(message), width, false),
         "agent_statistics" => push_command_result(&mut lines, &message_text(message), width, true),
         "command_status" => push_command_status(
@@ -67,6 +79,16 @@ pub(super) fn render(
             push_subagent_severity(&mut lines, &message_text(message), width, theme::error())
         }
         "whats_new" => startup::push_whats_new(&mut lines, &message_text(message), width),
+        "plan_offer" => startup::push_plan_offer(&mut lines, &message_text(message), width),
+        "startup_notices" => {
+            startup::push_startup_notices(&mut lines, &message_text(message), width)
+        }
+        "notice_warning" | "notice_error" => startup::push_notice_row(
+            &mut lines,
+            &message_text(message),
+            width,
+            message.role == "notice_error",
+        ),
         "progress_status" => push_compact_status(
             &mut lines,
             &message_text(message),

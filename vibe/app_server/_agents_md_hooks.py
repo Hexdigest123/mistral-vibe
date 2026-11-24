@@ -35,6 +35,7 @@ disk, which costs little, and keeps looking every time.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -57,6 +58,7 @@ from mistralai_vibe_local_harness.vibe import (
     PostToolCallHookHandler,
     sandbox_path,
 )
+from vibe.app_server._worktree_session import session_harness_files
 from vibe.core.config.harness_files import HarnessFilesManager
 from vibe.core.paths.conventions import AGENTS_MD_FILENAME
 from vibe.utils import VIBE_WARNING_TAG
@@ -75,6 +77,17 @@ _WRITE_TOOL_PATH_ARGUMENTS = {
 
 _AGENTS_MD_SECTION = "Contents of {directory}/AGENTS.md (project instructions for this directory):\n\n{content}"
 
+# Each session workspace's access roots, by its cwd and roots: subagents share the workspace.
+_ACCESS_ROOTS: dict[tuple[Path, tuple[Path, ...]], tuple[Path, ...]] = {}
+
+
+def register_access_roots(
+    cwd: Path, roots: Sequence[Path], access_roots: Sequence[Path]
+) -> None:
+    """Keeps the hook from reading AGENTS.md in a workspace's access roots."""
+    if access_roots:
+        _ACCESS_ROOTS[(cwd, tuple(roots))] = tuple(access_roots)
+
 
 def _passthrough(tool_result: RustToolResult) -> RustPostToolCallHookResult:
     return RustPostToolCallHookResult(
@@ -85,22 +98,14 @@ def _passthrough(tool_result: RustToolResult) -> RustPostToolCallHookResult:
 def _session_files(
     harness_files: HarnessFilesManager, context: HookContext
 ) -> HarnessFilesManager:
-    # The Session workspace always lists the cwd among its roots (it is the
-    # file sandbox), but the session manager must never receive it there: a
-    # listed cwd becomes a session root, and ``project_roots`` returns the
-    # listed roots even when the tree is untrusted, which would inject
-    # AGENTS.md docs past the trust gate. ``_build_session_config`` passes
-    # only ``options.workspace_roots`` for the same reason — the invariant
-    # ("never list the session cwd among ``for_session`` workspace roots")
-    # therefore lives at two call sites. The durable home would be
-    # ``for_session`` itself ignoring a listed root equal to the cwd; until
-    # then, keep the two filters in sync.
     workspace = context.config.workspace
-    session_cwd = workspace.cwd
-    listed_roots = [
-        root for root in workspace.roots if root.expanduser().resolve() != session_cwd
-    ]
-    return harness_files.for_session(session_cwd, workspace_roots=listed_roots)
+    access = _ACCESS_ROOTS.get((workspace.cwd, tuple(workspace.roots)), ())
+    return session_harness_files(
+        harness_files,
+        workspace.cwd,
+        [root for root in workspace.roots if root not in access],
+        access,
+    )
 
 
 def _read_file_path(
@@ -275,4 +280,5 @@ __all__ = [
     "agents_md_hook",
     "agents_md_hook_handlers",
     "merge_agents_md_hook",
+    "register_access_roots",
 ]

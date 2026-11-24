@@ -14,12 +14,10 @@ handshake = {
 }
 request_methods = {"session/resume"}
 
-# Enter submits /resume (the picker highlights the current session), Up
+# Enter submits /resume (the page highlights the current session), Up
 # selects the row our own app-server holds a lease on, and its Enter resumes
 # instead of refusing: the holder is this client's own server process.
 timeline: Timeline = ["/resume", "\r", "\x1b[A", "\r"]
 
-capture_startup = False
-capture_steps = {2, 3}
 screen_contains = ("Resumed session",)
-screen_excludes = ("open in another Vibe process",)
+screen_excludes = ("open in another Vibe process", "Resuming…")

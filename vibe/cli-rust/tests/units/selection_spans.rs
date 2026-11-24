@@ -28,10 +28,6 @@ fn selected_with_endpoint(
     selected_owner(row, from, to, granularity, RegionId::Main, end_exclusive)
 }
 
-fn selected_toast(row: &str, from: u16, to: u16) -> Vec<(u16, u16, u16)> {
-    selected_owner(row, from, to, Granularity::Char, RegionId::Toast(1), false)
-}
-
 fn selected_owner(
     row: &str,
     from: u16,
@@ -46,9 +42,12 @@ fn selected_owner(
     let mut app = App::default();
     let region = match owner {
         RegionId::Main => &mut app.view.selection_region,
-        RegionId::Toast(_) => &mut app.view.toast_selection_region,
         RegionId::Loading => &mut app.view.loading_selection_region,
+        RegionId::Goal => &mut app.view.goal_selection_region,
         RegionId::BottomApp => &mut app.view.bottom_app_selection_region,
+        RegionId::RailWindow => &mut app.view.rail_window_selection_region,
+        RegionId::CodePreview => &mut app.code_preview.selection,
+        RegionId::Preview => &mut app.sessions_page.preview.view.selection,
     };
     region.area = chat;
     region.end_exclusive = end_exclusive;
@@ -112,6 +111,15 @@ fn frame_regions_select_without_chrome_gaps() {
         false,
     );
     assert_eq!(loading, vec![(0, 0, 8)]);
+    let goal = selected_owner(
+        "▶ Goal Ship it",
+        2,
+        13,
+        Granularity::Char,
+        RegionId::Goal,
+        false,
+    );
+    assert_eq!(goal, vec![(0, 2, 13)]);
 }
 
 #[test]
@@ -119,14 +127,14 @@ fn drag_over_an_indented_tool_header_skips_its_chrome() {
     assert_eq!(selected("    ⏵ Read file", 0, 14), vec![(0, 6, 14)]);
 }
 
-#[test]
-fn grouped_diff_selection_skips_nested_borders_and_line_number_gutter() {
+/// The whole of a transcript `row` painted by an entry with `(border, gutter)` chrome columns.
+fn selected_in_entry(row: &str, (border, gutter): (u16, u16)) -> Vec<(u16, u16, u16)> {
     let chat = Rect::new(0, 0, 24, 1);
     let mut buf = Buffer::empty(chat);
-    buf.set_string(0, 0, "  ⎢   ⎢    4 + BETA", Style::default());
+    buf.set_string(0, 0, row, Style::default());
     let mut app = App::default();
     app.view.selection_region.area = chat;
-    app.view.diff_hitmap.push((0, 1, 7));
+    app.view.chrome_hitmap.push((0, 1, 0, border, gutter));
     app.selection.region = Some(Selection {
         owner: RegionId::Main,
         anchor: (0, 0),
@@ -138,7 +146,31 @@ fn grouped_diff_selection_skips_nested_borders_and_line_number_gutter() {
         text: String::new(),
     });
 
-    assert_eq!(region::spans(&app, &buf, chat), vec![(0, 15, 18)]);
+    region::spans(&app, &buf, chat)
+}
+
+#[test]
+fn grouped_diff_selection_skips_nested_borders_and_line_number_gutter() {
+    assert_eq!(
+        selected_in_entry("│ │    4 + BETA", (4, 7)),
+        vec![(0, 11, 14)]
+    );
+}
+
+#[test]
+fn a_border_glyph_past_the_entry_border_is_content() {
+    assert_eq!(selected_in_entry("│ │ │ x", (4, 0)), vec![(0, 4, 6)]);
+    assert_eq!(selected_in_entry("│ x", (0, 0)), vec![(0, 0, 2)]);
+}
+
+#[test]
+fn an_inset_notice_border_is_chrome() {
+    assert_eq!(selected_in_entry("  └ msg", (4, 0)), vec![(0, 4, 6)]);
+}
+
+#[test]
+fn an_edit_header_keeps_its_text_from_the_diff_gutter() {
+    assert_eq!(selected_in_entry("⏵ Edited a.rs", (2, 7)), vec![(0, 2, 12)]);
 }
 
 #[test]
@@ -206,65 +238,6 @@ fn copy_skips_decorative_rules() {
         extracted(&["  before", "────────", "  after"]),
         "before\nafter"
     );
-}
-
-#[test]
-fn toast_copy_keeps_leading_chrome_glyphs() {
-    assert_eq!(selected_toast("> /path failed", 0, 19), vec![(0, 0, 13)]);
-}
-
-#[test]
-fn toast_copy_keeps_content_indentation() {
-    assert_eq!(selected_toast("  indented", 0, 19), vec![(0, 0, 9)]);
-}
-
-#[test]
-fn toast_copy_keeps_a_dash_only_row() {
-    assert_eq!(selected_toast("────────", 0, 19), vec![(0, 0, 7)]);
-}
-
-#[test]
-fn toast_copy_ignores_transcript_selection_chrome() {
-    let chat = Rect::new(0, 0, 20, 1);
-    let mut buf = Buffer::empty(chat);
-    buf.set_string(0, 0, "hello world", Style::default());
-    let mut app = App::default();
-    app.view.toast_selection_region.area = chat;
-    app.view.selection_chrome.push((0, 0, 4));
-    app.selection.region = Some(Selection {
-        owner: RegionId::Toast(1),
-        anchor: (0, 0),
-        head: (chat.right() - 1, 0),
-        pending_copy: false,
-        edge_scroll: 0,
-        scroll_target: ScrollTarget::None,
-        table_cell: None,
-        text: String::new(),
-    });
-
-    assert_eq!(region::spans(&app, &buf, chat), vec![(0, 0, 10)]);
-}
-
-#[test]
-fn toast_copy_ignores_diff_gutters() {
-    let chat = Rect::new(0, 0, 24, 1);
-    let mut buf = Buffer::empty(chat);
-    buf.set_string(0, 0, ">  line failed", Style::default());
-    let mut app = App::default();
-    app.view.toast_selection_region.area = chat;
-    app.view.diff_hitmap.push((0, 1, 7));
-    app.selection.region = Some(Selection {
-        owner: RegionId::Toast(1),
-        anchor: (0, 0),
-        head: (chat.right() - 1, 0),
-        pending_copy: false,
-        edge_scroll: 0,
-        scroll_target: ScrollTarget::None,
-        table_cell: None,
-        text: String::new(),
-    });
-
-    assert_eq!(region::spans(&app, &buf, chat), vec![(0, 0, 13)]);
 }
 
 #[test]

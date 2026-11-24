@@ -51,8 +51,10 @@ Path(_home, "ui_startup_config.json").write_text(
         "activeModel": "mistral-medium-3.5",
         "activeModelDisplayName": "mistral-medium-3.5",
         "imagesSupported": False,
-        "defaultAgent": "accept-edits",
+        "defaultAgent": "default",
         "agents": [],
+        "defaultApprovalPolicy": "accept-edits",
+        "approvalPolicies": [],
         "skills": [],
         "contextWindow": 0,
         "narratorEnabled": False,
@@ -63,7 +65,6 @@ Path(_home, "ui_startup_config.json").write_text(
 
 env = {"VIBE_HOME": _home, "VIBE_WHATS_NEW_DIR": os.fspath(WHATS_NEW_FIXTURE)}
 
-capture_startup = False
 timeline: Timeline = ["x"]
 
 screen_contains = ("> x",)

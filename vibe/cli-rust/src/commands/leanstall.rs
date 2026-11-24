@@ -12,7 +12,8 @@ use crate::server::{method, AgentInstallParams, AgentsListResponse, Client};
 use crate::transcript::local;
 
 const LEAN: &str = "lean";
-pub const SWITCHING: &str = "Wait for the agent switch to finish, then run the command again.";
+pub const SWITCHING: &str =
+    "Wait for the approval policy switch to finish, then run the command again.";
 
 /// A settled `agents/install` (`installed`) or `agents/uninstall`.
 pub struct Event {
@@ -52,13 +53,12 @@ fn set_installed(app: &mut App, client: &Arc<Client>, installed: bool) {
         return;
     };
     let tx = app.command_tx.clone();
-    let pending = app.commit_started();
     let client = client.clone();
     app.agents.installing = true;
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let result = request(&client, session_id, installed).await;
         let event = Event { installed, result };
-        deliver(tx, CommandEvent::Leanstall(Box::new(event)), &pending).await;
+        deliver(tx, CommandEvent::Leanstall(Box::new(event))).await;
     });
 }
 
@@ -95,7 +95,13 @@ pub fn apply_event(app: &mut App, event: Event) {
         }
     };
     app.agents.all = response.agents;
-    agents::set_active(app, response.active);
+    app.agents.active = response.active;
+    if let Some(policies) = response.approval_policies {
+        app.agents.policies = policies;
+    }
+    if let Some(policy) = response.active_approval_policy {
+        agents::set_active(app, policy);
+    }
     let notice = if event.installed {
         "Lean agent installed."
     } else {

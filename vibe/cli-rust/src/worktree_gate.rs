@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use serde_json::Value;
 
-use crate::cli::StartupResume;
+use crate::cli::{StartModel, StartupResume};
 use crate::server::signal::ShutdownSignal;
 use crate::server::{AgentConfig, ChildHandle, Client, Launch, Notification, WorktreeInput};
 use crate::startup::{handshake, StartupEvent};
@@ -51,7 +51,7 @@ pub fn print_using(cwd: &str) {
 pub fn settle_cwd(params: &Value) -> Option<String> {
     let mut cwd = None;
     let mut moved = false;
-    for (path, value) in crate::worktree::replace_ops(params.get("patch")?) {
+    for (path, value) in crate::utils::json::replace_ops(params.get("patch")?) {
         match path {
             "/cwd" => cwd = value.as_str().map(str::to_owned),
             "/worktree" => moved = !value.is_null(),
@@ -67,7 +67,7 @@ pub fn settle_cwd(params: &Value) -> Option<String> {
 
 /// The worktree the settle announced (`/worktree` replace), as tracked info.
 pub fn settle_worktree(params: &Value) -> Option<crate::worktree::WorktreeInfo> {
-    for (path, value) in crate::worktree::replace_ops(params.get("patch")?) {
+    for (path, value) in crate::utils::json::replace_ops(params.get("patch")?) {
         if path != "/worktree" {
             continue;
         }
@@ -145,7 +145,7 @@ pub async fn absorb_until_settled(
                 }
                 None => return Ok((Settled::default(), waited)),
             },
-            _ = tokio::time::sleep_until(deadline) => return Ok((Settled::default(), waited)),
+            _ = crate::clock::sleep_until_real(Some(deadline.into_std())) => return Ok((Settled::default(), waited)),
         }
     }
 }
@@ -190,13 +190,14 @@ pub async fn early_start(
     show_unready_config: bool,
     startup_resume: StartupResume,
     agent_config: AgentConfig,
+    start_model: StartModel,
     shutdown: &mut ShutdownSignal,
 ) -> Result<EarlyWorktreeStart> {
     print_preparing(agent_config.worktree.as_ref());
     let (client, child, notifications, crash_rx) = match Client::spawn(launch).await {
         Ok(spawned) => spawned,
         Err(error) => {
-            tracing::error!(vibe_boundary = "startup", fatal = true, "{error:#}");
+            crate::startup::failure::log_spawn(&error);
             return Err(error.context("spawn app-server"));
         }
     };
@@ -207,7 +208,7 @@ pub async fn early_start(
     let (trust_tx, trust_rx) = mpsc::channel::<String>(1);
     // The bridge carries the notifications the event loop still reads.
     let (bridge_tx, bridge_rx) = mpsc::channel::<Notification>(256);
-    tokio::spawn(handshake(
+    crate::work::spawn_daemon(handshake(
         client.clone(),
         ready_tx,
         trust_rx,
@@ -216,6 +217,7 @@ pub async fn early_start(
             show_unready_config,
             resume: startup_resume,
             agent_config,
+            start_model,
             notifications: Some((notifications, bridge_tx)),
             // The gate's child was spawned for this handshake: it runs the
             // `initialize` itself.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 handshake = {
     "models/refresh": {
@@ -23,8 +23,7 @@ handshake = {
     }
 }
 request_methods = {"models/refresh"}
-capture_startup = False
-timeline: Timeline = ["/model refresh\r"]
+timeline: Timeline = ["/model refresh\r", take_snapshot()]
 screen_contains = (
     "Could not refresh local: HTTP 503; models listed: openrouter 3, local 1",
 )

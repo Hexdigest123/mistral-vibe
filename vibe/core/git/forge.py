@@ -14,6 +14,7 @@ to the session. Local only. No cloud-sandbox support in Phase 2.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 import json
 import os
@@ -29,7 +30,16 @@ from vibe.core.git.worktree.repository import WorktreeRepository
 from vibe.core.session.artifact_detector import find_cli_binary
 from vibe.observability.logging import logger
 
-__all__ = ["DiscoveredPullRequest", "ForgeError", "discover_pull_requests"]
+__all__ = [
+    "DiscoveredPullRequest",
+    "ForgeError",
+    "PullRequestHead",
+    "discover_pull_requests",
+]
+
+# (host, repository path, branch): the GitHub ``owner/repo`` or the GitLab
+# project path, matched case-insensitively on host and path.
+type PullRequestHead = tuple[str, str, str]
 
 # Generous enough that a slow forge answer is not mistaken for a hang; the
 # caller treats a timeout as "no discovery" and moves on.
@@ -111,6 +121,9 @@ def _run_gh_pr_list(
             timeout=_LIST_TIMEOUT_SECONDS,
             check=False,
             env=env,
+            # Never inherit stdin: on the stdio transport it is the RPC pipe.
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired as exc:
         raise ForgeError(
@@ -200,6 +213,9 @@ def _run_glab_mr_list(
             timeout=_LIST_TIMEOUT_SECONDS,
             check=False,
             env=env,
+            # Never inherit stdin: on the stdio transport it is the RPC pipe.
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired as exc:
         raise ForgeError(
@@ -257,7 +273,9 @@ def _run_glab_mr_list(
     return prs
 
 
-def discover_pull_requests(repo_path: Path) -> list[DiscoveredPullRequest]:
+def discover_pull_requests(
+    repo_path: Path, *, skip_heads: Collection[PullRequestHead] = ()
+) -> list[DiscoveredPullRequest]:
     """Discover open PRs/MRs linked to the checkout's current branch.
 
     Opens the git repository at *repo_path*, reads its remote and current
@@ -269,8 +287,9 @@ def discover_pull_requests(repo_path: Path) -> list[DiscoveredPullRequest]:
 
     Raises ``ForgeError`` when discovery cannot proceed (no CLI, no auth,
     no remote, unsupported forge, command failure). Returns an empty list
-    when the branch has no open PRs/MRs or the checkout is on a detached
-    HEAD (no current branch to scope to).
+    when the branch has no open PRs/MRs, the checkout's head is in
+    *skip_heads*, or the checkout is on a detached HEAD (no current branch
+    to scope to).
 
     Synchronous: callers run this in a thread (``asyncio.to_thread``).
     """
@@ -285,6 +304,10 @@ def discover_pull_requests(repo_path: Path) -> list[DiscoveredPullRequest]:
                 # Detached HEAD: there is no current branch, hence no PR/MR
                 # can be linked to it. Not an error — nothing to discover.
                 return []
+            skipped = {
+                (host.lower(), path.lower(), head_branch)
+                for host, path, head_branch in skip_heads
+            }
 
             provider = _detect_provider(remote_url)
             if provider is None:
@@ -298,6 +321,8 @@ def discover_pull_requests(repo_path: Path) -> list[DiscoveredPullRequest]:
                 # Extract host from the normalised URL.
                 url_parsed = parse_git_url(remote_url)
                 host = url_parsed.host if url_parsed.host else "github.com"
+                if (host.lower(), f"{owner}/{repo_name}".lower(), branch) in skipped:
+                    return []
 
                 gh_path = find_cli_binary("gh")
                 if gh_path is None:
@@ -321,6 +346,8 @@ def discover_pull_requests(repo_path: Path) -> list[DiscoveredPullRequest]:
                 p for p in (url_parsed.owner, *url_parsed.groups, url_parsed.repo) if p
             ]
             project_path = "/".join(path_parts)
+            if (host.lower(), project_path.lower(), branch) in skipped:
+                return []
 
             glab_path = find_cli_binary("glab")
             if glab_path is None:

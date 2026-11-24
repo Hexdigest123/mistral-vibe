@@ -19,19 +19,19 @@ import dataclasses
 from datetime import UTC, datetime
 import json
 from pathlib import Path
-import time
 from typing import Any, Literal
+from uuid import NAMESPACE_URL, uuid5
 
 from giturlparse import parse as parse_git_url
 from uuid_utils import uuid7
 
 from vibe.app_server._dispatch import DispatchResult, method_not_found
 from vibe.app_server._model import ProtocolModel, validate_wire
+from vibe.app_server._pull_request_cache import PullRequestDetails, pull_request_cache
 from vibe.app_server.protocol import (
     ArtifactsListParams,
     ArtifactsListResponse,
     ArtifactsMarkViewedParams,
-    ArtifactsSyncParams,
     EmptyResponse,
     PublicChecksSummary,
     PublicCheckStatus,
@@ -39,17 +39,18 @@ from vibe.app_server.protocol import (
     PublicGitLabMergeRequestDetails,
     PublicPullRequestArtifactDetails,
     PublicSessionArtifact,
+    PublicWorktreeArtifact,
 )
 from vibe.core.git.forge import (
     DiscoveredPullRequest,
     ForgeError,
+    PullRequestHead,
     discover_pull_requests,
 )
 from vibe.core.git.forge_sync import (
-    PullRequestSnapshot,
-    RateLimitedSyncError,
+    ChecksWireStatus,
+    ReviewWireDecision,
     derive_pr_status,
-    fetch_pull_request_snapshot,
 )
 from vibe.core.git.remote import parse_github_url
 from vibe.core.git.worktree.repository import WorktreeRepository
@@ -57,9 +58,10 @@ from vibe.core.session.artifact_detector import (
     DetectedPullRequest,
     cli_binary_source,
     extract_draft_from_command,
-    extract_pr_from_output,
-    extract_title_from_command,
+    extract_prs_from_output,
     is_pr_creation_command,
+    pr_creation_limit,
+    pr_creation_output_first,
     resolve_gitlab_repo_id,
 )
 from vibe.core.session.artifacts import (
@@ -70,6 +72,7 @@ from vibe.core.session.artifacts import (
     GitLabMergeRequestDetails,
     PullRequestLifecycleState,
     SessionArtifact,
+    WorktreeArtifact,
 )
 from vibe.core.session.metadata import persist_metadata
 from vibe.core.session.session_index import METADATA_FILENAME
@@ -78,23 +81,19 @@ from vibe.core.types import SessionMetadata
 from vibe.observability.logging import logger
 from vibe.utils.io import read_safe
 
-__all__ = ["ArtifactRequestHandler", "SessionArtifactService", "to_public_artifact"]
+__all__ = [
+    "ArtifactRequestHandler",
+    "SessionArtifactService",
+    "to_public_artifact",
+    "with_cached_status",
+]
 
 # Only finished effects can carry a creation signal; a running or pending
 # effect has no output to parse yet.
 _PROCESSABLE_STATUSES = frozenset({"completed", "failed"})
 
-# Rate-limit budget (Phase 4, NFR4): a per-artifact freshness window makes
-# back-to-back turn syncs a no-op (hardcoded, no config knob), and 429
-# responses back off exponentially, capped.
-_SYNC_FRESHNESS_SECONDS = 60.0
-_SYNC_BACKOFF_BASE_SECONDS = 5.0
-_SYNC_BACKOFF_MAX_SECONDS = 300.0
-
-SyncTrigger = Literal["session_start", "turn_end", "client_request"]
-
-# Telemetry payload vocabularies (design doc section 12.2) — enums and counters only,
-# no URLs, repo names, PR numbers or hosts.
+# Telemetry payload vocabularies — enums and counters only, no URLs, repo names, PR
+# numbers or hosts.
 _DetectionStage = Literal[
     "command_parse",
     "output_extract",
@@ -109,29 +108,78 @@ def _utcnow_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _checks_wire_state(checks: ChecksSummary | None) -> str | None:
-    """Map the checks summary to the wire's raw checks-status vocabulary."""
-    if checks is None:
-        return None
-    return {"pass": "passing", "fail": "failing", "pending": "pending", "none": "none"}[
-        checks.state
-    ]
+_CHECKS_WIRE_STATUS: dict[str, ChecksWireStatus] = {
+    "pass": "passing",
+    "fail": "failing",
+    "pending": "pending",
+    "none": "none",
+}
 
 
 # The provider's uppercase review-decision form, mapped to the wire's
 # provider-neutral vocabulary (artifact/status.ts). Anything else — an
-# unknown value or a missing decision — stores nothing and keeps the
-# previously synced status.
-_REVIEW_DECISION_WIRE: dict[str, str] = {
+# unknown value or a missing decision — stores ``None``.
+_REVIEW_DECISION_WIRE: dict[str, ReviewWireDecision] = {
     "APPROVED": "approved",
     "CHANGES_REQUESTED": "changes_requested",
     "REVIEW_REQUIRED": "review_required",
 }
 
 
-def _new_artifact_id() -> str:
-    """A UUID v7 (chronologically sortable) artifact id, via uuid-utils."""
-    return str(uuid7())
+def with_cached_status(artifact: SessionArtifact) -> SessionArtifact:
+    """The artifact with its status from the process's pull request cache.
+
+    ``provider_updated_at`` is when the status was last read; ``pr_status``
+    (the CLI's label) is derived from the same raw statuses as the clients'
+    status. Without a cached read, the artifact stands as stored.
+    """
+    details = artifact.details
+    cached = pull_request_cache().get(artifact.external_key)
+    if details is None or cached is None:
+        return artifact
+    snapshot = cached.snapshot
+    checks_status = (
+        None if snapshot.checks is None else _CHECKS_WIRE_STATUS[snapshot.checks.state]
+    )
+    review_decision = _REVIEW_DECISION_WIRE.get(snapshot.review_decision or "")
+    pr_status, pr_status_reason = derive_pr_status(
+        snapshot.state, checks_status, review_decision, snapshot.merge_status
+    )
+    return artifact.model_copy(
+        update={
+            "display_title": snapshot.title or artifact.display_title,
+            "details": details.model_copy(
+                update={
+                    "state": snapshot.state,
+                    "is_in_merge_queue": snapshot.is_in_merge_queue,
+                    "source_branch": snapshot.source_branch or details.source_branch,
+                    "target_branch": snapshot.target_branch or details.target_branch,
+                    "author": snapshot.author or details.author,
+                    "provider_created_at": snapshot.created_at,
+                    "provider_updated_at": cached.read_at,
+                    "provider_closed_at": snapshot.closed_at,
+                    "provider_merged_at": snapshot.merged_at,
+                    "merge_commit_sha": snapshot.merge_commit_sha,
+                    "pr_status": pr_status,
+                    "pr_status_reason": pr_status_reason,
+                    "checks": snapshot.checks,
+                    "checks_status": checks_status,
+                    "optional_checks_status": (
+                        None
+                        if snapshot.optional_checks_state is None
+                        else _CHECKS_WIRE_STATUS[snapshot.optional_checks_state]
+                    ),
+                    "review_decision": review_decision,
+                    "merge_status": snapshot.merge_status,
+                }
+            ),
+        }
+    )
+
+
+def _artifact_id(session_id: str, external_key: str) -> str:
+    """One id per PR/MR per session, whichever service instance records it."""
+    return str(uuid5(NAMESPACE_URL, f"{session_id}/{external_key}"))
 
 
 def _github_external_key(host: str, owner: str, repo: str, number: int) -> str:
@@ -193,12 +241,16 @@ class SessionArtifactService:
         *,
         telemetry: SessionTelemetry | None = None,
         metadata_lock: asyncio.Lock | None = None,
-        on_artifacts_changed: Callable[[list[SessionArtifact]], None] | None = None,
+        on_artifacts_changed: Callable[
+            [list[SessionArtifact], list[WorktreeArtifact]], None
+        ]
+        | None = None,
     ) -> None:
         self._session_id = session_id
         self._session_dir = session_dir
         # Keyed by external_key — the stable dedupe key from the contract.
         self._artifacts: dict[str, SessionArtifact] = {}
+        self._worktrees: dict[str, WorktreeArtifact] = {}
         self._dirty = False
         # Emission surface for the vibe.artifact_* events; None when the
         # session telemetry is unavailable (unit tests, non-adapter callers).
@@ -208,12 +260,6 @@ class SessionArtifactService:
         # aligned under the same lock).
         self._metadata_lock = metadata_lock
         self._on_artifacts_changed = on_artifacts_changed
-        # Phase 4 sync bookkeeping, keyed by external_key, in memory only:
-        # last successful sync per artifact (freshness window) and the
-        # deadline until which a rate-limited artifact is skipped.
-        self._last_sync_at: dict[str, float] = {}
-        self._backoff_until: dict[str, float] = {}
-        self._backoff_attempts: dict[str, int] = {}
 
     def load(self, metadata: SessionMetadata) -> None:
         """Seed from the session's persisted metadata (session start/resume).
@@ -222,11 +268,56 @@ class SessionArtifactService:
         """
         for artifact in metadata.artifacts:
             self._artifacts[artifact.external_key] = artifact
+        for worktree in metadata.worktrees:
+            self._worktrees[worktree.path] = worktree
         self._dirty = False
 
     def list_artifacts(self) -> list[SessionArtifact]:
         """All artifacts, ordered by observation time then id."""
         return sorted(self._artifacts.values(), key=lambda a: (a.discovered_at, a.id))
+
+    def list_worktrees(self) -> list[WorktreeArtifact]:
+        return sorted(self._worktrees.values(), key=lambda w: (w.discovered_at, w.id))
+
+    async def record_worktree(
+        self, *, path: Path, branch: str, repo_root: Path
+    ) -> WorktreeArtifact | None:
+        """Record a worktree the session created; None when already recorded."""
+        key = str(path)
+        if key in self._worktrees:
+            return None
+        worktree = WorktreeArtifact(
+            id=str(uuid7()),
+            session_id=self._session_id,
+            path=key,
+            branch=branch,
+            repo_root=str(repo_root),
+            discovered_at=_utcnow_iso(),
+        )
+        self._worktrees[key] = worktree
+        self._dirty = True
+        try:
+            await self._persist()
+        except Exception:
+            logger.warning(
+                "Failed to persist a session worktree; keeping in-memory copy",
+                extra={"session_id": self._session_id},
+                exc_info=True,
+            )
+        return worktree
+
+    async def forget_worktree(self, path: Path) -> None:
+        if self._worktrees.pop(str(path), None) is None:
+            return
+        self._dirty = True
+        try:
+            await self._persist()
+        except Exception:
+            logger.warning(
+                "Failed to persist a forgotten session worktree",
+                extra={"session_id": self._session_id},
+                exc_info=True,
+            )
 
     async def mark_viewed(self, artifact_ids: list[str]) -> list[SessionArtifact]:
         """Mark artifacts as viewed (Phase 3: the Desktop artifact panel).
@@ -272,22 +363,37 @@ class SessionArtifactService:
     async def discover_and_create(self, repo_path: Path) -> list[SessionArtifact]:
         """Discover open PRs/MRs linked to *repo_path*'s current branch.
 
-        Phase 2: called at session load (start + resume) when the session has
-        no existing PR artifacts. Runs ``gh pr list --head <branch>`` /
-        ``glab mr list --source-branch <branch>`` in a thread, then creates a
-        ``SessionArtifact`` per discovered PR/MR.
+        Phase 2: called at session load (start + resume) and whenever the
+        session moves to another checkout. Runs ``gh pr list --head <branch>``
+        / ``glab mr list --source-branch <branch>`` in a thread, then creates
+        a ``SessionArtifact`` per discovered PR/MR. Existing artifacts are
+        kept, and a head (host, repository, branch) one of them already
+        covers is not queried again while that PR/MR is open: a merged or
+        closed one's branch can get a new PR/MR.
 
         Returns the list of artifacts created (empty when skipped, no PRs
         found, or discovery failed). Persists all created artifacts in one
         ``meta.json`` write. Never raises — discovery is best-effort.
         """
-        # Skip when PR artifacts already exist (Phase 1 detected, or a prior
-        # discovery persisted them).
-        if any(a.kind == "pull_request" for a in self._artifacts.values()):
-            return []
-
+        # The state as last read, not the stored one (the state at creation):
+        # from memory for a watched PR, else a small file read, off the loop.
+        cache = pull_request_cache()
+        artifacts = list(self._artifacts.values())
+        reads = await asyncio.to_thread(
+            lambda: [cache.get(artifact.external_key) for artifact in artifacts]
+        )
+        known_heads = {
+            head
+            for artifact, read in zip(artifacts, reads, strict=True)
+            if artifact.details is not None
+            and (read.snapshot.state if read else artifact.details.state)
+            in {"draft", "open"}
+            and (head := _artifact_head(artifact)) is not None
+        }
         try:
-            discovered = await asyncio.to_thread(discover_pull_requests, repo_path)
+            discovered = await asyncio.to_thread(
+                discover_pull_requests, repo_path, skip_heads=known_heads
+            )
         except ForgeError as exc:
             logger.info(
                 "PR discovery skipped",
@@ -314,20 +420,12 @@ class SessionArtifactService:
             )
 
         created: list[SessionArtifact] = []
-        known_urls = {a.external_url for a in self._artifacts.values()}
         for pr in discovered:
             external_key = _external_key_from_discovered(pr, repo_id)
-            if external_key in self._artifacts:
-                continue  # dedup (race with Phase 1 detection)
-            if pr.url in known_urls:
-                # Same MR under a different key: Phase 1 resolved a repo_id
-                # Phase 2 could not, or vice versa. Dedup on the URL too.
+            if self._holds(external_key, pr.url):
                 continue
             artifact = self._build_artifact_from_discovered(pr, external_key, repo_id)
-            # Enrich from birth: one provider fetch per discovered PR/MR.
-            artifact = await self._enrich_new_artifact(artifact)
             self._artifacts[external_key] = artifact
-            known_urls.add(pr.url)
             created.append(artifact)
 
         if created:
@@ -342,8 +440,17 @@ class SessionArtifactService:
                 )
             for artifact in created:
                 self._record_created(artifact, message_id=None, source="discovered")
+        return [await self._read_new_artifact(artifact) for artifact in created]
 
-        return created
+    def _holds(self, external_key: str, url: str) -> bool:
+        """Whether this PR/MR is already recorded.
+
+        The URL catches the same MR stored under the other key form: one
+        phase resolved a GitLab ``repo_id`` that the other could not.
+        """
+        return external_key in self._artifacts or any(
+            a.external_url == url for a in self._artifacts.values()
+        )
 
     def _build_artifact_from_discovered(
         self, pr: DiscoveredPullRequest, external_key: str, repo_id: int | None = None
@@ -356,7 +463,7 @@ class SessionArtifactService:
         discovered_at = _utcnow_iso()
         if pr.provider == "github":
             return GitHubPullRequestArtifact(
-                id=_new_artifact_id(),
+                id=_artifact_id(self._session_id, external_key),
                 session_id=self._session_id,
                 external_key=external_key,
                 external_url=pr.url,
@@ -381,7 +488,7 @@ class SessionArtifactService:
                 ),
             )
         return GitLabMergeRequestArtifact(
-            id=_new_artifact_id(),
+            id=_artifact_id(self._session_id, external_key),
             session_id=self._session_id,
             external_key=external_key,
             external_url=pr.url,
@@ -406,207 +513,34 @@ class SessionArtifactService:
             ),
         )
 
-    async def sync_artifacts(self, *, trigger: SyncTrigger) -> list[SessionArtifact]:
-        """Refresh tracked PR/MR artifacts from their provider (Phase 4).
+    def watched(self) -> list[tuple[str, PullRequestDetails]]:
+        """The PRs/MRs to keep fresh, for :meth:`PullRequestCache.watch`."""
+        return [
+            (artifact.external_key, artifact.details)
+            for artifact in self._artifacts.values()
+            if artifact.details is not None
+        ]
 
-        One pass over the session's artifacts: skipped for terminal
-        (``merged``) artifacts, artifacts synced within the freshness
-        window (non-``turn_end`` triggers only), and artifacts backing
-        off after a rate-limit response. A turn end always syncs: the
-        turn's commands may have changed a PR that was synced moments
-        ago, and the icon must reflect the state the turn left behind.
-        Each candidate's provider fetch runs in a thread; a changed snapshot
-        is applied in memory and the whole batch persists in one write, and
-        the changed artifacts are returned so the caller announces
-        ``artifacts/updated`` per artifact.
+    async def _read_new_artifact(self, artifact: SessionArtifact) -> SessionArtifact:
+        """Read a freshly built artifact's PR/MR before it is announced.
 
-        Never raises — a failed fetch keeps the stored state (stale-while-
-        error), logs a structured warning, and emits
-        ``vibe.artifact_sync_failed``. Unchanged artifacts produce no write,
-        no notification, and no telemetry.
-        """
-        now = time.time()
-        candidates: list[SessionArtifact] = []
-        for artifact in self.list_artifacts():
-            details = artifact.details
-            if details is None:
-                continue
-            if details.state == "merged":
-                continue  # terminal — never synced again
-            if trigger != "turn_end":
-                # The freshness window is a rate-limit budget for passes that
-                # have no state change to observe (session start, client
-                # request); a turn end is exactly when PRs change.
-                last = self._last_sync_at.get(artifact.external_key)
-                if last is not None and now - last < _SYNC_FRESHNESS_SECONDS:
-                    continue
-            backoff_until = self._backoff_until.get(artifact.external_key)
-            if backoff_until is not None and now < backoff_until:
-                continue
-            candidates.append(artifact)
-        if not candidates:
-            return []
-
-        changed: list[SessionArtifact] = []
-        for artifact in candidates:
-            assert artifact.details is not None  # filtered above
-            try:
-                snapshot = await asyncio.to_thread(
-                    fetch_pull_request_snapshot, artifact.details, _utcnow_iso()
-                )
-            except RateLimitedSyncError as exc:
-                self._record_sync_failed(artifact, exc, trigger)
-                self._schedule_backoff(artifact.external_key, now)
-                continue
-            except Exception as exc:
-                self._record_sync_failed(artifact, exc, trigger)
-                continue
-            self._last_sync_at[artifact.external_key] = time.time()
-            self._backoff_attempts.pop(artifact.external_key, None)
-            self._backoff_until.pop(artifact.external_key, None)
-            updated = self._apply_snapshot(artifact, snapshot)
-            if updated is not None:
-                changed.append(updated)
-
-        if changed:
-            self._dirty = True
-            try:
-                await self._persist()
-            except Exception:
-                logger.warning(
-                    "Failed to persist synced artifacts; keeping in-memory copy",
-                    extra={"session_id": self._session_id},
-                    exc_info=True,
-                )
-            for artifact in changed:
-                self._record_synced(artifact, trigger)
-        return changed
-
-    def _apply_snapshot(
-        self, artifact: SessionArtifact, snapshot: PullRequestSnapshot
-    ) -> SessionArtifact | None:
-        """Apply a provider snapshot to an artifact in memory.
-
-        Returns the updated artifact, or None when nothing changed (no
-        dirty flag, no persistence, no notification). ``pr_status`` is
-        derived here, once, from the sync-time inputs (review decision,
-        mergeability) that are never stored.
-        """
-        details = artifact.details
-        if details is None:
-            return None
-        pr_status = derive_pr_status(snapshot)
-        # provider_updated_at records the last successful sync time (the
-        # "Updated X ago" signal); the provider's own timestamps land in the
-        # dedicated created/closed/merged fields.
-        updated = artifact.model_copy(
-            update={
-                "display_title": snapshot.title or artifact.display_title,
-                "details": details.model_copy(
-                    update={
-                        "state": snapshot.state,
-                        "source_branch": snapshot.source_branch
-                        or details.source_branch,
-                        "target_branch": snapshot.target_branch
-                        or details.target_branch,
-                        "author": snapshot.author or details.author,
-                        "provider_created_at": snapshot.created_at,
-                        "provider_updated_at": _utcnow_iso(),
-                        "provider_closed_at": snapshot.closed_at,
-                        "provider_merged_at": snapshot.merged_at,
-                        "merge_commit_sha": snapshot.merge_commit_sha,
-                        "pr_status": pr_status,
-                        "checks": snapshot.checks,
-                        "checks_status": _checks_wire_state(snapshot.checks),
-                        "review_decision": _REVIEW_DECISION_WIRE.get(
-                            snapshot.review_decision or ""
-                        ),
-                        "merge_status": snapshot.merge_status,
-                    }
-                ),
-            }
-        )
-        # Idempotence: an unchanged PR produces no write, no notification, no
-        # telemetry. The sync stamp (provider_updated_at) is excluded from
-        # the comparison — an unchanged PR keeps its previous stamp.
-        old_dump = artifact.model_dump(mode="json")
-        new_dump = updated.model_dump(mode="json")
-        old_dump["details"].pop("provider_updated_at", None)
-        new_dump["details"].pop("provider_updated_at", None)
-        if old_dump == new_dump:
-            return None
-        # Replace in place only. Enrich-from-birth applies a snapshot to an
-        # artifact that is not recorded yet; inserting here would make the
-        # dedup check in _record_new_artifact find the artifact itself and
-        # skip the recording (no persist, no created notification). The
-        # caller owns the insertion of a new artifact.
-        if artifact.external_key in self._artifacts:
-            self._artifacts[artifact.external_key] = updated
-        return updated
-
-    def _schedule_backoff(self, external_key: str, now: float) -> None:
-        """Exponential backoff after a rate-limit response, capped."""
-        attempts = self._backoff_attempts.get(external_key, 0) + 1
-        self._backoff_attempts[external_key] = attempts
-        delay = min(
-            _SYNC_BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)),
-            _SYNC_BACKOFF_MAX_SECONDS,
-        )
-        self._backoff_until[external_key] = now + delay
-
-    def _record_synced(self, artifact: SessionArtifact, trigger: SyncTrigger) -> None:
-        if self._telemetry is None:
-            return
-        self._telemetry.record_artifact_synced(
-            provider=artifact.provider, trigger=trigger, changed=True
-        )
-
-    def _record_sync_failed(
-        self, artifact: SessionArtifact, error: BaseException, trigger: SyncTrigger
-    ) -> None:
-        logger.warning(
-            "Artifact provider sync failed; keeping stored state",
-            extra={
-                "session_id": self._session_id,
-                "provider": artifact.provider,
-                "operation": "fetch_pull_request",
-                "error_type": type(error).__name__,
-            },
-        )
-        if self._telemetry is None:
-            return
-        self._telemetry.record_artifact_sync_failed(
-            provider=artifact.provider, trigger=trigger, error_type=type(error).__name__
-        )
-
-    async def _enrich_new_artifact(self, artifact: SessionArtifact) -> SessionArtifact:
-        """Fetch the provider snapshot for a freshly built artifact.
-
-        "Every artifact is enriched from birth" (Phase 4): creation and
-        discovery each fetch the PR/MR once so the stored artifact carries
-        the full enrichment (timestamps, checks, pr_status) immediately. A
-        failure is not fatal — the artifact stands with the partial data it
-        was built with and the next sync pass fills the rest.
+        Creation and discovery each read the PR/MR once, so the announced
+        artifact carries its status (``to_public_artifact`` reads it from the
+        cache). A failure is not fatal: the artifact stands with the partial
+        data it was built with, and the next refresh fills the rest.
         """
         details = artifact.details
         if details is None:
             return artifact
         try:
-            snapshot = await asyncio.to_thread(
-                fetch_pull_request_snapshot, details, _utcnow_iso()
-            )
-        except Exception as exc:
+            await pull_request_cache().read_now(artifact.external_key, details)
+        except Exception:
             logger.debug(
-                "Initial provider enrichment failed; keeping partial artifact",
-                extra={
-                    "session_id": self._session_id,
-                    "provider": artifact.provider,
-                    "error_type": type(exc).__name__,
-                },
+                "Initial provider read failed; keeping partial artifact",
+                extra={"session_id": self._session_id, "provider": artifact.provider},
+                exc_info=True,
             )
-            return artifact
-        updated = self._apply_snapshot(artifact, snapshot)
-        return updated if updated is not None else artifact
+        return artifact
 
     async def on_shell_effect(
         self,
@@ -617,13 +551,14 @@ class SessionArtifactService:
         *,
         message_id: str | None = None,
         cwd: str | None = None,
-    ) -> SessionArtifact | None:
-        """Inspect a finished shell effect. Returns the created artifact, or None.
+    ) -> list[SessionArtifact]:
+        """Inspect a finished shell effect. Returns the created artifacts.
 
         Called by the adapter when a ``bash``/``shell`` tool effect reaches a
-        terminal state. Returns None when the effect is not a PR/MR creation
-        or reopen, carries no provider URL, or the artifact already exists
-        (dedup).
+        terminal state. One effect may create several PRs/MRs (a loop over
+        ``gh pr create``). Returns an empty list when the effect is not a
+        PR/MR creation or reopen, carries no provider URL, or every artifact
+        already exists (dedup).
 
         *cwd* is the session's checkout: a reopen confirmation carries no
         URL, so missing coordinates (host, owner/repo, project path) are
@@ -637,59 +572,63 @@ class SessionArtifactService:
         local so the in-memory artifact still stands and the caller notifies.
         """
         if status not in _PROCESSABLE_STATUSES:
-            return None
+            return []
         stage: _DetectionStage = "command_parse"
         provider: _DetectionProvider = "unknown"
         try:
             detected_provider = is_pr_creation_command(command)
             if detected_provider is None:
-                return None
+                return []
             provider = detected_provider
             self._record_detected(detected_provider, message_id=message_id)
             stage = "output_extract"
-            detected = extract_pr_from_output(
-                stdout, stderr, provider=detected_provider
-            )
-            if detected is None:
-                return None
-
-            # GitLab: resolve the numeric repo_id best-effort via glab api so
-            # the external key survives group/project renames.
-            if (
-                detected.provider == "gitlab"
-                and detected.repo_id is None
-                and detected.project_path is not None
+            created: list[SessionArtifact] = []
+            for detected in extract_prs_from_output(
+                stdout,
+                stderr,
+                provider=detected_provider,
+                limit=pr_creation_limit(command),
+                from_start=pr_creation_output_first(command),
             ):
-                stage = "repo_id_resolve"
-                repo_id = await resolve_gitlab_repo_id(
-                    detected.host, detected.project_path
-                )
-                if repo_id is not None:
-                    detected = dataclasses.replace(detected, repo_id=repo_id)
-
-            # A reopen confirmation carries no URL: resolve the missing
-            # coordinates (host, owner/repo, project path) from the
-            # session's checkout remote.
-            if detected.url == "" or not _has_complete_coordinates(detected):
-                stage = "coordinates_resolve"
-                resolved = await self._resolve_remote_coordinates(detected, cwd)
-                if resolved is None:
-                    logger.info(
-                        "PR coordinates could not be resolved from the checkout",
-                        extra={"session_id": self._session_id},
+                # GitLab: resolve the numeric repo_id best-effort via glab api
+                # so the external key survives group/project renames.
+                if (
+                    detected.provider == "gitlab"
+                    and detected.repo_id is None
+                    and detected.project_path is not None
+                ):
+                    stage = "repo_id_resolve"
+                    repo_id = await resolve_gitlab_repo_id(
+                        detected.host, detected.project_path
                     )
-                    return None
-                detected = resolved
+                    if repo_id is not None:
+                        detected = dataclasses.replace(detected, repo_id=repo_id)
 
-            # The URL regexes guarantee these; the guard keeps the builder type-safe.
-            if not _has_complete_coordinates(detected):
-                return None
+                # A reopen confirmation carries no URL: resolve the missing
+                # coordinates (host, owner/repo, project path) from the
+                # session's checkout remote.
+                if detected.url == "" or not _has_complete_coordinates(detected):
+                    stage = "coordinates_resolve"
+                    resolved = await self._resolve_remote_coordinates(detected, cwd)
+                    if resolved is None:
+                        logger.info(
+                            "PR coordinates could not be resolved from the checkout",
+                            extra={"session_id": self._session_id},
+                        )
+                        continue
+                    detected = resolved
 
-            stage = "persist"
-            artifact = await self._record_new_artifact(
-                detected, command, message_id=message_id
-            )
-            return artifact
+                # The URL regexes guarantee these; the guard keeps the builder type-safe.
+                if not _has_complete_coordinates(detected):
+                    continue
+
+                stage = "persist"
+                artifact = await self._record_new_artifact(
+                    detected, command, message_id=message_id
+                )
+                if artifact is not None:
+                    created.append(artifact)
+            return created
         except Exception as exc:
             self._record_detection_failed(exc, provider=provider, stage=stage)
             raise
@@ -767,11 +706,16 @@ class SessionArtifactService:
 
         GitLab ``external_key`` may use either ``repo_id`` or ``project_path``
         depending on whether ``glab api`` resolved; dedup by MR identity so the
-        same merge request is never stored twice under both forms.
+        same merge request is never stored twice under both forms. The URL
+        catches any other key form, as discovery's ``_holds`` does.
         """
         preferred = _compute_external_key(detected)
         if preferred in self._artifacts:
             return preferred
+        if detected.url:
+            for key, artifact in self._artifacts.items():
+                if artifact.external_url == detected.url:
+                    return key
         if detected.provider != "gitlab":
             return None
         assert detected.project_path is not None
@@ -790,9 +734,6 @@ class SessionArtifactService:
         """Enrich, insert, persist, and notify under the optional metadata lock."""
         external_key = _compute_external_key(detected)
         artifact = self._build_artifact(detected, command, external_key)
-        # Enrich from birth: one provider fetch before the artifact is
-        # recorded, so the stored artifact carries the full enrichment.
-        artifact = await self._enrich_new_artifact(artifact)
 
         async with self._acquire_metadata_lock():
             duplicate_key = self._find_duplicate_key(detected)
@@ -824,7 +765,7 @@ class SessionArtifactService:
                 persist_error, provider=detected.provider, stage="persist"
             )
         self._record_created(artifact, message_id=message_id)
-        return artifact
+        return await self._read_new_artifact(artifact)
 
     def _record_detected(
         self, provider: Literal["github", "gitlab"], *, message_id: str | None
@@ -859,7 +800,7 @@ class SessionArtifactService:
         )
 
     def _record_mark_viewed(self, *, nb_artifacts: int, nb_already_viewed: int) -> None:
-        """Emit ``vibe.artifact_mark_viewed`` (design doc §12.2.3)."""
+        """Emit ``vibe.artifact_mark_viewed``."""
         if self._telemetry is None:
             return
         self._telemetry.record_artifact_mark_viewed(
@@ -882,7 +823,9 @@ class SessionArtifactService:
     def _build_artifact(
         self, detected: DetectedPullRequest, command: str, external_key: str
     ) -> SessionArtifact:
-        title = extract_title_from_command(command)
+        # The title comes from the provider read that enriches the artifact
+        # (enrich-from-birth): the command text cannot be read reliably (a
+        # heredoc, a variable, shell quoting).
         draft = extract_draft_from_command(command, detected.provider)
         state: PullRequestLifecycleState = "draft" if draft else "open"
         discovered_at = _utcnow_iso()
@@ -892,11 +835,11 @@ class SessionArtifactService:
             assert detected.repo is not None
             assert detected.number is not None
             return GitHubPullRequestArtifact(
-                id=_new_artifact_id(),
+                id=_artifact_id(self._session_id, external_key),
                 session_id=self._session_id,
                 external_key=external_key,
                 external_url=detected.url,
-                display_title=title,
+                display_title=None,
                 discovered_at=discovered_at,
                 details=GitHubPullRequestDetails(
                     repo_host=detected.host,
@@ -923,11 +866,11 @@ class SessionArtifactService:
         assert detected.project_path is not None  # guarded by the caller
         assert detected.iid is not None
         return GitLabMergeRequestArtifact(
-            id=_new_artifact_id(),
+            id=_artifact_id(self._session_id, external_key),
             session_id=self._session_id,
             external_key=external_key,
             external_url=detected.url,
-            display_title=title,
+            display_title=None,
             discovered_at=discovered_at,
             details=GitLabMergeRequestDetails(
                 repo_host=detected.host,
@@ -970,7 +913,7 @@ class SessionArtifactService:
         if not self._dirty:
             return
         if self._on_artifacts_changed is not None:
-            self._on_artifacts_changed(self.list_artifacts())
+            self._on_artifacts_changed(self.list_artifacts(), self.list_worktrees())
         metadata_path = self._session_dir / METADATA_FILENAME
         if not metadata_path.is_file():
             return
@@ -979,6 +922,9 @@ class SessionArtifactService:
             raise ValueError(f"Session metadata must be an object: {metadata_path}")
         raw["artifacts"] = [
             artifact.model_dump(mode="json") for artifact in self.list_artifacts()
+        ]
+        raw["worktrees"] = [
+            worktree.model_dump(mode="json") for worktree in self.list_worktrees()
         ]
         await persist_metadata(raw, self._session_dir)
         self._dirty = False
@@ -993,6 +939,17 @@ def _has_complete_coordinates(detected: DetectedPullRequest) -> bool:
             and detected.number is not None
         )
     return detected.project_path is not None and detected.iid is not None
+
+
+def _artifact_head(artifact: SessionArtifact) -> PullRequestHead | None:
+    details = artifact.details
+    if details is None or not details.source_branch:
+        return None
+    if isinstance(details, GitHubPullRequestDetails):
+        repo_path = f"{details.repo_owner}/{details.repo_name}"
+    else:
+        repo_path = details.project_path
+    return (details.repo_host, repo_path, details.source_branch)
 
 
 def _artifact_is_draft(artifact: SessionArtifact) -> bool:
@@ -1061,14 +1018,17 @@ def _enrichment_fields(
         "target_branch": details.target_branch,
         "author": details.author,
         "state": details.state,
+        "is_in_merge_queue": details.is_in_merge_queue,
         "provider_created_at": details.provider_created_at,
         "provider_updated_at": details.provider_updated_at,
         "provider_closed_at": details.provider_closed_at,
         "provider_merged_at": details.provider_merged_at,
         "merge_commit_sha": details.merge_commit_sha,
         "pr_status": details.pr_status,
+        "pr_status_reason": details.pr_status_reason,
         "checks": _to_public_checks(details.checks),
         "checks_status": details.checks_status,
+        "optional_checks_status": details.optional_checks_status,
         "review_decision": details.review_decision,
         "merge_status": details.merge_status,
     }
@@ -1100,7 +1060,10 @@ def _to_public_details(
 
 
 def to_public_artifact(artifact: SessionArtifact) -> PublicSessionArtifact:
-    """Project a stored artifact onto its wire (camelCase) form."""
+    """Project a stored artifact onto its wire (camelCase) form, with its
+    status as last read from its provider (:func:`with_cached_status`).
+    """
+    artifact = with_cached_status(artifact)
     return PublicSessionArtifact(
         id=artifact.id,
         session_id=artifact.session_id,
@@ -1114,13 +1077,20 @@ def to_public_artifact(artifact: SessionArtifact) -> PublicSessionArtifact:
     )
 
 
+def to_public_worktree(worktree: WorktreeArtifact) -> PublicWorktreeArtifact:
+    # Kept apart from the stored model like PRs are: the wire is camelCase and
+    # must not change when meta.json does.
+    return PublicWorktreeArtifact.model_validate(worktree.model_dump())
+
+
 class ArtifactRequestHandler:
     """Serves the ``artifacts/`` RPC namespace for one session.
 
     Mirrors the ``review/`` handler shape: constructed by the session adapter
-    with its dependencies, dispatched per method. When PR monitoring is off the
-    service is ``None`` and every call answers empty — the namespace exists so
-    clients do not branch on the flag.
+    with its dependencies, dispatched per method. The service answers from the
+    persisted artifacts whether PR monitoring is on or off; the flag gates
+    detection and provider reads. ``artifacts/sync`` is the host's
+    (``SessionBackendHostArtifacts.sync_artifacts``).
 
     ``emit_updated`` announces each artifact a ``markViewed`` call newly marks
     (the ``artifacts/updated`` notification); the adapter supplies it because
@@ -1149,8 +1119,14 @@ class ArtifactRequestHandler:
                     if self._artifact_service is not None
                     else []
                 )
+                worktrees = (
+                    self._artifact_service.list_worktrees()
+                    if self._artifact_service is not None
+                    else []
+                )
                 response: ProtocolModel = ArtifactsListResponse(
-                    artifacts=[to_public_artifact(a) for a in artifacts]
+                    artifacts=[to_public_artifact(a) for a in artifacts],
+                    worktrees=[to_public_worktree(w) for w in worktrees],
                 )
             case "artifacts/markViewed":
                 params = validate_wire(ArtifactsMarkViewedParams, raw_params)
@@ -1162,23 +1138,6 @@ class ArtifactRequestHandler:
                 )
                 if self._emit_updated is not None:
                     for artifact in marked:
-                        await self._emit_updated(artifact)
-                response = EmptyResponse()
-            case "artifacts/sync":
-                # Client-driven provider sync (Phase 4): the Desktop fires it
-                # for a project's local sessions on project switch. No-op
-                # when the service is absent (PR monitoring off).
-                params = validate_wire(ArtifactsSyncParams, raw_params)
-                self._require_session(params.session_id)
-                changed = (
-                    await self._artifact_service.sync_artifacts(
-                        trigger="client_request"
-                    )
-                    if self._artifact_service is not None
-                    else []
-                )
-                if self._emit_updated is not None:
-                    for artifact in changed:
                         await self._emit_updated(artifact)
                 response = EmptyResponse()
             case _:

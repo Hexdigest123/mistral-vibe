@@ -2,17 +2,20 @@
 """Layer 3: facts shipped in the code for models we know, used with no network.
 
 Rows are tried in order and the first match wins, so a specific pattern comes before a
-general one. A pattern matches the lowercased model id after its last `/`. Rows never
-carry a threshold; the threshold comes from the user or the rule.
+general one. A pattern matches the lowercased model id after its last `/`; a pattern
+with a `/` matches the whole lowercased id, for a fact true only on one route prefix.
+Rows never carry a threshold; the threshold comes from the user or the rule.
 """
 
 from collections.abc import Sequence
+from dataclasses import replace
 from fnmatch import fnmatchcase
 
 from .types import (
     NO_REASONING,
     TEXT_AND_IMAGE,
     TEXT_ONLY,
+    FixedImageCost,
     KnownModel,
     ReasoningControl,
     ReasoningLevel,
@@ -74,22 +77,32 @@ def _openai_model(
     )
 
 
+_GPT_5_5 = _openai_model(
+    1_050_000, ReasoningSupport(_OPENAI_TO_XHIGH, can_turn_off=True)
+)
+
+
+# The most one image costs on these Mistral models: a 1,540-pixel side in 28-pixel
+# cells gives 55 rows of 55 image tokens, each row ended by one more token.
+_MISTRAL_IMAGE_COST = FixedImageCost(tokens=3_080)
 _MISTRAL_MEDIUM_3_5 = KnownModel(
     context_window=262_144,
     input_modalities=TEXT_AND_IMAGE,
     reasoning=ReasoningSupport(("high",), can_turn_off=True),
+    image_cost=_MISTRAL_IMAGE_COST,
 )
-# The Mistral API card lists mistral-large-latest as an alias of mistral-large-2512,
-# a model without reasoning that rejects every reasoning effort.
+# Mistral Large 2512 has no reasoning and rejects every reasoning effort.
 _MISTRAL_LARGE_2512 = KnownModel(
-    context_window=262_144, input_modalities=TEXT_AND_IMAGE, reasoning=NO_REASONING
+    context_window=262_144,
+    input_modalities=TEXT_AND_IMAGE,
+    reasoning=NO_REASONING,
+    image_cost=_MISTRAL_IMAGE_COST,
 )
-# The Mistral API takes only the efforts low, high and max for Mistral Large 4,
-# and rejects none, so its reasoning cannot be turned off.
 _MISTRAL_LARGE_4 = KnownModel(
     context_window=1_048_576,
     input_modalities=TEXT_AND_IMAGE,
-    reasoning=ReasoningSupport(("low", "high", "max"), can_turn_off=False),
+    reasoning=ReasoningSupport(("low", "medium", "high"), can_turn_off=False),
+    image_cost=_MISTRAL_IMAGE_COST,
 )
 
 # The Mistral API lists this window and no image input for GLM 5.3, and takes only
@@ -114,7 +127,7 @@ KNOWN_MODELS: Sequence[KnownModelRow] = (
         _MISTRAL_MEDIUM_3_5,
     ),
     (("mistral-large-4", "mistral-large-4-0"), _MISTRAL_LARGE_4),
-    (("mistral-large-2512", "mistral-large-latest"), _MISTRAL_LARGE_2512),
+    (("mistral-large-2512",), _MISTRAL_LARGE_2512),
     (("zai-glm-5-3", "zai-glm-5", "zai-glm-latest"), _GLM_5_3),
     (_claude("claude-haiku-5-5"), _claude_model(can_turn_off=True)),
     (
@@ -158,10 +171,12 @@ KNOWN_MODELS: Sequence[KnownModelRow] = (
         ),
         _openai_model(1_050_000, ReasoningSupport(_ALL_LEVELS, can_turn_off=True)),
     ),
-    (
-        _openai("gpt-5.5", "gpt-5.4"),
-        _openai_model(1_050_000, ReasoningSupport(_OPENAI_TO_XHIGH, can_turn_off=True)),
-    ),
+    # A deployment limit, not a model fact: an Azure AI deployment of gpt-5.5 served
+    # under the `azure_ai/` route id answers HTTP 500 to any image, in a user or a
+    # tool message, so it gets `[Image]` instead. Remove this row once that route
+    # answers an image in a user message.
+    (_openai("azure_ai/gpt-5.5"), replace(_GPT_5_5, input_modalities=TEXT_ONLY)),
+    (_openai("gpt-5.5", "gpt-5.4"), _GPT_5_5),
     (_openai("gpt-5.5-pro", "gpt-5.4-pro"), _openai_model(1_050_000, _OPENAI_PRO)),
     (
         _openai("gpt-5-pro"),
@@ -207,8 +222,12 @@ def find_known_model(
     model: str, rows: Sequence[KnownModelRow] = KNOWN_MODELS
 ) -> KnownModel | None:
     """Return the first row matching the model id, or `None`."""
-    name = model.rsplit("/", 1)[-1].lower()
+    model_id = model.lower()
+    name = model_id.rsplit("/", 1)[-1]
     for patterns, known in rows:
-        if any(fnmatchcase(name, pattern) for pattern in patterns):
+        if any(
+            fnmatchcase(model_id if "/" in pattern else name, pattern)
+            for pattern in patterns
+        ):
             return known
     return None

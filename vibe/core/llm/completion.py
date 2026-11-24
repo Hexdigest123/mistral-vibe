@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -11,11 +12,12 @@ from vibe.core.types import FileImageSource, InlineImageSource, LLMMessage, Role
 from vibe.utils.api_keys import resolve_api_key
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from mistralai_vibe_local_harness.protocol import RustContentBlock, RustMessage
     from mistralai_vibe_local_harness.vibe import (
         LocalRuntimeAdapterConfig,
+        ProviderCredentialProvider,
         UtilityReply,
     )
     from mistralai_vibe_local_harness.vibe.completion_profile import (
@@ -64,23 +66,43 @@ async def complete_once(
     transport: CompletionTransport,
     temperature: float | None = None,
     request_thinking: RequestReasoning | None = None,
+    credentials: ProviderCredentialProvider | None = None,
+    on_request: Callable[[str], None] | None = None,
 ) -> UtilityReply:
     """One completion outside a turn, on the Harness provider adapters.
 
-    Raises ``UtilityCompletionError`` when the provider call fails.
+    ``credentials`` is the session's credential for ``provider`` (the
+    connection's sign-in for a Mistral provider); without it, the provider's
+    API key. Raises ``UtilityCompletionError`` when the provider call fails,
+    or when ``credentials`` has no credential to send. ``on_request`` gets the
+    reasoning setting the request sends just before the provider call.
     """
     # Imported here: the Harness pulls the provider SDKs, which stay off the
     # CLI startup path.
     from mistralai_vibe_local_harness.vibe import (
         LocalModelRoute,
         LocalRuntimeAdapterConfig,
+        ProviderAuthRequired,
         ProviderCredentialSnapshot,
+        UtilityCompletionError,
         execute_utility_completion,
+        sent_reasoning,
     )
 
-    token = (
-        resolve_api_key(provider.api_key_env_var) if provider.api_key_env_var else None
-    )
+    if credentials is None:
+        token = (
+            resolve_api_key(provider.api_key_env_var)
+            if provider.api_key_env_var
+            else None
+        )
+        credential = ProviderCredentialSnapshot(
+            token=token, headers={}, revision=provider.name
+        )
+    else:
+        resolved = await credentials.resolve()
+        if isinstance(resolved, ProviderAuthRequired):
+            raise UtilityCompletionError(resolved.message, status=None, rejection=None)
+        credential = resolved
     config = LocalRuntimeAdapterConfig(
         provider=provider.name,
         backend=str(provider.backend),
@@ -89,6 +111,7 @@ async def complete_once(
         max_tokens=max_tokens,
         reasoning_field_name=provider.reasoning_field_name,
         emits_finish_reason=provider.emits_finish_reason,
+        tool_result_images=provider.sends_tool_result_images,
         extra_headers=provider.extra_headers,
         project_id=provider.project_id,
         region=provider.region,
@@ -109,15 +132,26 @@ async def complete_once(
         request_thinking=request_thinking,
         max_output_tokens=model.max_output_tokens,
     )
-    return await execute_utility_completion(
-        _harness_messages(messages),
-        config=config,
-        credential=ProviderCredentialSnapshot(
-            token=token, headers={}, revision=provider.name
-        ),
-        route=route,
-        metadata=metadata,
-    )
+    if on_request is not None:
+        on_request(sent_reasoning(config, route))
+    try:
+        return await execute_utility_completion(
+            _harness_messages(messages),
+            config=config,
+            credential=credential,
+            route=route,
+            metadata=metadata,
+        )
+    except UtilityCompletionError as exc:
+        if credentials is not None and exc.rejection is not None:
+            # Told so the same refused material is not sent again; bookkeeping
+            # must not hide the provider's own failure.
+            refused = credential.revision
+            with suppress(Exception):
+                await credentials.reject(
+                    observed_revision=refused, reason=exc.rejection
+                )
+        raise
 
 
 def _compile_reasoning(

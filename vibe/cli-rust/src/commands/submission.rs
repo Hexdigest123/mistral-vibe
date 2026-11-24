@@ -10,17 +10,15 @@ use crate::server::{
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use super::{dispatch, is_side_channel, parse, waits_for_jobs};
-use crate::app::{App, QueuedPrompt, Status, ToastSeverity};
-use crate::input_modes::{classify, classify_submitted, submitted_value, ClassifiedInput};
+use super::{dispatch, drops_queue, is_side_channel, parse, runs, waits_for_jobs};
+use crate::app::{App, QueuedPrompt, Severity, Status};
+use crate::input_modes::{classify_submitted, submitted_value, ClassifiedInput};
 use crate::startup::banners;
 use crate::telemetry::TelemetrySender;
 use crate::transcript::local;
 use crate::{completion_manager, config, message_queue};
 
 pub(super) const NOTICE_TIMEOUT_SECS: u64 = 4;
-/// Toast timeout (5s).
-const TOAST_SECS: u64 = 5;
 
 /// Replay slash commands deferred while the session was starting.
 /// Returns true if a deferred `/exit` was replayed, so the caller can quit.
@@ -48,16 +46,9 @@ pub fn flush_pending(
             saved_input = value;
             restore_rejected = true;
         }
-        app.show_toast(message, ToastSeverity::Warning, TOAST_SECS);
+        crate::ui::notice::show_sticky(app, Severity::Warning, &message);
     };
     for value in pending {
-        if let ClassifiedInput::Teleport { target } = classify(&value, &[]) {
-            match reject_hint(app) {
-                Some(hint) => reject(app, value, teleport_rejection(hint)),
-                None => crate::teleport::submit(app, client, target),
-            }
-            continue;
-        }
         let Some(command) = parse(&value) else {
             continue;
         };
@@ -93,13 +84,20 @@ pub fn submit(
 ) -> bool {
     let mode = app.chat_input.mode;
     let value = submitted_value(mode, &app.chat_input.submitted_text());
-    if matches!(app.session.status, Status::Failed) {
+    // The session being opened is not the one shown yet: the draft waits for it.
+    if matches!(app.session.status, Status::Failed) || crate::sessions_page::switching(app) {
+        return false;
+    }
+    // An interrupt taking its prompt back is still rewinding: the input waits for it.
+    if app.session.take_back_sent {
+        let text = "Restoring the interrupted prompt…";
+        crate::ui::notice::show(app, Severity::Information, text, NOTICE_TIMEOUT_SECS);
         return false;
     }
     // A held queue takes a bare Enter as "send it now"; an active turn takes it
-    // as "steer the accepted queue into this turn".
+    // as "steer the accepted queue into this turn". Neither applies while editing.
     if value.is_empty() {
-        if app.queue.paused {
+        if app.queue.paused && app.queue.selected.is_none() {
             // Releasing a held queue with Enter dismisses the what's-new body,
             // as any non-empty submission does.
             banners::dismiss_whats_new(app);
@@ -123,45 +121,27 @@ pub fn submit(
         }
         return false;
     }
-    let classified = classify_submitted(mode, &value, &app.completion.skills);
-    if !matches!(&classified, ClassifiedInput::SlashCommand { .. }) {
-        if reject_while_shell_runs(app, &value) {
-            return false;
+    let classified = match classify_submitted(mode, &value, &app.completion.skills) {
+        ClassifiedInput::SlashCommand { command } if !runs(command, |f| f.is_on(app)) => {
+            ClassifiedInput::Prompt {
+                text: value.clone(),
+            }
         }
-        if app.vibe_code_project.pending {
-            reject_input(
-                app,
-                &value,
-                "Wait for the project request to finish.".into(),
-            );
+        classified => classified,
+    };
+    if !matches!(
+        &classified,
+        ClassifiedInput::SlashCommand { .. } | ClassifiedInput::RemovedCommand { .. }
+    ) {
+        if reject_while_shell_runs(app, &value) {
             return false;
         }
         if app.agents.installing {
             reject_input(app, &value, "Wait for the agent install to finish.".into());
             return false;
         }
-        if app.teleport.is_some()
-            && matches!(
-                &classified,
-                ClassifiedInput::Prompt { .. } | ClassifiedInput::Skill { .. }
-            )
-        {
-            reject_input(app, &value, "Wait for the teleport to finish.".into());
-            return false;
-        }
     }
     match classified {
-        ClassifiedInput::Teleport { target } => {
-            if matches!(app.session.status, Status::Starting) {
-                clear_and_remember(app, &value);
-                app.pending_commands.push(value);
-            } else if let Some(hint) = reject_hint(app) {
-                reject_input(app, &value, teleport_rejection(hint));
-            } else {
-                clear_and_remember(app, &value);
-                crate::teleport::submit(app, client, target);
-            }
-        }
         ClassifiedInput::SlashCommand { command } => {
             // Defer every slash command until the session is ready: nothing
             // dispatches before it.
@@ -195,6 +175,12 @@ pub fn submit(
                 message_queue::enqueue_prompt(app, client, command);
                 message_queue::resume(app, client);
             }
+        }
+        ClassifiedInput::RemovedCommand { command, version } => {
+            let notice = format!("{command} was removed in Vibe {version}.");
+            crate::ui::notice::show_sticky(app, Severity::Warning, &notice);
+            remember(app, &value);
+            crate::telemetry::slash_command_used(app, command, "removed");
         }
         ClassifiedInput::Bash { command } => {
             if let Some(hint) = reject_hint(app) {
@@ -262,51 +248,57 @@ fn record_loop_usage(app: &App, value: &str) {
 }
 
 fn reject_input(app: &mut App, value: &str, message: String) {
-    app.show_toast(message, ToastSeverity::Warning, TOAST_SECS);
+    crate::ui::notice::show_sticky(app, Severity::Warning, &message);
     remember(app, value);
     app.chat_input.cursor = 0;
     completion_manager::input_changed(app);
 }
 
-fn teleport_rejection(hint: &str) -> String {
-    format!("Teleport cannot be queued — {hint}")
-}
-
 /// Why this slash command cannot run now.
 fn command_hint(app: &App, command: &str) -> Option<&'static str> {
     if !is_side_channel(command) {
-        return reject_hint(app);
+        return idle_hint(app, drops_queue(command));
     }
-    let job_running = app.compacting
-        || app.teleport.is_some()
-        || app.vibe_code_project.pending
-        || app.agents.installing;
+    let job_running = app.compacting || app.agents.installing;
     (job_running && waits_for_jobs(command)).then_some("wait for the current job to finish.")
+}
+
+/// Why rewind mode, which drops the queue, cannot open now: double-Esc follows typed `/rewind`'s gate.
+pub(crate) fn rewind_hint(app: &App) -> Option<&'static str> {
+    idle_hint(app, true)
 }
 
 /// Whether a typed non-side-channel command such as `/model` would run at once: `submit`'s gates, without deferring or rejecting.
 pub(crate) fn accepts_idle_command(app: &App) -> bool {
     !matches!(app.session.status, Status::Starting | Status::Failed)
         && !shell_in_flight(app)
-        && reject_hint(app).is_none()
+        && idle_hint(app, false).is_none()
 }
 
-/// Why a non-side-channel command cannot run now.
-fn reject_hint(app: &App) -> Option<&'static str> {
-    if app.queue.paused {
-        return Some("clear the queue first or remove this input.");
+/// Why a non-side-channel command cannot run now; a paused queue holds back only those that drop it.
+fn idle_hint(app: &App, drops_queue: bool) -> Option<&'static str> {
+    if app.queue.paused && !drops_queue && !working(app) {
+        return None;
     }
-    // Compaction runs as an agent job, so it counts as busy too.
-    if matches!(app.session.status, Status::Generating { .. })
-        || app.compacting
-        || app.vibe_code_project.pending
-        || app.agents.installing
-        || app.teleport.is_some()
-        || !app.queue.is_empty()
-    {
+    reject_hint(app)
+}
+
+/// Why a non-side-channel command or a shell command cannot run now.
+fn reject_hint(app: &App) -> Option<&'static str> {
+    if working(app) {
         return Some("wait for the current job to finish.");
     }
-    None
+    if app.queue.paused {
+        return Some("send the held prompts with Enter or remove them first.");
+    }
+    (!app.queue.is_empty()).then_some("wait for the current job to finish.")
+}
+
+/// A turn, a compaction or an agent install is running.
+fn working(app: &App) -> bool {
+    matches!(app.session.status, Status::Generating { .. })
+        || app.compacting
+        || app.agents.installing
 }
 
 pub(super) fn clear_and_remember(app: &mut App, value: &str) {
@@ -337,7 +329,13 @@ pub fn interrupt_turn(app: &mut App, client: &Arc<Client>) {
         return;
     }
     crate::telemetry::user_cancelled_action(app, "interrupt_agent");
-    local::add_interrupt(&mut app.view.transcript, &new_message_id());
+    // Before any answer, the prompt comes back to the input instead of leaving a marker.
+    if !crate::rewind::take_back_on_interrupt(app, unstarted) {
+        let marker = new_message_id();
+        local::add_interrupt(&mut app.view.transcript, &marker);
+        // A `/retry` of the interrupted turn replaces the marker with its reply.
+        super::retry::track_interrupt(app, marker);
+    }
     if unstarted {
         crate::message_queue::interrupt_on_start(app);
         return;
@@ -354,7 +352,7 @@ pub fn send_interrupt(app: &mut App, client: &Arc<Client>) {
         return;
     };
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = TurnInterruptParams {
             session_id,
             expected_turn_id: turn_id,

@@ -9,6 +9,7 @@ import re
 import shlex
 from string import Formatter
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import (
     BaseModel,
@@ -46,8 +47,8 @@ class MissingAPIKeyError(RuntimeError):
         if keyring_error:
             message = (
                 f"Can't read {env_key} from the system keyring for {provider_name} "
-                f"provider ({keyring_error}). Approve the keyring prompt or set "
-                f"the {env_key} environment variable"
+                f"provider ({keyring_error}). Unlock the system keyring or approve "
+                f"its prompt, or set the {env_key} environment variable"
             )
         super().__init__(message)
         self.env_key = env_key
@@ -132,6 +133,11 @@ class SessionLoggingConfig(BaseSettings):
         return str(Path(v).expanduser().resolve())
 
 
+# Mistral's internal AI gateway, an OpenAI-compatible proxy whose vision models
+# take images in a tool message.
+_TOOL_RESULT_IMAGE_HOSTS = frozenset({"internal-ai-gateway.mistralai.com"})
+
+
 class ProviderConfig(BaseModel):
     name: str
     api_base: str
@@ -161,6 +167,12 @@ class ProviderConfig(BaseModel):
     # provider's /models endpoint offers in the model picker. Fetched once per
     # boot and cached under the system temp dir (vibe.core.models).
     discover: bool = False
+    # Whether this provider takes images in a tool message, which the OpenAI
+    # Chat Completions spec does not allow (text only). Unset (None), it is on
+    # only for a known endpoint that takes them (`sends_tool_result_images`);
+    # off, a tool result reaches the model with `[Image]` in place of each
+    # image. The `mistral` backend sends tool images whatever this says.
+    tool_result_images: bool | None = None
     project_id: str = ""
     region: str = ""
     extra_headers: dict[str, str] = Field(default_factory=dict)
@@ -196,6 +208,19 @@ class ProviderConfig(BaseModel):
             and bool(self.browser_auth_base_url)
             and bool(self.browser_auth_api_base_url)
         )
+
+    @property
+    def sends_tool_result_images(self) -> bool:
+        """Whether tool-result images go in the tool message.
+
+        The provider's ``tool_result_images`` when set, False included;
+        otherwise on only for an endpoint known to take them. Derived on read,
+        so a copy with another ``api_base`` never keeps a stale value.
+        """
+        if self.tool_result_images is not None:
+            return self.tool_result_images
+        host = (urlparse(self.api_base).hostname or "").rstrip(".")
+        return host in _TOOL_RESULT_IMAGE_HOSTS
 
     @property
     def uses_vertex(self) -> bool:
@@ -483,6 +508,32 @@ MCPServer = Annotated[
 ]
 
 
+class VibeBotLocalToolsEntry(BaseModel):
+    server: str = Field(
+        min_length=1, description="The name of an MCP server in your own config."
+    )
+    tools: list[str] = Field(
+        default_factory=lambda: ["*"],
+        description="Tool names or globs the bot may call. Default: every tool.",
+    )
+    approval: Literal["allow", "ask"] = Field(
+        default="ask",
+        description=(
+            "allow runs a call without asking when the approval ceiling allows "
+            "it (under smart-approve: only tools read-only as the server declares "
+            "it); ask always waits for you."
+        ),
+    )
+
+    @field_validator("server", mode="after")
+    @classmethod
+    def normalize_server(cls, v: str) -> str:
+        normalized = normalize_mcp_server_name(v)
+        if not normalized:
+            raise ValueError("MCP server name must contain letters or numbers")
+        return normalized
+
+
 class ConnectorConfig(BaseModel):
     name: str = Field(description="Normalized connector alias to match against.")
     disabled: bool = Field(
@@ -521,12 +572,21 @@ def refuse_zero_auto_compact_threshold(value: Any) -> Any:
     return value
 
 
+class ModelRequirement(BaseModel):
+    """What the user needs before a turn can run on a model, in the model
+    catalog's ``requires`` shape. Any other kind fails validation, so a model
+    locked in a way this client cannot upsell is never listed.
+    """
+
+    kind: Literal["higher_plan"]
+
+
 class ModelConfig(BaseModel):
     name: str
     provider: str
     alias: str
     display_name: str | None = None
-    temperature: float = 0.2
+    temperature: float = 1.0
     # Request settings read by the Unified Harness runtime only; the legacy
     # agent loop does not send them.
     # Nucleus sampling; None leaves it to the provider's default.
@@ -536,10 +596,19 @@ class ModelConfig(BaseModel):
     # A session's own ``max_tokens`` limit, ``agent_max_output_tokens`` and
     # ``compaction_max_output_tokens`` take precedence and reach every provider.
     max_output_tokens: int | None = Field(default=None, ge=1)
-    input_price: float = 0.0  # Price per million input tokens
-    output_price: float = 0.0  # Price per million output tokens
-    cached_input_price: float | None = (
-        None  # Price per million cached input tokens; None bills them at input_price
+    input_price: float = Field(
+        default=0.0, ge=0, allow_inf_nan=False
+    )  # Price per million input tokens
+    output_price: float = Field(
+        default=0.0, ge=0, allow_inf_nan=False
+    )  # Price per million output tokens
+    cached_input_price: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        description=(
+            "Price per million cached input tokens; unset bills them at input_price"
+        ),
     )
     thinking: ThinkingLevel = "off"
     # The levels this model offers, in display order. Defaults to the CLI's
@@ -558,6 +627,10 @@ class ModelConfig(BaseModel):
     # Token count before automatic compaction. None takes the global setting,
     # or else the default for the model's window.
     auto_compact_threshold: int | None = Field(default=None, gt=0)
+    # Set when the user's plan cannot run the model: it is listed so the picker
+    # can upsell it, but no turn starts on it and it is never the default. Only
+    # the model catalog and GrowthBook set it (``VibeConfigSchema.prepare_layers``).
+    requires: ModelRequirement | None = None
     _default_alias_to_name = model_validator(mode="before")(_default_alias_to_name)
     _refuse_zero_threshold = field_validator("auto_compact_threshold", mode="before")(
         refuse_zero_auto_compact_threshold
@@ -570,12 +643,12 @@ class ModelConfig(BaseModel):
         # distinct from unset, which keeps the five. The catalog mapping relies
         # on the distinction (unspecified vs explicitly none). Duplicates are
         # dropped in first-seen order: the picker renders one row per level.
-        return list(dict.fromkeys(map(_standard_case, value))) or ["off"]
+        return list(dict.fromkeys(map(standard_thinking_level, value))) or ["off"]
 
     @field_validator("thinking", mode="after")
     @classmethod
     def _thinking_in_standard_case(cls, value: ThinkingLevel) -> ThinkingLevel:
-        return _standard_case(value)
+        return standard_thinking_level(value)
 
     @property
     def default_thinking(self) -> ThinkingLevel:
@@ -609,7 +682,7 @@ class ModelConfig(BaseModel):
         return set(self.thinking_levels) != set(DEFAULT_THINKING_LEVELS)
 
 
-def _standard_case(level: ThinkingLevel) -> ThinkingLevel:
+def standard_thinking_level(level: ThinkingLevel) -> ThinkingLevel:
     """A standard word in any case is the standard level, as the harness reads it;
     a model's own level keeps its case.
     """

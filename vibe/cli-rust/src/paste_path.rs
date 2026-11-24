@@ -1,18 +1,18 @@
-//! Path-mention rewriting for pasted text and non-bracketed drag-and-drop input.
+//! Pasted and dropped paths: detection, quoting and `@` mentions.
 
 use std::path::PathBuf;
 
 const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 const QUOTES: [char; 2] = ['\'', '"'];
 const PATH_ROOTS: [char; 2] = ['/', '~'];
-const TOKEN_BOUNDARIES: [char; 3] = ['(', '<', '['];
 const NARROW_NO_BREAK_SPACE: char = '\u{202f}';
 
 mod list;
 
 pub use list::{
-    pasted_image_path, pasted_image_path_on, pasted_image_paths, pasted_image_paths_on,
-    path_candidates, path_candidates_on, paths_resolve, paths_resolve_on, MAX_PASTED_PATHS,
+    escape_on, pasted_image_path, pasted_image_path_on, pasted_image_paths, pasted_image_paths_on,
+    path_candidates, path_candidates_on, paths_resolve, paths_resolve_on, shell_path,
+    shell_path_on, unescape_on, MAX_PASTED_PATHS,
 };
 
 pub fn has_supported_path_root(candidate: &str, windows: bool) -> bool {
@@ -102,7 +102,7 @@ fn is_mention_path_char(character: char) -> bool {
     character.is_alphanumeric() || "._/\\-()[]{}~".contains(character)
 }
 
-fn is_windows_drive_path(candidate: &str) -> bool {
+pub(crate) fn is_windows_drive_path(candidate: &str) -> bool {
     let bytes = candidate.as_bytes();
     bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -110,54 +110,11 @@ fn is_windows_drive_path(candidate: &str) -> bool {
         && matches!(bytes[2], b'\\' | b'/')
 }
 
-pub fn rewrite_bare_image_paths_in_text(text: &str) -> String {
-    rewrite_bare_image_paths_in_text_on(text, cfg!(windows))
-}
-
-pub fn rewrite_bare_image_paths_in_text_on(text: &str, windows: bool) -> String {
-    rewrite_bare_image_paths_with_spans_on(text, windows).0
-}
-
-/// Rewrite bare image paths, returning each new mention's byte span too.
-pub fn rewrite_bare_image_paths_with_spans(text: &str) -> (String, Vec<(usize, usize)>) {
-    rewrite_bare_image_paths_with_spans_on(text, cfg!(windows))
-}
-
-fn rewrite_bare_image_paths_with_spans_on(
-    text: &str,
-    windows: bool,
-) -> (String, Vec<(usize, usize)>) {
-    let mut spans = Vec::new();
-    if !text.contains(['/', '~', '\'', '"', '\\']) {
-        return (text.to_owned(), spans);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut pos = 0;
-    while pos < text.len() {
-        if at_token_boundary(text, pos) {
-            if let Some((token, end)) = extract_path_token(text, pos, windows) {
-                if is_image_path_on(&token, windows) {
-                    let start = out.len();
-                    out.push('@');
-                    out.push_str(&quote_if_needed(&token, windows));
-                    spans.push((start, out.len()));
-                    pos = end;
-                    continue;
-                }
-            }
-        }
-        let ch = text[pos..].chars().next().expect("position is in bounds");
-        out.push(ch);
-        pos += ch.len_utf8();
-    }
-    (out, spans)
-}
-
 pub fn is_image_path(candidate: &str) -> bool {
     is_image_path_on(candidate, cfg!(windows))
 }
 
-// Existence is validated by prompt preparation; composer rewriting stays I/O-free.
+// Existence is validated by prompt preparation; paste detection stays I/O-free.
 fn is_image_path_on(candidate: &str, windows: bool) -> bool {
     rooted_path(candidate, windows).is_some_and(|path| {
         path.extension()
@@ -186,7 +143,7 @@ fn expanded_path(candidate: &str) -> Option<PathBuf> {
     Some(PathBuf::from(candidate))
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -213,16 +170,6 @@ fn strip_matched_quotes(text: &str) -> &str {
         return text;
     }
     &text[first.len_utf8()..text.len() - first.len_utf8()]
-}
-
-fn at_token_boundary(text: &str, pos: usize) -> bool {
-    if pos == 0 {
-        return true;
-    }
-    let Some(previous) = text[..pos].chars().next_back() else {
-        return true;
-    };
-    previous != '@' && (previous.is_whitespace() || TOKEN_BOUNDARIES.contains(&previous))
 }
 
 fn extract_path_token(text: &str, pos: usize, windows: bool) -> Option<(String, usize)> {

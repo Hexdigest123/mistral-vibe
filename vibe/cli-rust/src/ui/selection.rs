@@ -23,11 +23,19 @@ pub(crate) fn frame_region(area: Rect) -> crate::selection::Region {
     }
 }
 
-/// Register the loading row for mouse routing and paint its selection overlay.
+/// Register the loading row and the rail on it for mouse routing, and paint its selection overlay.
 pub(crate) fn loading_region(app: &mut App, f: &mut Frame, area: Rect) {
     crate::mouse::register_region(app, area, crate::mouse::MouseTarget::Loading);
+    crate::mouse::register_region(app, app.rail.area, crate::mouse::MouseTarget::Rail);
     app.view.loading_selection_region = frame_region(area);
     overlay_region(app, f, RegionId::Loading);
+}
+
+/// Register the goal row for mouse routing and paint its selection overlay.
+pub(crate) fn goal_region(app: &mut App, f: &mut Frame, area: Rect) {
+    crate::mouse::register_region(app, area, crate::mouse::MouseTarget::GoalRow);
+    app.view.goal_selection_region = frame_region(area);
+    overlay_region(app, f, RegionId::Goal);
 }
 
 /// Highlight the selection inside the main screen region.
@@ -62,6 +70,7 @@ pub fn overlay_region(app: &mut App, f: &mut Frame, owner: RegionId) {
     for &span in &spans {
         paint_row(buf, content_chat, style, span);
     }
+    app.view.copy_light.paint(buf, &spans);
 }
 
 /// On the finalized (pending) frame, extract the selected text once, cache it so
@@ -82,6 +91,7 @@ fn cache_and_copy(app: &mut App, f: &mut Frame, spans: &[RowSpan]) -> bool {
         return true;
     }
     let text = region::extract_document(app)
+        .or_else(|| crate::selection::copy_preview(app, f.buffer_mut()))
         .unwrap_or_else(|| fold::extract(f.buffer_mut(), spans, &region::folds(app, owner)));
     if !pending {
         if let Some(selection) = app.selection.region.as_mut() {
@@ -97,8 +107,22 @@ fn cache_and_copy(app: &mut App, f: &mut Frame, spans: &[RowSpan]) -> bool {
         selection.text = text.clone();
         selection.pending_copy = false;
     }
-    notice::copy_if_autocopy(app, &text);
+    autocopy(app, &text);
     true
+}
+
+/// Autocopy a transcript or bottom-bar selection and flash it; composer copies never flash, the user is editing there.
+pub fn autocopy(app: &mut App, text: &str) {
+    if notice::copy_if_autocopy(app, text) {
+        flash(app);
+    }
+}
+
+/// Flash a copied transcript or bottom-bar selection, unless its animation is off.
+pub fn flash(app: &mut App) {
+    if !app.session.startup_config.disable_selection_animation {
+        app.view.copy_light.start();
+    }
 }
 
 /// Highlight one row; a group header's label is dimmed, its marker keeps the raw selection style.

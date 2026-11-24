@@ -1,17 +1,25 @@
 //! Loading area: a spinner, gradient status label, and key hints.
 
+pub mod easter_eggs;
 pub mod failure;
 mod hint;
+mod line;
 mod snake;
+mod wrap;
 
-use std::time::{Duration, Instant};
+pub(crate) use hint::queue as queue_hints;
+
+use std::time::Duration;
+
+use crate::clock::UiInstant;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
 use self::snake::Snake;
+use super::rng::Rng;
 use super::theme;
 use crate::app::{App, Status};
 
@@ -23,13 +31,21 @@ pub const INITIALIZING_LOADING_STATUS: &str = "Initializing";
 pub const RETRYING_LOADING_STATUS: &str = "Retrying";
 /// Label for a slash command fetching in the background (`/whoami`).
 pub const COMMAND_LOADING_STATUS: &str = "Loading";
+/// The loader of a session the Sessions page is opening.
+pub const OPENING_SESSION_STATUS: &str = "Opening session";
 pub const SHELL_LOADING_STATUS: &str = "Running command";
+/// Still glyph for later work: an agent waiting on its background work.
+const WAITING_GLYPH: &str = "◷";
 
 /// Spinner glyph + label gradient state, recreated at the start of each turn.
 pub struct LoadingAnim {
     snake: Snake,
     /// Current label text (`Generating`/`Thinking`), mirroring `_base_status`.
     label: String,
+    /// An easter egg shown in place of `label`, rolled whenever `label` changes.
+    egg: Option<&'static str>,
+    eggs: easter_eggs::Mode,
+    rng: Rng,
     /// Blocking callback label, mirroring `_action_required_status`.
     action_required: Option<String>,
     /// Label to restore once the callback is answered.
@@ -37,7 +53,7 @@ pub struct LoadingAnim {
     /// Elapsed time already accumulated before the current pause.
     paused_total: Duration,
     /// When the elapsed counter was paused, or `None` while it runs.
-    pause_start: Option<Instant>,
+    pause_start: Option<UiInstant>,
     /// Index into `theme::LOADING_GRADIENT` of the current base color.
     color_index: usize,
     /// Wipe direction through the palette: +1 up, -1 down. Ping-pongs at the ends.
@@ -48,9 +64,12 @@ pub struct LoadingAnim {
 
 impl Default for LoadingAnim {
     fn default() -> Self {
-        Self {
+        let mut anim = Self {
             snake: Snake::default(),
-            label: DEFAULT_LOADING_STATUS.to_owned(),
+            label: String::new(),
+            egg: None,
+            eggs: easter_eggs::mode(),
+            rng: Rng::default(),
             action_required: None,
             label_before_action_required: None,
             paused_total: Duration::default(),
@@ -58,14 +77,29 @@ impl Default for LoadingAnim {
             color_index: 0,
             direction: 1,
             progress: 0,
-        }
+        };
+        anim.assign(DEFAULT_LOADING_STATUS);
+        anim
     }
 }
 
 impl LoadingAnim {
-    /// Current label text (`Generating`/`Thinking`/`Retrying`).
+    /// Current label text (`Generating`/`Thinking`/`Retrying`), never an easter egg.
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    pub fn shown(&self) -> &str {
+        self.egg.unwrap_or(&self.label)
+    }
+
+    /// Change the label, rolling a new egg; setting the same label keeps the current text.
+    fn assign(&mut self, label: &str) {
+        if self.label == label {
+            return;
+        }
+        self.label = label.to_owned();
+        self.egg = easter_eggs::hatch(self.eggs, &mut self.rng, label);
     }
 
     /// Set the label without disturbing the spinner or gradient.
@@ -76,17 +110,17 @@ impl LoadingAnim {
             }
             return;
         }
-        self.label = label.to_owned();
+        self.assign(label);
     }
 
     /// Show a blocking user-action label and freeze the elapsed counter.
     pub fn begin_action_required(&mut self, label: &str) {
         if self.action_required.is_none() {
             self.label_before_action_required = Some(self.label.clone());
-            self.pause_start = Some(Instant::now());
+            self.pause_start = Some(crate::clock::now());
         }
         self.action_required = Some(label.to_owned());
-        self.label = label.to_owned();
+        self.assign(label);
     }
 
     /// Resume progress once the callback has been answered.
@@ -95,26 +129,27 @@ impl LoadingAnim {
             return;
         }
         if let Some(pause_start) = self.pause_start.take() {
-            self.paused_total += pause_start.elapsed();
+            self.paused_total += crate::clock::since(pause_start);
         }
-        self.label = self
+        let label = self
             .label_before_action_required
             .take()
             .unwrap_or_else(|| DEFAULT_LOADING_STATUS.to_owned());
+        self.assign(&label);
     }
 
     /// Turn elapsed time, excluding whatever a blocking callback froze.
-    fn elapsed(&self, since: Instant) -> Duration {
+    fn elapsed(&self, since: UiInstant) -> Duration {
         let running = match self.pause_start {
             Some(pause_start) => pause_start.duration_since(since),
-            None => since.elapsed(),
+            None => crate::clock::since(since),
         };
         running.saturating_sub(self.paused_total)
     }
 
     /// Colored positions: the spinner (0), each label char, then the ellipsis.
     fn total_elements(&self) -> usize {
-        1 + self.label.chars().count() + 1
+        1 + self.shown().chars().count() + 1
     }
 
     /// Advance one tick: step the snake and the gradient wipe front.
@@ -131,6 +166,21 @@ impl LoadingAnim {
         }
     }
 
+    /// The spinner and `label` in this animation's moving gradient, one span
+    /// per character, then `suffix` (`…`, or `… ` before more of the line).
+    pub fn spans(&self, label: &str, suffix: &str) -> Vec<Span<'static>> {
+        let color = |pos: usize| Style::default().fg(self.color_at(pos));
+        let mut spans = vec![Span::styled(self.snake.render(), color(0)), Span::raw(" ")];
+        for (i, ch) in label.chars().enumerate() {
+            spans.push(Span::styled(ch.to_string(), color(1 + i)));
+        }
+        spans.push(Span::styled(
+            suffix.to_owned(),
+            color(1 + label.chars().count()),
+        ));
+        spans
+    }
+
     /// The color for a position: before the wipe front shows the next color.
     fn color_at(&self, pos: usize) -> Color {
         let g = theme::LOADING_GRADIENT;
@@ -143,118 +193,67 @@ impl LoadingAnim {
 }
 
 pub fn draw(app: &App, f: &mut Frame, area: Rect) {
-    // Keep the normal top padding; startup uses the last row to sit against the input.
-    if area.height < 2 {
+    // Keep the normal top padding; startup uses the last rows to sit against the input.
+    // A viewed child shows its own status, never the main session's startup failure.
+    if area.height < 2 || (app.subagents.viewed_child().is_none() && failure::draw(app, f, area)) {
         return;
     }
-    let content_y = if matches!(app.session.status, Status::Starting | Status::Failed) {
-        area.y + area.height - 1
-    } else {
-        area.y + 1
+    let Some(spans) = line::spans(app, area.width) else {
+        return;
     };
-    let content = Rect {
-        y: content_y,
-        height: 1,
-        ..area
+    let rows = wrap::rows(spans, area.width);
+    let height = (rows.len() as u16).min(area.height - 1);
+    let top = match matches!(app.session.status, Status::Starting | Status::Failed) {
+        true => area.bottom() - height,
+        false => area.y + 1,
     };
-
-    // The main loading row is hidden while a subagent is viewed, which
-    // shows the subagent's own status instead (Running / Waiting for input).
-    if let Some(child) = app.subagents.viewed_child() {
-        if let Some(status) = crate::subagents::subagent_loading_status(child.status) {
-            let anim = &app.view.loading;
-            let color = |pos: usize| Style::default().fg(anim.color_at(pos));
-            f.render_widget(
-                Line::from(vec![
-                    Span::styled(anim.snake.render(), color(0)),
-                    Span::raw(" "),
-                    Span::styled(status.to_owned(), color(1)),
-                ]),
-                content,
-            );
-        }
-        return;
+    for (y, row) in (top..).zip(rows).take(usize::from(height)) {
+        f.render_widget(
+            row,
+            Rect {
+                y,
+                height: 1,
+                ..area
+            },
+        );
     }
+}
 
-    if failure::draw(app, f, area) {
-        return;
-    }
-    let teleport_since = crate::teleport::loading_since(app);
-    // Queue mode's own keys replace every other hint for exactly as long as it lasts.
-    let queue_hints = crate::input::composer_reachable(app)
-        .then(|| crate::message_queue::mode_hints(app))
-        .flatten();
-    if !app.view.command_loading
-        && teleport_since.is_none()
-        && !matches!(
-            app.session.status,
-            Status::Starting | Status::Generating { .. }
-        )
-    {
-        if let Some(hints) = queue_hints {
-            let mut spans = Vec::new();
-            hint::push(&mut spans, String::new(), hints);
-            f.render_widget(Line::from(spans), content);
-        }
-        return;
-    }
-    let anim = &app.view.loading;
-    let color = |pos: usize| Style::default().fg(anim.color_at(pos));
+/// The rows the loading line takes at `width`, its hints wrapped instead of cut.
+pub fn rows(app: &App, width: u16) -> u16 {
+    line::spans(app, width).map_or(1, |spans| wrap::rows(spans, width).len().max(1) as u16)
+}
 
-    let mut spans: Vec<Span> = Vec::new();
+/// Columns the loading line takes unwrapped, so the rail beside it never clips it.
+pub fn width(app: &App) -> u16 {
+    spans_width(&line::measured(app, None).unwrap_or_default())
+}
 
-    // Snake spinner glyph + gap.
-    spans.push(Span::styled(anim.snake.render(), color(0)));
-    spans.push(Span::raw(" "));
+/// The columns a waiting line shrinks to (`◷ Waiting…`); `None` for a line that does not shrink.
+pub fn narrow_width(app: &App) -> Option<u16> {
+    let narrow = spans_width(&line::measured(app, Some(0)).unwrap_or_default());
+    (narrow < width(app)).then_some(narrow)
+}
 
-    // Label, one color-cycled span per character, then the trailing "… ".
-    for (i, ch) in anim.label.chars().enumerate() {
-        spans.push(Span::styled(ch.to_string(), color(1 + i)));
-    }
-    spans.push(Span::styled("… ", color(1 + anim.label.chars().count())));
+/// Columns `spans` take on one row.
+fn spans_width(spans: &[Span]) -> u16 {
+    let width: usize = spans.iter().map(Span::width).sum();
+    u16::try_from(width).unwrap_or(u16::MAX)
+}
 
-    // Background slash commands have no timer or controls; manual shell commands do.
-    // Startup keeps queue cancellation available without offering turn interruption.
-    let background = app.view.command_loading && app.session.shell_operation_id.is_none();
-    if background || app.session.status == Status::Starting {
-        let hints = match queue_hints {
-            Some(hints) => hints.to_vec(),
-            None if background => Vec::new(),
-            None => hint::starting(app),
-        };
-        hint::push(&mut spans, String::new(), &hints);
-        f.render_widget(Line::from(spans), content);
-        return;
-    }
-
-    // Status is always `Generating` here (draw returned above otherwise).
-    let elapsed = match (app.session.shell_started_at, app.session.status) {
-        (Some(since), _) => anim.elapsed(since),
-        (None, Status::Generating { since }) => anim.elapsed(since),
-        _ => teleport_since.map_or_else(Duration::default, |since| anim.elapsed(since)),
-    };
-    let hints = queue_hints.map_or_else(|| hint::running(app), <[_]>::to_vec);
-    hint::push(
-        &mut spans,
-        format!("{} ", format_elapsed(elapsed.as_secs())),
-        &hints,
-    );
-
-    // A callback is waiting for the user to stop typing.
-    if crate::question_app::waiting(app)
-        || (app.approval.active.is_none() && app.approval.has_pending())
-    {
-        spans.push(Span::styled(
-            " typing detected, waiting…",
-            Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
-        ));
-    }
-
-    f.render_widget(Line::from(spans), content);
+/// Columns of the loading line's widest part that cannot wrap or shrink, so a narrow column never clips its label.
+pub fn min_width(app: &App) -> u16 {
+    let spans = line::measured(app, Some(0)).unwrap_or_default();
+    let widest = wrap::rows(spans, 0)
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0);
+    u16::try_from(widest).unwrap_or(u16::MAX)
 }
 
 /// `Ns`, then `NmNs`, then `NhNmNs`.
-fn format_elapsed(seconds: u64) -> String {
+pub(super) fn format_elapsed(seconds: u64) -> String {
     if seconds < 60 {
         return format!("{seconds}s");
     }

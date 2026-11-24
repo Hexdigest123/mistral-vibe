@@ -17,7 +17,12 @@ from vibe.config_values import (
 # Where a model comes from, as the pickers group it: `project` covers project
 # config, agent profile, env and session overrides; `local` the user config and
 # built-ins.
-ModelSource = Literal["admin", "growthbook", "catalog", "project", "local"]
+ModelSource = Literal["admin", "catalog", "project", "local"]
+
+
+class ModelRequirementView(ProtocolModel):
+    # The model catalog's ``requires`` shape; the only kind a client is shown.
+    kind: Literal["higher_plan"]
 
 
 class ModelConfigView(ProtocolModel):
@@ -44,6 +49,9 @@ class ModelConfigView(ProtocolModel):
     # defines it; None from an older server (ADR 0014) or when no known layer
     # defines it.
     source: ModelSource | None = None
+    # Set when the user's plan cannot run the model: listed so the picker can
+    # upsell it, but a turn on it is refused. None from an older server (ADR 0014).
+    requires: ModelRequirementView | None = None
 
 
 class TranscribeModelConfigView(ProtocolModel):
@@ -92,16 +100,28 @@ class ConfigView(ProtocolModel):
     # Cold-cache first launch
     awaiting_experiment_model: bool = False
     default_model_alias: str
-    default_agent: str = "accept-edits"
+    default_agent: str = "default"
+    default_approval_policy: str = "accept-edits"
     theme: str
     log_level: str | None
     disable_welcome_banner_animation: bool
+    # Preserve the copy animation when reading an older app-server response (ADR 0014).
+    disable_selection_animation: bool = False
     # Preserve blinking when reading an older app-server response (ADR 0014).
     cursor_blink: bool = True
-    show_greeting: bool
+    # Preserve the plain input when reading an older app-server response (ADR 0014).
+    vim_keybindings: bool = False
+    # Preserve the warning when reading an older app-server response (ADR 0014).
+    show_dangerous_directory_warning: bool = True
     autocopy_to_clipboard: bool
     # Preserve mouse capture when reading an older app-server response (ADR 0014).
     enable_mouse_capture: bool = True
+    # Preserve the pinned prompt when reading an older app-server response (ADR 0014).
+    enable_sticky_prompt: bool = True
+    # Keep every turn's details shown when reading an older app-server response (ADR 0014).
+    collapse_turn_details: bool = False
+    # Preserve @ file completion when reading an older app-server response (ADR 0014).
+    enable_file_autocomplete: bool = True
     file_watcher_for_autocomplete: bool
     ask_confirmation_on_exit: bool
     voice_mode_enabled: bool
@@ -109,17 +129,22 @@ class ConfigView(ProtocolModel):
     show_thinking_nodes: bool
     show_subagent_status_list: bool
     worktree_limit: int
+    # Preserve the checkout placement when reading an older app-server
+    # response (ADR 0014).
+    auto_worktree: bool = False
     enable_update_checks: bool
     enable_notifications: bool
     # ADR 0015: the outbound TLS trust policy the Rust client's update
     # gateway applies; the server keeps its own copy for MCP/connector TLS.
     enable_system_trust_store: bool = False
     experimental_enable_tab_status: bool
-    # Consent gate for client-local sinks (the Rust client's crash reporter).
-    # Datalake events stay server-gated; clients never decide that.
-    enable_telemetry: bool = True
+    # The Rust client's crash-reporter gate: telemetry on and a deployment that
+    # is not self-hosted. Datalake events stay server-gated.
+    crash_reports_enabled: bool = False
     experimental_enable_registry_skills: bool = False
-    experimental_enable_local_projects: bool = False
+    enable_pr_monitoring: bool = True
+    # Hides or shows the storage UI only: storage/usage/* answer either way.
+    experimental_enable_storage_usage: bool = False
     models: list[ModelConfigView]
     transcribe_models: list[str]
     tts_models: list[str]

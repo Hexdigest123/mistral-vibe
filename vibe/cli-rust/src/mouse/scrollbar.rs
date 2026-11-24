@@ -167,9 +167,14 @@ fn live_track(app: &App) -> Option<Track> {
 }
 
 fn page(app: &mut App, track: &mut Track) {
-    let (Some(position), Some(max)) =
-        (track.state.page(track.side), track.state.max_scroll_large())
-    else {
+    let covered = match track.target {
+        MouseTarget::Transcript => app.view.sticky_prompt.map_or(0, |(_, rows)| rows.into()),
+        _ => 0,
+    };
+    let (Some(position), Some(max)) = (
+        track.state.page(track.side, covered),
+        track.state.max_scroll_large(),
+    ) else {
         return;
     };
     if track.target == MouseTarget::Transcript {
@@ -242,11 +247,21 @@ fn apply_position(app: &mut App, target: MouseTarget, position: usize, max: usiz
             app.completion.reveal = false;
         }
         MouseTarget::Approval => app.approval.detail_scroll = position,
+        MouseTarget::SkillsBody => crate::skills_browser::scroll_body_to(app, position),
+        MouseTarget::LoopsDetails => {
+            let details = &mut app.loops.details;
+            details.scroll = position.min(details.lines.saturating_sub(details.visible));
+        }
         MouseTarget::Trust => app.trust.scroll = position,
+        MouseTarget::RailWindow => crate::rail::scroll_to(app, position),
         MouseTarget::ReleaseNotes => app.release_notes.scroll = position,
+        MouseTarget::CodePreview => crate::code_preview::scroll_to(app, position),
         MouseTarget::ProxySetup => {
             app.proxy_setup.scroll = position;
             app.proxy_setup.free_scroll = true;
+        }
+        MouseTarget::SessionsPreview => {
+            crate::sessions_page::preview_view::scroll_to(app, transcript_scroll(position, max));
         }
         // The console's scrollbar position is its top line; the console's
         // scroll offset counts up from the bottom, like the transcript's.

@@ -2,11 +2,12 @@
 
 use std::collections::BTreeMap;
 
+use unicode_width::UnicodeWidthStr;
 use vibe_rs::app::App;
 use vibe_rs::completion_manager;
 use vibe_rs::utils::file_match::matching;
 use vibe_rs::utils::fuzzy::score;
-use vibe_rs::utils::text::{ellipsize, multi_line, single_line, wrap_hard};
+use vibe_rs::utils::text::{ellipsize, multi_line, single_line, wrap_hard, wrap_ranges};
 
 fn paths(entries: &[(&str, bool)]) -> BTreeMap<String, bool> {
     entries
@@ -87,9 +88,15 @@ fn tree_with_a_large_early_directory() -> BTreeMap<String, bool> {
         ("data/zz/last.txt", false),
         ("zebra.txt", false),
     ]);
-    // More entries than the fuzzy scan cap.
+    // More entries than the former 32k fuzzy scan cap, all sorted before `zebra.txt`.
     index.extend((0..40_000).map(|n| (format!("data/{n:05}.bin"), false)));
     index
+}
+
+#[test]
+fn a_fuzzy_query_reaches_entries_sorted_after_a_large_directory() {
+    let found = matching(&tree_with_a_large_early_directory(), "zebra", 10);
+    assert_eq!(found, vec!["@zebra.txt"]);
 }
 
 #[test]
@@ -153,6 +160,19 @@ fn a_partial_path_starting_mid_path_finds_the_nested_file() {
 fn matching_ties_break_alphabetically() {
     let index = paths(&[("z.rs", false), ("a.rs", false)]);
     assert_eq!(matching(&index, ".rs", 10), vec!["@a.rs", "@z.rs"]);
+}
+
+#[test]
+fn a_limited_fuzzy_search_keeps_the_best_matches_in_full_order() {
+    let mut index = paths(&[("ab", true), ("ab-c", false)]);
+    // Enough deeper matches to trim the candidates mid-scan at a limit of 3.
+    index.extend((0..10).map(|n| (format!("x{n}/zzb"), false)));
+    let all = matching(&index, "b", 100);
+    assert_eq!(all.len(), 12, "{all:?}");
+    assert_eq!(all[..2], ["@ab-c", "@ab/"], "a file and a directory tie");
+    for limit in 1..=4 {
+        assert_eq!(matching(&index, "b", limit), all[..limit], "limit {limit}");
+    }
 }
 
 #[test]
@@ -220,4 +240,26 @@ fn wrap_hard_hangs_continuations_and_cuts_unbreakable_runs() {
         vec!["/some/", "long/p", "ath"]
     );
     assert_eq!(wrap_hard("日本語です", 4), vec!["日本", "語で", "す"]);
+}
+
+#[test]
+fn wrap_hard_folds_a_long_unbroken_run_into_full_rows() {
+    let rows = wrap_hard(&"x".repeat(200_000), 76);
+    assert_eq!(rows.len(), 200_000_usize.div_ceil(76));
+    assert!(rows[..rows.len() - 1].iter().all(|row| row.len() == 76));
+    let ligatures = wrap_hard("لالالالاxxx", 4);
+    assert!(
+        ligatures.iter().all(|row| row.width() <= 4),
+        "{ligatures:?}"
+    );
+}
+
+#[test]
+fn wrap_ranges_skip_the_space_a_fold_drops_and_keep_leading_ones() {
+    assert_eq!(wrap_ranges("ab cd ef", 5), [0..5, 6..8]);
+    assert_eq!(
+        wrap_ranges("  a b", 9),
+        [std::ops::Range { start: 0, end: 5 }]
+    );
+    assert_eq!(wrap_ranges("abcdefg hi", 3), [0..3, 3..6, 6..7, 8..10]);
 }

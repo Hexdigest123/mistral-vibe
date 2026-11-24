@@ -6,11 +6,13 @@ use crossterm::event::KeyCode;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use vibe_rs::app::{App, Status};
-use vibe_rs::commands::{is_side_channel, submission, CommandEvent};
+use vibe_rs::commands::{branch, submission, CommandEvent};
 use vibe_rs::config;
+use vibe_rs::focus::Focus;
 use vibe_rs::post_ready::AccountReads;
-use vibe_rs::server::{Client, HistoryEntry, MessageContent};
+use vibe_rs::server::{Client, HistoryEntry, MessageContent, RpcError};
 
+use crate::feedback_support::notice_text;
 use crate::support::{key, settle};
 
 struct Harness {
@@ -51,12 +53,8 @@ impl Harness {
             .collect()
     }
 
-    fn last_toast(&self) -> Option<&str> {
-        self.app
-            .overlays
-            .toasts
-            .back()
-            .map(|toast| toast.text.as_str())
+    fn notice(&self) -> Option<&str> {
+        notice_text(&self.app)
     }
 }
 
@@ -71,27 +69,6 @@ async fn every_exit_alias_exits_without_starting_a_turn() {
         assert!(matches!(harness.app.session.status, Status::Ready));
         assert_eq!(harness.sent_methods().await, Vec::<String>::new());
     }
-}
-
-#[tokio::test]
-async fn branch_during_a_turn_is_refused_kept_and_never_forks() {
-    assert!(!is_side_channel("/branch"));
-    let mut harness = Harness::ready();
-    harness.app.session.active_turn_id = Some("turn".into());
-    harness.app.session.status = Status::Generating {
-        since: std::time::Instant::now(),
-    };
-
-    assert!(!harness.submit("/branch"));
-
-    assert_eq!(harness.app.chat_input.full_text(), "/branch");
-    assert!(harness
-        .last_toast()
-        .is_some_and(|text| text.starts_with("Slash commands cannot be queued")));
-    assert!(!harness
-        .sent_methods()
-        .await
-        .contains(&"session/fork".to_owned()));
 }
 
 #[tokio::test]
@@ -118,43 +95,111 @@ async fn the_fork_alias_branches_the_session_like_branch() {
 }
 
 #[tokio::test]
-async fn display_settings_run_during_a_turn_and_with_a_paused_queue() {
-    let busy_states: [fn(&mut App); 2] = [
+async fn branch_forks_at_once_while_busy_but_waits_for_a_running_job() {
+    let busy_states: [fn(&mut App); 3] = [
         |app| {
             app.session.active_turn_id = Some("turn".into());
             app.session.status = Status::Generating {
-                since: std::time::Instant::now(),
+                since: vibe_rs::clock::now(),
+            };
+        },
+        |app| {
+            app.session.status = Status::Generating {
+                since: vibe_rs::clock::now(),
             };
         },
         |app| app.queue.paused = true,
     ];
     for make_busy in busy_states {
-        for command in [
-            "/theme",
-            "/log-level",
-            "/voice",
-            "/proxy-setup",
-            "/remote-project",
-        ] {
+        let mut harness = Harness::ready();
+        make_busy(&mut harness.app);
+
+        assert!(!harness.submit("/branch"));
+
+        assert!(harness.app.chat_input.full_text().is_empty());
+        assert_eq!(harness.notice(), None);
+        assert!(harness
+            .sent_methods()
+            .await
+            .contains(&"session/fork".to_owned()));
+    }
+    let mut harness = Harness::ready();
+    harness.app.compacting = true;
+
+    assert!(!harness.submit("/branch"));
+
+    assert_eq!(harness.app.chat_input.full_text(), "/branch");
+    assert!(!harness
+        .sent_methods()
+        .await
+        .contains(&"session/fork".to_owned()));
+}
+
+#[test]
+fn a_branch_opens_the_resume_command_and_adds_no_row() {
+    let statuses = [
+        Status::Ready,
+        Status::Generating {
+            since: vibe_rs::clock::now(),
+        },
+    ];
+    for status in statuses {
+        let mut app = App::default();
+        app.session.status = status;
+
+        branch::apply_branched(&mut app, "session", "copy-id", Some("unified"));
+        app.set_status(Status::Ready);
+
+        assert_eq!(app.focus(), Focus::BranchApp);
+        assert_eq!(app.branch_app.session_id, "copy-id");
+        assert_eq!(app.view.transcript.lines().count(), 0);
+        assert_eq!(notice_text(&app), None);
+        vibe_rs::branch_app::handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.focus(), Focus::Composer);
+    }
+}
+
+#[test]
+fn a_refused_busy_branch_says_to_retry_once_the_response_ends() {
+    let error = |harness_code: &str| -> RpcError {
+        serde_json::from_value(serde_json::json!({
+            "code": "conflict",
+            "message": "server message",
+            "data": {"harnessCode": harness_code},
+        }))
+        .expect("error parses")
+    };
+
+    assert_eq!(
+        branch::branch_failure_message(&error("fork_entry_required")),
+        "Can't branch while this response is running. Try again when it finishes."
+    );
+    assert_eq!(
+        branch::branch_failure_message(&error("session_busy")),
+        "Failed to branch session: server message"
+    );
+}
+
+#[tokio::test]
+async fn display_settings_run_during_a_turn_and_with_a_paused_queue() {
+    let busy_states: [fn(&mut App); 2] = [
+        |app| {
+            app.session.active_turn_id = Some("turn".into());
+            app.session.status = Status::Generating {
+                since: vibe_rs::clock::now(),
+            };
+        },
+        |app| app.queue.paused = true,
+    ];
+    for make_busy in busy_states {
+        for command in ["/theme", "/log-level", "/voice", "/proxy-setup"] {
             let mut harness = Harness::ready();
             make_busy(&mut harness.app);
 
             assert!(!harness.submit(command));
 
             assert!(harness.app.chat_input.full_text().is_empty(), "{command}");
-            assert_eq!(harness.last_toast(), None, "{command} is not refused");
-        }
-        // The harness refuses MCP, connector and plugin changes during a turn.
-        for command in ["/mcp", "/connectors", "/plugins", "/reload-plugins"] {
-            let mut harness = Harness::ready();
-            make_busy(&mut harness.app);
-
-            assert!(!harness.submit(command));
-
-            assert_eq!(harness.app.chat_input.full_text(), command);
-            assert!(harness
-                .last_toast()
-                .is_some_and(|text| text.starts_with("Slash commands cannot be queued")));
+            assert_eq!(harness.notice(), None, "{command} is not refused");
         }
         let mut harness = Harness::ready();
         make_busy(&mut harness.app);
@@ -173,10 +218,29 @@ async fn display_settings_run_during_a_turn_and_with_a_paused_queue() {
 }
 
 #[tokio::test]
+async fn integration_changes_wait_for_a_running_turn() {
+    // The harness refuses MCP, connector and plugin changes during a turn.
+    for command in ["/mcp", "/connectors", "/plugins", "/reload-plugins"] {
+        let mut harness = Harness::ready();
+        harness.app.session.active_turn_id = Some("turn".into());
+        harness.app.session.status = Status::Generating {
+            since: vibe_rs::clock::now(),
+        };
+
+        assert!(!harness.submit(command));
+
+        assert_eq!(harness.app.chat_input.full_text(), command);
+        assert!(harness
+            .notice()
+            .is_some_and(|text| text.starts_with("Slash commands cannot be queued")));
+    }
+}
+
+#[tokio::test]
 async fn settings_wait_for_a_running_job_while_read_only_commands_still_run() {
     let jobs: [fn(&mut App); 2] = [
         |app| app.compacting = true,
-        |app| app.vibe_code_project.pending = true,
+        |app| app.agents.installing = true,
     ];
     for start_job in jobs {
         for command in ["/theme", "/proxy-setup"] {
@@ -188,7 +252,7 @@ async fn settings_wait_for_a_running_job_while_read_only_commands_still_run() {
             assert_eq!(harness.app.chat_input.full_text(), command);
             assert!(!harness.app.theme_picker.open);
             assert!(harness
-                .last_toast()
+                .notice()
                 .is_some_and(|text| text.starts_with("Slash commands cannot be queued")));
         }
         let mut harness = Harness::ready();
@@ -197,7 +261,7 @@ async fn settings_wait_for_a_running_job_while_read_only_commands_still_run() {
         assert!(!harness.submit("/help"));
 
         assert!(harness.app.chat_input.full_text().is_empty());
-        assert_eq!(harness.last_toast(), None);
+        assert_eq!(harness.notice(), None);
     }
 }
 
@@ -205,7 +269,7 @@ async fn settings_wait_for_a_running_job_while_read_only_commands_still_run() {
 async fn a_command_read_during_a_turn_keeps_the_turn_loading_line() {
     let mut harness = Harness::ready();
     harness.app.session.status = Status::Generating {
-        since: std::time::Instant::now(),
+        since: vibe_rs::clock::now(),
     };
     harness.app.view.loading.set_label("Thinking");
 

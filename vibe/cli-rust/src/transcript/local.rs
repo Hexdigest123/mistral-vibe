@@ -1,10 +1,11 @@
 //! Client-owned transcript messages preserved until the server supersedes them.
 
 mod fork;
+mod interrupt;
 mod positions;
-pub mod teleport;
 
-pub use fork::{add_branch_created, add_rewind_fork};
+pub use fork::add_rewind_fork;
+pub use interrupt::{add_interrupt, is_interrupt, set_interrupt_retryable};
 pub(super) use positions::preserve_file_image_links;
 pub use positions::{preserve, restore, restore_positions};
 
@@ -175,8 +176,10 @@ pub fn add_status(transcript: &mut Transcript, id: &str, text: &str) {
 }
 
 /// Mount a `✕` error row; the body is sanitized and prefixed at render time.
+/// Callers that append a hint bound the message first, so the cap never cuts it.
 pub fn add_command_error(transcript: &mut Transcript, id: &str, text: &str) {
-    add_message(transcript, id, "command_error", text);
+    let text = crate::utils::text::bounded_row(text);
+    add_message(transcript, id, "command_error", &text);
 }
 
 /// Mount a client-owned notice (e.g. app-server crash) preserved across snapshots.
@@ -192,20 +195,6 @@ pub fn add_notice(transcript: &mut Transcript, id: &str, message: &str) {
     }));
 }
 
-/// Mount the local interrupt marker, shown after a
-/// turn is cancelled with Escape. It is client-owned and preserved across
-/// snapshots like other local entries.
-pub fn add_interrupt(transcript: &mut Transcript, id: &str) {
-    transcript.add(&serde_json::json!({
-        "entry": {
-            "id": id,
-            "type": "interrupt",
-            "generationStatus": "completed",
-            "local": true,
-        }
-    }));
-}
-
 /// Mount a borderless warning row: plain text in `$warning`, appended to the
 /// messages area.
 pub fn add_warning(transcript: &mut Transcript, id: &str, text: &str) {
@@ -215,11 +204,20 @@ pub fn add_warning(transcript: &mut Transcript, id: &str, text: &str) {
 /// Mount the what's-new body of a fresh session, pinned below every message
 /// the transcript will ever hold.
 pub fn add_whats_new(transcript: &mut Transcript, id: &str, text: &str) {
+    add_pinned(transcript, id, "whats_new", text);
+}
+
+/// Mount the plan offer in its own box, pinned below the what's-new body.
+pub fn add_plan_offer(transcript: &mut Transcript, id: &str, text: &str) {
+    add_pinned(transcript, id, "plan_offer", text);
+}
+
+fn add_pinned(transcript: &mut Transcript, id: &str, role: &str, text: &str) {
     transcript.add(&serde_json::json!({
         "entry": {
             "id": id,
             "type": "message",
-            "role": "whats_new",
+            "role": role,
             "content": [{"type": "text", "text": text}],
             "generationStatus": "completed",
             "local": true,
@@ -252,7 +250,10 @@ pub fn add_progress_status(transcript: &mut Transcript, id: &str, text: &str) {
 /// Settle the compact status indicator: ✓ on success, ✕ on error.
 pub fn settle_compact_status(transcript: &mut Transcript, id: &str, error: Option<&str>) {
     match error {
-        Some(msg) => settle_status(transcript, id, &format!("Error: {msg}")),
+        Some(msg) => {
+            let msg = crate::utils::text::bounded_message(msg);
+            settle_status(transcript, id, &format!("Error: {msg}"))
+        }
         None => settle_status(transcript, id, "Compaction completed."),
     }
 }
