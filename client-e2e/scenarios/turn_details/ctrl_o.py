@@ -10,7 +10,7 @@ handshake = HANDSHAKE
 timeline: Timeline = [*worked_turn(), "\x0f", take_snapshot()]
 
 screen_contains = (
-    " Worked for 1m 12s",
+    "◷ Worked for 1m 12s",
     "Let me look at the test first.",
     "cat test_auth.py",
 )

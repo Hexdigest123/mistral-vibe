@@ -16,7 +16,7 @@ handshake = {
     "config/read": {"config": {"theme": "ansi-dark"}},
     "runtime/read": {"runtime": {"config": {"theme": "ansi-dark"}}},
 }
-screen_rows = {10: " Ran 2 commands"}
+screen_rows = {10: "● Ran 2 commands"}
 
 # Drag from the group header (SGR row 11) down into the answer (row 13).
 _DRAG = "\x1b[<0;1;11M\x1b[<32;8;13M\x1b[<0;8;13m"

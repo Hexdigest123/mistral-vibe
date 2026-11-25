@@ -39,7 +39,7 @@ timeline: Timeline = [
 # The header lands under the pinned prompt and the steps fill the rest of the viewport.
 screen_rows = {
     0: "> fix the flaky auth test",
-    3: " Worked for <1s · 8 messages · 8 tool calls",
+    3: "◷ Worked for <1s · 8 messages · 8 tool calls",
     5: "│   Step 1: checking the next part of the suite.",
 }
 screen_contains = ("Step 7: checking",)

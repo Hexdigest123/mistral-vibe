@@ -30,8 +30,7 @@ Mistral Vibe is an open-source coding agent for your terminal. Describe what you
 - TTFT and tok/s in the bottom bar (see [TTFT and TPS](#ttft-and-tps)): time to first token and tokens per second next to the usage and context gauges, like OpenCode's TUI
 - On Linux, child processes Vibe starts (MCP stdio servers, hooks, background processes) carry `PR_SET_PDEATHSIG`, so the kernel kills them if the app-server dies — no more orphaned `node`/shell processes after a `SIGKILL`
 - Builds to `vibes` instead of `vibe` (for my personal testing)
-- Optional telemetry kill switch `disable_all_telemetry` (see [Telemetry kill switch](#telemetry-kill-switch)): **off by default**, so installing this fork changes nothing; when you enable it, ALL telemetry is disabled and locally stored telemetry is deleted
-  - It is flagged DANGEROUS in the settings: this might get you banned when they enact their new fascist dictator policies
+- Optional telemetry kill switch `disable_all_telemetry` (see [Telemetry kill switch](#telemetry-kill-switch)): **off by default**, so installing this fork changes nothing; when you enable it, ALL telemetry is disabled and locally stored telemetry is deleted. It is flagged DANGEROUS in the settings (ban risk, see below)
 
 **Where to find the settings**
 
@@ -116,7 +115,8 @@ disable_all_telemetry = true
 ```
 
 - **Off by default** (`false`), so installing this fork does not change what is sent and cannot get you banned on its own.
-- **DANGEROUS when enabled**: it is flagged red in `/config` and warns on save. Disabling telemetry may violate the Terms of Service — this might get you banned when they enact their new fascist dictator policies.
+- **Preventive today**: a default install sends no telemetry at all — the channels above only flow with a Mistral API key or sign-in (`enable_telemetry` itself defaults to on, but without Mistral credentials there is nothing to send to) — and the kill switch is off, so right now it changes nothing. It is a guarantee for the future: if telemetry ever becomes default-on or new channels are added, arming it keeps every one of them off.
+- **DANGEROUS when enabled**: it is flagged red in `/config` and warns on save. Disabling telemetry may violate the Terms of Service and can get your account banned.
 - When enabled, Vibe stops sending all of the above and **deletes the telemetry it stored on disk** (the GrowthBook eval caches under `~/.vibe/` and telemetry payload lines in `~/.vibe/logs/vibe.log`).
 - A project's `.vibe/config.toml` or an agent profile can turn the kill switch **on** for its sessions but never off: their `disable_all_telemetry = false` is ignored, same rule as `enable_telemetry`.
 

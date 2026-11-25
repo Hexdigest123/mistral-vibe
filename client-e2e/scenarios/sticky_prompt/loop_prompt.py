@@ -25,5 +25,5 @@ timeline: Timeline = [
     take_snapshot(),
 ]
 
-screen_rows = {0: " Say hi"}
+screen_rows = {0: "↻ Say hi"}
 screen_excludes = ("Say hi to the user.", "loop ae1aa08a")

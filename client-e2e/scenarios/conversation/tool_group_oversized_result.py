@@ -15,8 +15,8 @@ from e2e.app_server.scenario import Timeline
 _PROMPT = "summarize the readme"
 
 screen_contains = (
-    " Read 1 file, ran 1 command",
-    " Read README.md (truncated)",
+    "● Read 1 file, ran 1 command",
+    "● Read README.md (truncated)",
     "<truncated-output>",
 )
 

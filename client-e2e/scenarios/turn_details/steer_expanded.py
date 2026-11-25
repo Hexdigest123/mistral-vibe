@@ -10,14 +10,14 @@ handshake = steer_outside.handshake
 timeline: Timeline = [*steer_outside.timeline[:-1], "\x0f", take_snapshot()]
 
 screen_rows = {
-    10: " Worked for 10s · 1 message · 1 tool call",
+    10: "◷ Worked for 10s · 1 message · 1 tool call",
     12: "│   Let me look at the test first.",
     15: "└ └ 1 failed",
     16: "",
     17: "",
     18: "↳ also check the docs",
     19: "",
-    20: " Worked for 1m 2s · 1 tool call",
+    20: "◷ Worked for 1m 2s · 1 tool call",
     23: "└ └ # Auth",
     24: "",
     25: "",
