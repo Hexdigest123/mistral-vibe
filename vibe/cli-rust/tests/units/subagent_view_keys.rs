@@ -51,7 +51,8 @@ async fn opening_the_subagent_list_from_the_rail_and_back_keeps_the_draft() {
         harness.press(KeyCode::Char(character), KeyModifiers::NONE);
     }
     assert!(!harness.press(KeyCode::Char('x'), KeyModifiers::CONTROL));
-    assert!(harness.app.rail.focused, "Ctrl+X reaches the rail");
+    assert!(harness.app.session_tabs.chord, "Ctrl+X arms the tab chord");
+    // Enter is not a tab key: the chord cancels and the rail takes it.
     assert!(!harness.press(KeyCode::Enter, KeyModifiers::NONE));
     assert!(harness.app.subagents.list.focused);
     assert_eq!(harness.app.subagents.list.options.selected(), 0);

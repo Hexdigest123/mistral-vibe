@@ -25,7 +25,7 @@ _THOUGHT = (
     "Short second line."
 )
 
-# The folded group header lands on SGR row 11, then its `⏵ Thought` row on 12.
+# The folded group header lands on SGR row 11, then its `󰟶 Thought` row on 12.
 _CLICK_GROUP = "\x1b[<0;1;11M\x1b[<0;1;11m"
 _CLICK_THOUGHT = "\x1b[<0;5;12M\x1b[<0;5;12m"
 

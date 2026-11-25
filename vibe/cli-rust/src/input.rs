@@ -374,6 +374,12 @@ fn handle_key_inner(
         completion_manager::input_changed(app);
         return false;
     }
+    // Fork feature (AGENTS.md "Fork features"): Ctrl+X then 1-9/n/c drives session
+    // tabs; the chord takes the next key before the composer edits with it, and
+    // while the feature is on it owns Ctrl+X before the rail toggle.
+    if crate::session_tabs::handle_key(app, client, &key) {
+        return false;
+    }
     if enters_rail(app, &key) && crate::rail::enter(app) {
         return false;
     }
@@ -426,10 +432,6 @@ fn handle_key_inner(
         return false;
     }
 
-    // Fork feature (AGENTS.md "Fork features"): Tab/Shift+Tab/Alt+1-9 switch session tabs.
-    if crate::session_tabs::handle_key(app, client, &key) {
-        return false;
-    }
     // App-level keys: Esc, scroll, completion/history nav, accept, submit.
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

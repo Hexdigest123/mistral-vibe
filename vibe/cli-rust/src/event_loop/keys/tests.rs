@@ -347,9 +347,16 @@ fn ctrl_c_after_ctrl_x_hides_the_jump_letters_too() {
         )))
     };
     handle_input_event(&mut app, &client, &config_tx, ctrl('x'));
-    assert!(app.rail.letters);
+    // Session tabs are on by default: Ctrl+X arms the tab chord first; the rail
+    // letters come with the next non-tab key.
+    assert!(app.session_tabs.chord);
+    assert!(!app.rail.letters);
 
     handle_input_event(&mut app, &client, &config_tx, ctrl('c'));
+    assert!(
+        !app.session_tabs.chord,
+        "a priority key cancels the chord too"
+    );
     assert!(!app.rail.letters);
     handle_input_event(&mut app, &client, &config_tx, Some(key('t')));
     assert_eq!(

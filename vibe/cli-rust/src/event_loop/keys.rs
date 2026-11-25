@@ -263,7 +263,17 @@ pub(crate) fn dispatch_key(
         if app.rail.letters {
             crate::rail::back(app);
         }
+        // Fork feature (AGENTS.md "Fork features"): a priority key cancels an
+        // armed tab chord the same way.
+        app.session_tabs.chord = false;
         return exit;
+    }
+    // Fork feature (AGENTS.md "Fork features"): an armed tab chord takes the next
+    // key before the composer-level bindings below (Left opening the Sessions
+    // page included), so Ctrl+X n works with a single tab and any other key
+    // still reaches the rail, as Ctrl+X would have.
+    if crate::session_tabs::chord_key(app, client, &key) {
+        return false;
     }
     drop_box_selection(app);
     if crate::rail::nav_key(app, client, &key) {

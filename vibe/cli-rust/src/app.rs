@@ -207,6 +207,8 @@ pub struct Session {
     pub prepared_worktree: Option<crate::worktree::WorktreeInfo>,
     /// Context budget `(current_tokens, max_tokens)`; `(_, 0)` renders as empty.
     pub tokens: (u64, u64),
+    /// Fork feature (AGENTS.md "Fork features"): the turn's TTFT/TPS stream tracking for the bottom bar.
+    pub pace: crate::stream_pace::Tracker,
     /// The session's PR/MR artifacts, latest first; the rail's PR item opens a window listing them.
     pub artifacts: Vec<crate::server::PublicSessionArtifact>,
     /// The session `artifacts` was read for; a switch away re-reads the list.
@@ -985,6 +987,8 @@ impl App {
         }
         // Fork feature (AGENTS.md "Fork features"): register the attached session as a tab.
         crate::session_tabs::on_session_id(self, &session_id);
+        // Fork feature (AGENTS.md "Fork features"): a new session starts with no TTFT/TPS reading.
+        crate::stream_pace::reset(self);
         self.session.session_id = Some(session_id);
         // Background emitters can queue before the handshake lands.
         for event in self.session.held_telemetry.drain(..) {

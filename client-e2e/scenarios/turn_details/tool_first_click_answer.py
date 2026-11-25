@@ -28,5 +28,5 @@ timeline: Timeline = [
     _CLICK,
 ]
 
-screen_rows = {10: "⏵ Worked for <1s · 2 tool calls", 12: "  Fixed."}
+screen_rows = {10: " Worked for <1s · 2 tool calls", 12: "  Fixed."}
 screen_excludes = ("Ran 2 commands", "cat test_auth.py")

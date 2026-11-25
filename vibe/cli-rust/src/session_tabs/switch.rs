@@ -86,6 +86,39 @@ pub(super) fn start(app: &mut App, client: &Arc<Client>, to: usize) {
     }
 }
 
+/// Switch to tab `to` whose session is already attached (the server reused it,
+/// e.g. for an empty session a new tab replaced): swap the saved views locally,
+/// no server round-trip — so it works even while a turn runs.
+pub(super) fn switch_local(app: &mut App, to: usize) {
+    let from = app.session_tabs.active;
+    let snapshot = TabSnapshot {
+        transcript: app.view.transcript.snapshot(),
+        scroll: (app.view.scroll, app.view.scroll_target),
+        draft: app.chat_input.input.clone(),
+        cursor: app.chat_input.cursor,
+    };
+    app.session_tabs.list[from].snapshot = Some(snapshot);
+    app.session_tabs.active = to;
+    let saved = app.session_tabs.list[to].snapshot.take();
+    match &saved {
+        Some(saved) => {
+            app.view.transcript.restore(saved.transcript.clone());
+            (app.view.scroll, app.view.scroll_target) = saved.scroll;
+        }
+        None => {
+            app.view.transcript.clear();
+            app.view.scroll = 0;
+            app.view.scroll_target = 0;
+        }
+    }
+    app.view.transcript_cache.invalidate_layouts();
+    let (draft, cursor) = saved
+        .as_ref()
+        .map(|saved| (saved.draft.clone(), saved.cursor))
+        .unwrap_or_default();
+    restore_draft(app, &draft, cursor);
+}
+
 /// Put a tab's draft back into the composer.
 pub(super) fn restore_draft(app: &mut App, draft: &str, cursor: usize) {
     app.chat_input.input = draft.to_owned();

@@ -49,6 +49,10 @@ GUARD_TESTS = (
     "vibe/cli-rust/tests/units/session_tabs.rs",
     "client-e2e/scenarios/session_tabs/new_switch.py",
     "client-e2e/scenarios/session_tabs/disabled.py",
+    "client-e2e/scenarios/session_tabs/chord_new_single_tab.py",
+    "client-e2e/scenarios/session_tabs/gone_tab_removed.py",
+    "vibe/cli-rust/tests/units/stream_pace.rs",
+    "client-e2e/scenarios/footer/stream_pace.py",
 )
 
 
@@ -69,6 +73,7 @@ def test_the_rust_guard_tests_are_registered() -> None:
         "model_refresh",
         "paste_image",
         "config_dangerous",
+        "stream_pace",
     ):
         assert f"mod {module};" in units, _dropped(f"Rust units module {module}")
 

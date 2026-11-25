@@ -296,13 +296,13 @@ edit `config.toml` and run `/reload`; no restart is needed.
 the transcript once it scrolls off; the next section's prompt pushes it out. It
 shows at most three rows, the last one cut with `…`, and turns off below 15
 transcript rows. A prompt a scheduled loop sent pins as its folded title
-(`⏵ title`), without its instructions or `loop` line. Clicking it
+(the `nf-fa-rotate_right` loop icon plus its title), without its instructions or `loop` line. Clicking it
 scrolls the transcript back to that prompt. Set it to `false` through `/config`,
 or edit `config.toml` and run `/reload`; no restart is needed.
 
 `collapse_turn_details = true` collapses a turn once its final answer arrives:
 the intermediate assistant messages, reasoning and tool calls move into one
-group above the answer, headed `⏵ Worked for 1m 12s · 2 messages · 3 tool calls`.
+group above the answer, headed by the `nf-fa-clock` icon and `Worked for 1m 12s · 2 messages · 3 tool calls`.
 While the turn runs, its steps show as usual. A click on the header, or
 `Ctrl+O` with the tool groups, expands the group: the steps show indented by two
 columns behind a rail like a tool group's border, the header and rail turn to

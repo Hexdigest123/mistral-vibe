@@ -1,8 +1,9 @@
 //! Session tabs: several sessions in one window, switched in place.
-// Fork feature (AGENTS.md "Fork features"): quick-switch tabs — only the active
+// Fork feature (AGENTS.md \"Fork features\"): quick-switch tabs — only the active
 // tab is attached to the app-server; the others keep their transcript, scroll
 // and composer draft here, and their session in the store (resumable later).
 // The `enable_session_tabs` config value (default on) hides the whole feature.
+// A switch while a turn runs is queued and runs when the session goes idle.
 
 mod command;
 mod keys;
@@ -12,15 +13,23 @@ use std::sync::Arc;
 
 use ratatui::layout::Rect;
 
-use crate::app::{App, Severity};
+use crate::app::{App, Severity, Status};
 use crate::server::Client;
 use crate::transcript::Snapshot;
 
 pub use command::run as command;
-pub use keys::handle_key;
+pub use keys::{chord_key, handle_key};
 
-/// Refusal shown when a turn, queue or shell command blocks a switch.
+/// Refusal shown while the session is starting or failed: nothing queues then.
 pub const BUSY: &str = "Wait for the current turn to finish before switching tabs.";
+
+/// A tab action the user asked for while a turn runs; it runs once the session is idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedAction {
+    Switch(usize),
+    New,
+    Close(usize),
+}
 
 /// One tab: the session it shows, its label, and the view saved while away.
 pub struct Tab {
@@ -46,6 +55,10 @@ pub struct SessionTabs {
     pending: Option<(usize, usize)>,
     /// The active tab closes once its switch away lands.
     pending_close: Option<usize>,
+    /// The tab action queued while the session was busy.
+    pub queued: Option<QueuedAction>,
+    /// Ctrl+X was pressed: the next key is a tab command (1-9 switch, n new, c close).
+    pub chord: bool,
     /// Painted tab cells of the last frame, for mouse clicks.
     pub areas: Vec<Rect>,
     /// The `enable_session_tabs` config value.
@@ -59,6 +72,8 @@ impl Default for SessionTabs {
             active: 0,
             pending: None,
             pending_close: None,
+            queued: None,
+            chord: false,
             areas: Vec::new(),
             enabled: true,
         }
@@ -70,9 +85,9 @@ pub fn switchable(app: &App) -> bool {
     app.session_tabs.enabled && app.session_tabs.list.len() > 1
 }
 
-/// Whether the tab bar is drawn: more than one open tab.
+/// Whether the tab bar is drawn: more than one open tab, or the chord is armed.
 pub fn visible(app: &App) -> bool {
-    switchable(app)
+    app.session_tabs.enabled && (app.session_tabs.list.len() > 1 || app.session_tabs.chord)
 }
 
 /// Whether a tab switch is waiting on the server.
@@ -83,6 +98,10 @@ pub fn switching(app: &App) -> bool {
 /// Apply the `enable_session_tabs` config value.
 pub fn set_enabled(app: &mut App, enabled: bool) {
     app.session_tabs.enabled = enabled;
+    if !enabled {
+        app.session_tabs.queued = None;
+        app.session_tabs.chord = false;
+    }
 }
 
 /// `App::set_session_id` hook: register the attached session as a tab.
@@ -192,15 +211,97 @@ fn save_current_from_switching(app: &mut App) {
     }
 }
 
-/// A tab switch failed: the tab left stays active, with its draft back.
-pub fn on_switch_failed(app: &mut App) {
-    let Some((from, _to)) = app.session_tabs.pending.take() else {
+/// A tab switch failed: the tab left stays active, with its draft back. When the
+/// target's session no longer exists, its tab is removed from the list instead.
+pub fn on_switch_failed(app: &mut App, session_gone: bool) {
+    let Some((from, to)) = app.session_tabs.pending.take() else {
         return;
     };
     app.session_tabs.pending_close = None;
-    if let Some(snapshot) = &app.session_tabs.list[from].snapshot {
+    if session_gone {
+        app.session_tabs.list.remove(to);
+        if to < from {
+            app.session_tabs.active = from - 1;
+        }
+        app.session_tabs.queued = None;
+        crate::notices::inline(
+            app,
+            Severity::Warning,
+            "Removed a tab whose session no longer exists.",
+        );
+    }
+    if let Some(snapshot) = app.session_tabs.list[app.session_tabs.active]
+        .snapshot
+        .clone()
+    {
         let (draft, cursor) = (snapshot.draft.clone(), snapshot.cursor);
         switch::restore_draft(app, &draft, cursor);
+    }
+}
+
+/// Queue a tab action while the session is busy; it runs when the session is idle.
+fn queue(app: &mut App, action: QueuedAction) {
+    if matches!(app.session.status, Status::Starting | Status::Failed) {
+        crate::notices::inline(app, Severity::Warning, BUSY);
+        return;
+    }
+    let text = match action {
+        QueuedAction::Switch(index) => {
+            format!(
+                "Switch to tab {} when the current turn finishes.",
+                index + 1
+            )
+        }
+        QueuedAction::New => "Open the new tab when the current turn finishes.".to_owned(),
+        QueuedAction::Close(index) => {
+            format!("Close tab {} when the current turn finishes.", index + 1)
+        }
+    };
+    app.session_tabs.queued = Some(action);
+    crate::notices::inline(app, Severity::Information, &text);
+}
+
+/// Run the queued tab action once the session is idle; called after server events.
+pub fn maybe_run_queued(app: &mut App, client: &Arc<Client>) {
+    if !app.session_tabs.enabled {
+        app.session_tabs.queued = None;
+        return;
+    }
+    let Some(action) = app.session_tabs.queued else {
+        return;
+    };
+    if crate::sessions_page::switching(app) || switching(app) || !crate::sessions_page::idle(app) {
+        return;
+    }
+    app.session_tabs.queued = None;
+    match action {
+        QueuedAction::Switch(index) => switch_to(app, client, index),
+        QueuedAction::New => new_tab(app, client),
+        QueuedAction::Close(index) => close(app, client, index),
+    }
+}
+
+/// Remove the tab at `index`, fixing the active index and any queued action.
+fn remove_tab(app: &mut App, index: usize) {
+    app.session_tabs.list.remove(index);
+    if app.session_tabs.active > index {
+        app.session_tabs.active -= 1;
+    }
+    let mut drop_queued = false;
+    if let Some(queued) = &mut app.session_tabs.queued {
+        match queued {
+            QueuedAction::Switch(i) | QueuedAction::Close(i) => {
+                if *i == index {
+                    drop_queued = true;
+                } else if *i > index {
+                    *i -= 1;
+                }
+            }
+            QueuedAction::New => {}
+        }
+    }
+    if drop_queued {
+        app.session_tabs.queued = None;
     }
 }
 
@@ -214,7 +315,7 @@ pub fn new_tab(app: &mut App, client: &Arc<Client>) {
         return;
     }
     if !crate::sessions_page::idle(app) {
-        crate::notices::inline(app, Severity::Warning, BUSY);
+        queue(app, QueuedAction::New);
         return;
     }
     app.session_tabs.list.push(Tab {
@@ -233,6 +334,20 @@ pub fn switch_to(app: &mut App, client: &Arc<Client>, index: usize) {
         return;
     }
     if index >= app.session_tabs.list.len() || index == app.session_tabs.active {
+        return;
+    }
+    if crate::sessions_page::switching(app) || switching(app) {
+        return;
+    }
+    // The target's session is already attached (the server reused it): swap views locally.
+    if app.session_tabs.list[index].session_id.is_some()
+        && app.session_tabs.list[index].session_id == app.session.session_id
+    {
+        switch::switch_local(app, index);
+        return;
+    }
+    if !crate::sessions_page::idle(app) {
+        queue(app, QueuedAction::Switch(index));
         return;
     }
     switch::start(app, client, index);
@@ -261,17 +376,14 @@ pub fn close(app: &mut App, client: &Arc<Client>, index: usize) {
             return;
         }
         if !crate::sessions_page::idle(app) {
-            crate::notices::inline(app, Severity::Warning, BUSY);
+            queue(app, QueuedAction::Close(index));
             return;
         }
         app.session_tabs.pending_close = Some(index);
         let to = if index > 0 { index - 1 } else { 1 };
         switch::start(app, client, to);
     } else {
-        app.session_tabs.list.remove(index);
-        if app.session_tabs.active > index {
-            app.session_tabs.active -= 1;
-        }
+        remove_tab(app, index);
     }
 }
 

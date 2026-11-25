@@ -138,11 +138,10 @@ pub(super) fn push_user(
     // A settled message's content widget spans the row (`width: 1fr`), so its
     // rewind highlight reverses the padding too; a queued one is `width: auto`.
     let padded = selected && !pending;
-    let content_width = width.saturating_sub(2) as usize;
     if let Some(fired) = fired_loop {
         let text = super::message_text(message);
         let styles = (prompt, content);
-        push_loop_prompt(lines, &text, fired, expanded, styles, content_width);
+        push_loop_prompt(lines, &text, fired, expanded, styles, usize::from(width));
         if !pending && !followed_by_user {
             push_separator(lines, width);
         }

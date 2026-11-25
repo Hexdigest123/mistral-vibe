@@ -22,10 +22,11 @@ fn ctrl_x_toggles_the_rail_from_anywhere_in_the_prompt() {
 
     press(&mut app, KeyCode::Left);
     send_key(&mut app, ctrl('x'));
-    assert_eq!(app.focus(), Focus::Rail);
-    assert_eq!(rail::selected(&app), Some(Item::Goal));
+    assert!(app.session_tabs.chord, "Ctrl+X arms the tab chord first");
+    assert_eq!(app.focus(), Focus::Composer);
 
     send_key(&mut app, ctrl('x'));
+    // Not a tab key: the chord cancels and the key reaches the rail.
     assert!(!app.rail.letters, "Ctrl+X again hides the letters");
     assert_eq!(app.focus(), Focus::Rail, "and stays on the rail");
     press(&mut app, KeyCode::Esc);
@@ -100,9 +101,12 @@ fn ctrl_x_over_the_subagent_list_opens_another_item() {
 fn letters_show_only_from_ctrl_x_until_an_item_opens() {
     let mut app = with_items(true);
     send_key(&mut app, ctrl('x'));
-    assert!(app.rail.letters, "Ctrl+X from the prompt letters the items");
+    assert!(app.session_tabs.chord, "Ctrl+X arms the tab chord");
 
     press(&mut app, KeyCode::Char('t'));
+    // Not a tab key: the chord cancels, the rail takes the key and opens Plan.
+    assert_eq!(rail::window(&app), Some(Item::Plan));
+    assert!(!app.rail.letters);
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.focus(), Focus::Rail);
     assert!(

@@ -1,5 +1,8 @@
-//! Footer gauges: the context window and the monthly Vibe Code usage, as bars on a track.
+//! Footer gauges: the context window, the monthly Vibe Code usage, and the turn's TTFT/TPS, as bars on a track.
 
+use std::time::Duration;
+
+use crate::stream_pace::PaceView;
 use crate::utils::text::format_compact_count;
 
 use super::footer_fit::{Form, Tone};
@@ -88,6 +91,34 @@ pub fn context_forms((current, max): (u64, u64)) -> Vec<Form> {
         vec![label(), level(percent), tail(percent_label(percent))],
         vec![label(), level(percent)],
     ]
+}
+
+/// `0.8s ttft · 42.0 tok/s`, then `42.0 tok/s`, then hidden; absent without a reading.
+pub fn pace_forms(pace: Option<PaceView>) -> Vec<Form> {
+    let Some(pace) = pace else {
+        return vec![];
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ttft) = pace.ttft {
+        parts.push(format!("{} ttft", secs_label(ttft)));
+    }
+    if let Some(tps) = pace.tps {
+        parts.push(format!("{tps:.1} tok/s"));
+    }
+    if parts.is_empty() {
+        return vec![];
+    }
+    let full = vec![(parts.join(" · "), Tone::Muted)];
+    let tail = parts.last().map(|part| vec![(part.clone(), Tone::Muted)]);
+    match tail {
+        Some(tail) if tail != full => vec![full, tail],
+        _ => vec![full],
+    }
+}
+
+/// `0.8s`, `12.3s`: OpenCode's footer writes TTFT in seconds with one decimal.
+fn secs_label(duration: Duration) -> String {
+    format!("{:.1}s", duration.as_secs_f64())
 }
 
 /// `usage ██▍    40%`, `usage ▃ 40%`, then `usage ▃`; `PAYG` follows when usage past 100% is billed.

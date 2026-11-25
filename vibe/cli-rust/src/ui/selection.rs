@@ -4,6 +4,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use super::{notice, theme};
 use crate::app::App;
@@ -127,14 +128,14 @@ pub fn flash(app: &mut App) {
 
 /// Highlight one row; a group header's label is dimmed, its marker keeps the raw selection style.
 fn paint_row(buf: &mut Buffer, chat: Rect, style: Style, (y, x0, x1): RowSpan) {
-    if is_group_header(buf, chat, y) {
+    if let Some(marker) = group_header_marker(buf, chat, y) {
         let label = group_label_style();
         for x in x0..=x1 {
             let Some(cell) = buf.cell_mut((x, y)) else {
                 continue;
             };
-            // The marker cell and its trailing pad sit before the label.
-            let patch = if x < chat.x + 2 { style } else { label };
+            // The marker icon and its trailing pad sit before the label.
+            let patch = if x < chat.x + marker { style } else { label };
             cell.set_style(cell.style().remove_modifier(Modifier::all()).patch(patch));
         }
         return;
@@ -146,10 +147,12 @@ fn paint_row(buf: &mut Buffer, chat: Rect, style: Style, (y, x0, x1): RowSpan) {
     }
 }
 
-/// A folded group header row: its status indicator glyph at the row's first cell.
-fn is_group_header(buf: &Buffer, chat: Rect, y: u16) -> bool {
-    buf.cell((chat.x, y))
-        .is_some_and(|cell| matches!(cell.symbol(), "⏵" | "⏷" | "■" | "□"))
+/// A group header row: its marker glyph at the row's first cell, and the cells the glyph and its pad take.
+fn group_header_marker(buf: &Buffer, chat: Rect, y: u16) -> Option<u16> {
+    let cell = buf.cell((chat.x, y))?;
+    let symbol = cell.symbol();
+    (crate::ui::icons::ALL.contains(&symbol) || matches!(symbol, "■" | "□"))
+        .then(|| UnicodeWidthStr::width(symbol) as u16 + 1)
 }
 
 /// Selected group-header label: selection text at 55% opacity, or SGR dim on ANSI themes.

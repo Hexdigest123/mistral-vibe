@@ -9,6 +9,7 @@ const BUSY_WITH_OTHER_CODE: &str = r#"{"jsonrpc":"2.0","id":3,"error":{"code":"i
 const NUMERIC_CODE: &str =
     r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"Method not found"}}"#;
 const NEWER_STORE: &str = r#"{"jsonrpc":"2.0","id":5,"error":{"code":"internal_error","message":"This session was written by a newer store format (1.3) and needs a newer reader to open.","data":{"harnessCode":"store_requires_newer_reader"}}}"#;
+const NOT_FOUND: &str = r#"{"jsonrpc":"2.0","id":6,"error":{"code":"not_found","message":"Session not found: 55f77d2d-081a-68c1-4cee-e338035e2137","data":{"harnessCode":"session_not_found","sessionId":"55f77d2d-081a-68c1-4cee-e338035e2137"}}}"#;
 
 fn rpc(frame: &str) -> RpcError {
     let incoming: Incoming = serde_json::from_str(frame).expect("frame parses");
@@ -61,6 +62,14 @@ fn busy_conflict_survives_the_attach_context_chain() {
 fn newer_store_shows_the_upgrade_message() {
     let message = request_error::resume_failure_message(&request_failure(rpc(NEWER_STORE)));
     assert_eq!(message, request_error::STORE_REQUIRES_NEWER_READER_MESSAGE);
+}
+
+#[test]
+fn session_not_found_shows_the_gone_message() {
+    let error = rpc(NOT_FOUND);
+    assert_eq!(error.harness_code(), Some("session_not_found"));
+    let message = request_error::resume_failure_message(&request_failure(error));
+    assert_eq!(message, request_error::SESSION_NOT_FOUND_MESSAGE);
 }
 
 #[test]

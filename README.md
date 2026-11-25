@@ -27,6 +27,7 @@ Mistral Vibe is an open-source coding agent for your terminal. Describe what you
   - Also auto-discovers Mistral's model catalog, since `mistral-large-4` is still listed with a 400k max context window, which is simply false
 - FZF search in every long list: `/model`, `/config`, `/resume`, `/mcp` and `/plugins` (see [FZF search](#fzf-search))
 - Session tabs (see [Session tabs](#session-tabs)): several sessions in one window, switched with `Tab`/`Shift+Tab`, `Alt+1-9`, a click on the tab bar, or `/tab`
+- TTFT and tok/s in the bottom bar (see [TTFT and TPS](#ttft-and-tps)): time to first token and tokens per second next to the usage and context gauges, like OpenCode's TUI
 - On Linux, child processes Vibe starts (MCP stdio servers, hooks, background processes) carry `PR_SET_PDEATHSIG`, so the kernel kills them if the app-server dies — no more orphaned `node`/shell processes after a `SIGKILL`
 - Builds to `vibes` instead of `vibe` (for my personal testing)
 - Optional telemetry kill switch `disable_all_telemetry` (see [Telemetry kill switch](#telemetry-kill-switch)): **off by default**, so installing this fork changes nothing; when you enable it, ALL telemetry is disabled and locally stored telemetry is deleted
@@ -85,9 +86,10 @@ discover = true  # also auto-discovers Mistral's model catalog
 Open several sessions side by side in one window. When more than one tab is open, a tab bar shows above the conversation:
 
 - `/tab new` opens a fresh session in a new tab (opening a session from `/sessions` opens it as a new tab too)
-- `Tab` / `Shift+Tab` step through the tabs (wrapping), `Alt+1-9` jumps to a numbered tab, a click on a tab switches to it, a middle click closes it
+- `Ctrl+X` then `1-9` jumps to a numbered tab, `n` opens a new tab, `c` closes the active one; a click on a tab switches to it, a middle click closes it
 - `/tab next|prev|close [N]|N` does the same from the prompt
-- Each tab keeps its conversation, scroll position and draft while another tab is active; switching waits for the current turn to finish (only the active tab is attached)
+- Each tab keeps its conversation, scroll position and draft while another tab is active; while a turn runs, a switch is queued and happens when the turn finishes (only the active tab is attached)
+- A tab whose session no longer exists (e.g. an empty session the server discarded) is removed from the tab bar instead of erroring
 
 Tabs are **on by default**; hide the tab bar and disable the keys with:
 
@@ -95,6 +97,10 @@ Tabs are **on by default**; hide the tab bar and disable the keys with:
 # ~/.vibe/config.toml  (or toggle `enable_session_tabs` in /config)
 enable_session_tabs = false
 ```
+
+**TTFT and TPS**
+
+The bottom bar shows the current (or last) turn's generation pace after the context gauge: `0.8s ttft · 20.0 tok/s`. TTFT is measured from the turn starting to the first streamed token; tok/s is the output tokens divided by the time from the first to the last streamed token — while streaming it is estimated from the streamed characters (chars/4), and the exact completion token count replaces it once the turn's stats arrive.
 
 **Telemetry kill switch**
 

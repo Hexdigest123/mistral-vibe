@@ -1,4 +1,4 @@
-"""With enable_session_tabs = false the tab keys and /tab stay inert, no tab bar shows."""
+"""With enable_session_tabs = false the Ctrl+X chord and /tab stay inert, no tab bar shows."""
 
 from __future__ import annotations
 
@@ -13,6 +13,6 @@ _runtime["runtime"]["config"]["enableSessionTabs"] = False
 
 handshake = {"runtime/read": _runtime}
 screen_contains = ("Session tabs are off",)
-screen_excludes = ("Tab switch tab",)
+screen_excludes = ("Ctrl+X tabs",)
 
-timeline: Timeline = ["/tab new\r", "\t"]
+timeline: Timeline = ["/tab new\r", "\x18"]

@@ -192,10 +192,10 @@ fn leaving_the_letters_over_a_window_keeps_the_rail_under_it() {
 fn an_arrow_after_ctrl_x_hides_the_letters_and_still_moves() {
     let mut app = with_items(true);
     send_key(&mut app, ctrl('x'));
-    assert!(app.rail.letters);
-    assert_eq!(rail::selected(&app), Some(Item::Agents));
+    assert!(app.session_tabs.chord, "Ctrl+X arms the tab chord");
 
     press(&mut app, KeyCode::Right);
+    // Not a tab key: the chord cancels and the arrow reaches the rail.
     assert!(!app.rail.letters, "any key hides the letters");
     assert_eq!(rail::selected(&app), Some(Item::Goal));
     assert_eq!(app.focus(), Focus::Rail);

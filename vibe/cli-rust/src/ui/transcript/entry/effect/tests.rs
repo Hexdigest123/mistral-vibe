@@ -1,3 +1,4 @@
+use ratatui::style::Modifier;
 use serde_json::json;
 
 use super::{push_effect, EffectView};
@@ -23,7 +24,6 @@ fn rows(message: &str, suffix: &str, expanded: bool) -> Vec<String> {
         in_progress: false,
         local: false,
         expanded,
-        grouped: false,
         stream_delta: None,
     };
     let mut lines = LinkedLines::default();
@@ -91,7 +91,6 @@ fn running(message: &str, suffix: &str) -> LinkedLines {
         in_progress: true,
         local: false,
         expanded: false,
-        grouped: false,
         stream_delta: None,
     };
     let mut lines = LinkedLines::default();
@@ -166,4 +165,48 @@ fn an_expanded_header_with_a_huge_message_wraps_only_its_bounded_text() {
     assert!(fits(&rows));
     assert_eq!(painted, crate::utils::text::MESSAGE_MAX_CHARS);
     assert!(rows.iter().any(|row| row.contains("[truncated]")));
+}
+
+#[test]
+fn a_settled_call_opens_with_the_tool_icon_folded_plain_and_unfolded_bold() {
+    let effect: EffectEntry = serde_json::from_value(json!({
+        "detail": {"kind": "shell", "display": {"verb": "Running", "message": "make test"}},
+        "state": {"status": "completed", "outputText": "ok",
+            "output": {"stdout": "ok", "stderr": "", "output": "ok", "truncated": false},
+            "display": {"success": true, "verb": "Ran", "message": "make test", "suffix": ""}}
+    }))
+    .unwrap();
+    let marker_of = |expanded: bool| {
+        let mut lines = LinkedLines::default();
+        push_effect(
+            &mut lines,
+            &effect,
+            EffectView {
+                index: 0,
+                rev: 0,
+                in_progress: false,
+                local: false,
+                expanded,
+                stream_delta: None,
+            },
+            None,
+            0,
+            WIDTH,
+            None,
+        );
+        let marker = lines.lines()[0].spans[0].clone();
+        (marker.content.to_string(), marker.style)
+    };
+    let (folded, folded_style) = marker_of(false);
+    assert_eq!(folded, crate::ui::icons::TOOL);
+    assert!(
+        !folded_style.add_modifier.contains(Modifier::BOLD),
+        "{folded_style:?}"
+    );
+    let (unfolded, unfolded_style) = marker_of(true);
+    assert_eq!(unfolded, crate::ui::icons::TOOL);
+    assert!(
+        unfolded_style.add_modifier.contains(Modifier::BOLD),
+        "{unfolded_style:?}"
+    );
 }

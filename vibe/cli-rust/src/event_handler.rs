@@ -21,7 +21,7 @@ use crate::utils::text::bounded_message;
 use crate::{
     agents, approval, artifacts, completion_manager, config, feedback, mcp, message_queue,
     model_picker, notices, observability, post_ready, question_app, session_exit, sessions_page,
-    startup, subagents, todo_tracker, turn_summary, ui,
+    startup, stream_pace, subagents, todo_tracker, turn_summary, ui,
 };
 
 /// Returns true if a deferred `/exit` was replayed during the Ready event.
@@ -699,6 +699,8 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             expand_live_foldable(app, entry);
             sync_loading_label(app, &params);
             turn_summary::track_narrator_added(app, &event.params, entry);
+            // Fork feature (AGENTS.md "Fork features"): the entry's streamed text feeds the footer's TTFT/TPS.
+            stream_pace::on_entry_added(app, &event.params, entry);
             if let Some(entry) = event.params.get("entry") {
                 subagents::remember_parent_instruction_from_entry(app, entry);
             }
@@ -713,6 +715,8 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             record_todos(app, entry.as_ref());
             sync_loading_label(app, &params);
             turn_summary::track_narrator_updated(app, &event.params);
+            // Fork feature (AGENTS.md "Fork features"): the patch's appended text feeds the footer's TTFT/TPS.
+            stream_pace::on_entry_updated(app, &event.params);
             if let Some(entry) = updated_entry_raw(app, &params) {
                 subagents::remember_parent_instruction_from_entry(app, &entry);
             }
@@ -769,6 +773,8 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             app.set_status(Status::Generating {
                 since: crate::clock::now(),
             });
+            // Fork feature (AGENTS.md "Fork features"): the turn's TTFT clock starts with the turn.
+            stream_pace::on_turn_started(app);
             // An unsolicited turn ends the previous turn's open data, drops
             // whatever summary it still had in flight, and opens a fresh one.
             turn_summary::on_turn_end(app, client);
@@ -844,6 +850,8 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             // The turn spent usage; a rate limit may mean the allowance ran out.
             let rate_limited = turn.error_code() == Some("rate_limit");
             crate::usage_gauge::refresh(app, client, rate_limited);
+            // Fork feature (AGENTS.md "Fork features"): the finished stream becomes the footer's TTFT/TPS reading.
+            stream_pace::on_turn_completed(app);
             if !interrupted && !app.queue.is_empty() && !app.queue.paused {
                 app.session.deferred_completion = turn
                     .queue_item_id
@@ -878,6 +886,8 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             if app.subagents.viewed_subagent_id.is_none() {
                 app.session.tokens = (current, max);
             }
+            // Fork feature (AGENTS.md "Fork features"): exact completion tokens sharpen the footer's TPS.
+            stream_pace::on_stats_updated(app, &stats);
             app.session.stats = stats;
             // The `/context` app, when open, re-reads so its estimates follow the new reading.
             crate::context_app::refresh(app, client);

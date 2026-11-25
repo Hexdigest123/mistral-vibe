@@ -9,6 +9,9 @@ use serde_json::Value;
 pub struct ConfigField {
     pub name: String,
     pub popular: bool,
+    /// The settings-screen section key the server filed the field under. An
+    /// older server sends none; the `popular` flag then decides the section.
+    pub category: String,
     pub path: String,
     pub raw_value: Value,
     pub kind: String,
@@ -66,6 +69,7 @@ struct WireField {
     value: Value,
     path: String,
     popular: bool,
+    category: String,
     enum_choices: Vec<String>,
     value_labels: BTreeMap<String, String>,
     #[serde(deserialize_with = "crate::utils::json::lenient")]
@@ -105,6 +109,7 @@ fn field(wire: WireField) -> ConfigField {
         overridden: layers.iter().any(|(layer, _)| layer != "default"),
         name: wire.name,
         popular: wire.popular,
+        category: resolve_category(&wire.category, wire.popular),
         path: wire.path,
         raw_value: wire.value,
         kind: wire.kind,
@@ -113,6 +118,66 @@ fn field(wire: WireField) -> ConfigField {
         value_labels: wire.value_labels,
         layers,
         dangerous: wire.dangerous,
+    }
+}
+
+/// An older server sends no category; fall back to the `popular` flag.
+fn resolve_category(category: &str, popular: bool) -> String {
+    if category.is_empty() {
+        if popular {
+            "popular".to_owned()
+        } else {
+            "advanced".to_owned()
+        }
+    } else {
+        category.to_owned()
+    }
+}
+
+/// The settings-screen sections in display order. The client owns the labels
+/// and this order; a newer server's unknown key sorts after the known ones,
+/// ahead of "advanced" (ADR 0014).
+pub const SECTION_ORDER: &[&str] = &[
+    "popular",
+    "fork",
+    "models",
+    "voice",
+    "tts",
+    "tools",
+    "agents",
+    "appearance",
+    "safety",
+    "worktrees",
+];
+
+/// Where a section sits in the list: known keys by `SECTION_ORDER`, unknown
+/// keys after them, "advanced" last.
+pub fn section_rank(category: &str) -> usize {
+    if category == "advanced" {
+        usize::MAX
+    } else {
+        SECTION_ORDER
+            .iter()
+            .position(|key| *key == category)
+            .unwrap_or(SECTION_ORDER.len())
+    }
+}
+
+/// The heading drawn over a section.
+pub fn section_label(category: &str) -> String {
+    match category {
+        "popular" => "Popular settings".to_owned(),
+        "fork" => "Fork features".to_owned(),
+        "models" => "Models".to_owned(),
+        "voice" => "Voice".to_owned(),
+        "tts" => "TTS".to_owned(),
+        "tools" => "Tools".to_owned(),
+        "agents" => "Agents".to_owned(),
+        "appearance" => "Appearance".to_owned(),
+        "safety" => "Safety".to_owned(),
+        "worktrees" => "Worktrees".to_owned(),
+        "advanced" => "Advanced settings".to_owned(),
+        other => other.to_owned(),
     }
 }
 

@@ -72,7 +72,7 @@ fn a_loop_prompt_pins_as_its_folded_title_in_the_primary_marker_colour() {
     assert_eq!(lines.lines()[0].spans[0].style.fg, Some(theme::primary()));
     assert_eq!(
         loop_rows("Say hi\nSay hi to the user.", 30),
-        ["⏵ Say hi", &"─".repeat(30)]
+        [format!("{} Say hi", crate::ui::icons::LOOP), "─".repeat(30),]
     );
     let lines = sticky(&prompt("tick"), None, None, 20, 3);
     assert_eq!(lines.lines()[0].spans[0].style.fg, Some(theme::ORANGE));
@@ -83,7 +83,10 @@ fn a_long_loop_title_wraps_then_is_cut_on_its_third_row() {
     let title = "word ".repeat(40);
     let lines = loop_rows(&format!("{title}\nthe instructions"), 22);
     assert_eq!(lines.len(), 4, "{lines:?}");
-    assert!(lines[0].starts_with("⏵ word"), "{lines:?}");
+    assert!(
+        lines[0].starts_with(&format!("{} word", crate::ui::icons::LOOP)),
+        "{lines:?}"
+    );
     assert!(lines[2].ends_with('…'), "{lines:?}");
     assert!(
         lines.iter().all(|line| line.chars().count() <= 22),

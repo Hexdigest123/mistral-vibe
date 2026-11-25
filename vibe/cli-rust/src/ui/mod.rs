@@ -31,6 +31,7 @@ pub mod goal_panel;
 pub mod goal_row;
 pub mod highlight;
 pub(crate) mod hint_line;
+pub mod icons;
 pub mod jump_to_bottom;
 pub(crate) mod list_cursor;
 mod list_hover;

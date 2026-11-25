@@ -13,7 +13,6 @@ use super::theme;
 use crate::app::App;
 use crate::selection::{cells, Granularity};
 use crate::utils::paths::collapse_home;
-use unicode_width::UnicodeWidthStr;
 
 /// What a click on a painted bar link does.
 #[derive(Clone)]
@@ -68,6 +67,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         quit: quit.as_ref().map(Line::width),
         tokens: app.session.tokens,
         usage: crate::usage_gauge::footer_usage(app),
+        pace: crate::stream_pace::footer_pace(app),
     });
     let mut left = quit.map_or_else(Vec::new, |line| line.spans);
     // Each link's span range in `left` and its click action.
@@ -82,20 +82,28 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         links.push((start, left.len(), BarLinkAction::CopyPath(path)));
     }
     let mut right = Vec::new();
-    let context_width = fitted
-        .context
-        .iter()
-        .map(|(text, _)| text.width())
-        .sum::<usize>() as u16;
-    for gauge in [fitted.usage, fitted.context] {
+    // The context gauge's span range in `right`, for its click area.
+    let mut context_range = 0..0;
+    for (slot, gauge) in [fitted.usage, fitted.context, fitted.pace]
+        .into_iter()
+        .enumerate()
+    {
         if gauge.is_empty() {
             continue;
         }
         if !right.is_empty() {
             right.push(Span::styled(GAUGE_SEP, muted));
         }
+        let start = right.len();
         right.extend(spans(gauge));
+        if slot == 1 {
+            context_range = start..right.len();
+        }
     }
+    let span_width =
+        |range: std::ops::Range<usize>| right[range].iter().map(Span::width).sum::<usize>() as u16;
+    let context_width = span_width(context_range.clone());
+    let context_offset = span_width(0..context_range.start);
     let left = Line::from(left);
     let right_width = right.iter().map(Span::width).sum::<usize>() as u16;
     let right = Line::from(right);
@@ -136,12 +144,12 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             ..area
         },
     );
-    // The context gauge ends the right side; a click on it opens `/context`.
+    // A click on the context gauge opens `/context`; it no longer ends the right side.
     app.view.footer_tokens_area = if context_width == 0 {
         Rect::default()
     } else {
         Rect {
-            x: right_x + right_width.saturating_sub(context_width),
+            x: right_x + context_offset,
             width: context_width.min(area.right() - right_x),
             height: 1,
             ..area

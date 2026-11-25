@@ -89,7 +89,9 @@ config/config 1aad48800785
 
 config/config_search f017ea2887ed
 
-config/telemetry_kill_switch 9ceac8c3baad
+config/config_sections c96a11864b88
+
+config/telemetry_kill_switch 71f349cd7ad7
 
 context/context_click_over_rail_window 92418a263362
 
@@ -103,7 +105,7 @@ context/context_textual_dark 92418a263362
 
 context/ctrl_x_over_context 92418a263362
 
-context/rail_chip_over_context bcab59b274d6
+context/rail_chip_over_context 973e3cfe05c5
 
 conversation/ask_user_question c774d4977819
 
@@ -155,25 +157,25 @@ conversation/ask_user_question_tabs_ellipsis c774d4977819
 
 conversation/ask_user_question_tabs_wrap c774d4977819
 
-conversation/ask_user_question_transcript_click a8d909630267
+conversation/ask_user_question_transcript_click 6a4edb5919e7
 
 conversation/ask_user_question_wrap 1ca7a4e637b7
 
-conversation/bash_empty_expand 35f5b0093bbc
+conversation/bash_empty_expand 5ad0ffc5e040
 
 conversation/bash_failed_expand c774d4977819
 
-conversation/bash_long_command 654abe1996ef
+conversation/bash_long_command de2e6fe19fb8
 
-conversation/bash_long_expand df0518095b6c
+conversation/bash_long_expand c080f65687c4
 
-conversation/bash_multiline_expand c603abbf4a91
+conversation/bash_multiline_expand 882c33ae51f9
 
 conversation/bash_output_sanitization c774d4977819
 
-conversation/bash_running_long_command b420b9e239df
+conversation/bash_running_long_command 79f212953cdd
 
-conversation/bash_unbreakable_token_expand 4c10600ca0e7
+conversation/bash_unbreakable_token_expand e4f7ed2e779b
 
 conversation/compaction_auto c774d4977819
 
@@ -201,39 +203,39 @@ conversation/ctrl_c_interrupts_turn 292ad8a758d0
 
 conversation/ctrl_c_interrupts_unstarted_turn b082bf1fbd53
 
-conversation/edit_diff edbc42429f88
+conversation/edit_diff 326b32f621a5
 
-conversation/edit_diff_highlight 182650ae1f7c
+conversation/edit_diff_highlight 709f59c2b6ca
 
-conversation/edit_diff_light_theme 5d9fd96a0a2a
+conversation/edit_diff_light_theme ba85c4e74467
 
-conversation/edit_diff_multiline 8a5223c091ca
+conversation/edit_diff_multiline 6eeb48d0464d
 
 conversation/edit_diff_null_pair c774d4977819
 
 conversation/edit_diff_occurrences 5e0716f4d220
 
-conversation/edit_diff_tabs 11ae250d67d2
+conversation/edit_diff_tabs 93151dea5c0a
 
-conversation/edit_diff_theme 13aac4cfc7c1
+conversation/edit_diff_theme 3848b421a377
 
 conversation/edit_diff_wide c774d4977819
 
-conversation/edit_diff_word_wrap 160e5064e1b0
+conversation/edit_diff_word_wrap 614e1e6fa3ad
 
-conversation/edit_write_expand a307f0577fa5
+conversation/edit_write_expand 6e18e662d709
 
-conversation/effect_header_long_path f6aa825066ac
+conversation/effect_header_long_path 04d88f4130fb
 
 conversation/history_scroll_top_loading e2710b74b24d
 
-conversation/hook_notice df5bb2d2ffde
+conversation/hook_notice 952ca8725b3e
 
 conversation/hook_notice_llm c774d4977819
 
-conversation/hook_notice_pre_tool ea0297a0d889
+conversation/hook_notice_pre_tool 1c906a94a484
 
-conversation/hook_notice_pre_tool_parallel 8b47c2b0bdca
+conversation/hook_notice_pre_tool_parallel 2ceda6dae90f
 
 conversation/hook_pre_llm_stops_turn c774d4977819
 
@@ -247,7 +249,7 @@ conversation/overlapping_approval_question a241dbdd05f0
 
 conversation/prompt_prepare_failed_sends_text b860fa884e52
 
-conversation/read_file_expand ef380ee8454c
+conversation/read_file_expand 7846ddbb07bb
 
 conversation/read_file_highlight c774d4977819
 
@@ -259,7 +261,7 @@ conversation/say_hi c3b326e94091
 
 conversation/scratchpad_effects c774d4977819
 
-conversation/shell_no_content fd66c8de6e6c
+conversation/shell_no_content 00fbaea90cf8
 
 conversation/subagent_all_ready_main_quiet c774d4977819
 
@@ -301,19 +303,19 @@ conversation/subagent_view_read_failed 7a7f2c2eabcb
 
 conversation/subagent_view_status 7058057c784f
 
-conversation/tabs_bodies 61a8e431b3ff
+conversation/tabs_bodies 59e40fa23df6
 
-conversation/thinking 3a1e2b91a18d
+conversation/thinking 85f9f02e1202
 
-conversation/thinking_expand c3ab66a0806b
+conversation/thinking_expand 7ee8991690b6
 
 conversation/thinking_hidden_live c774d4977819
 
-conversation/thinking_progress_expand 69f585574fa4
+conversation/thinking_progress_expand 149b38f798b5
 
-conversation/todo_effect b397126a181e
+conversation/todo_effect 93f98b18c270
 
-conversation/todo_panel bf443a75ffd2
+conversation/todo_panel 6e8924199ae2
 
 conversation/todo_panel_escape c774d4977819
 
@@ -345,31 +347,31 @@ conversation/tool_group_consecutive_rounds c774d4977819
 
 conversation/tool_group_counts c774d4977819
 
-conversation/tool_group_ctrl_o 5f295ec64167
+conversation/tool_group_ctrl_o 3aed0f701569
 
 conversation/tool_group_distinct_files c774d4977819
 
-conversation/tool_group_expand 9129929cf575
+conversation/tool_group_expand f7bb6f5da573
 
 conversation/tool_group_keeps_unfolded_call c774d4977819
 
-conversation/tool_group_last_status 7e137795f93a
+conversation/tool_group_last_status e89c45354dad
 
 conversation/tool_group_oversized_result c774d4977819
 
-conversation/tool_group_packing 6f0b052e828b
+conversation/tool_group_packing f27adbf41337
 
 conversation/tool_group_resume_settled f017ea2887ed
 
-conversation/tool_group_thought_wrap acda8f4ddc20
+conversation/tool_group_thought_wrap 463d3c4fd100
 
-conversation/tool_result_warnings ee41ba128e64
+conversation/tool_result_warnings 7f605900284a
 
-conversation/tool_stream_line 90810f93f5a5
+conversation/tool_stream_line 3ec4e8a86a5a
 
-conversation/tool_suffix 262f293481b5
+conversation/tool_suffix 6d090730c4b7
 
-conversation/tool_suffix_long_message 5c91f390022a
+conversation/tool_suffix_long_message e3c8209442e2
 
 conversation/user_image_attachments f017ea2887ed
 
@@ -379,21 +381,21 @@ conversation/user_message_wrap c774d4977819
 
 conversation/waiting_line_narrow ce32780a586f
 
-conversation/web_connector 89af058294e8
+conversation/web_connector a23003f3702c
 
-conversation/web_fetch df7262846722
+conversation/web_fetch 06540f9ae14b
 
-conversation/web_search_expand e57739bb520a
+conversation/web_search_expand 04076046b919
 
 conversation/web_search_long_source c774d4977819
 
 conversation/web_search_sources c774d4977819
 
-conversation/who_is_paul 16d7e73bb3a8
+conversation/who_is_paul 1b7cbd68b959
 
 conversation/wrapped_image_attachment_link f017ea2887ed
 
-conversation/write_file_highlight 2a5d1369d699
+conversation/write_file_highlight 365961f11163
 
 dangerous_directory/home_warning f017ea2887ed
 
@@ -405,17 +407,17 @@ dangerous_directory/home_warning_reenabled f017ea2887ed
 
 debug_console f017ea2887ed
 
-expand_scroll/collapse_from_body 033bbefdbdf4
+expand_scroll/collapse_from_body 691d439c9499
 
-expand_scroll/ctrl_o cf491f972bba
+expand_scroll/ctrl_o cc4f31f6574d
 
-expand_scroll/ctrl_o_inside_group 3914e3170434
+expand_scroll/ctrl_o_inside_group d3b38a519084
 
-expand_scroll/group_multi_click a03b5858d9af
+expand_scroll/group_multi_click 273cbc9e17ae
 
-expand_scroll/pinned_tall_group 9692bd24413f
+expand_scroll/pinned_tall_group 3999a24df9fa
 
-expand_scroll/scrolled_up_group 481668db679c
+expand_scroll/scrolled_up_group f51ca1731c52
 
 external_editor/cancelled db1fcb8a7bad
 
@@ -439,7 +441,7 @@ feedback/snooze b8c15388ef32
 
 file_mention/absolute_path_filter f017ea2887ed
 
-file_mention/at_file_mention c8542dbdd649
+file_mention/at_file_mention ef0e95b00861
 
 file_mention/at_popup_scroll_up 027770dea174
 
@@ -474,6 +476,8 @@ file_mention/tab_keeps_popup_open f60098f3bb24
 file_mention/vertical_caret_completion f017ea2887ed
 
 footer/copy_path 0c7cc71204ae
+
+footer/stream_pace 0b3e3c1a10aa
 
 footer/usage_after_model_switch 2672ed2f53c8
 
@@ -525,7 +529,7 @@ goal/resume_prompt_vim 31493478ccd7
 
 goal/row_selection 4699a80aa7dc
 
-goal/row_statuses ce581f5de5e4
+goal/row_statuses 3e229b89b95f
 
 goal/short_terminal 1300719008fa
 
@@ -539,7 +543,7 @@ hints/narrow_picker f5e36dd61e9b
 
 input/bash_failed e33d6d29d307
 
-input/bash_mode 857126cbc3f0
+input/bash_mode c8d0cdd03149
 
 input/bash_no_output 0b206c6b660d
 
@@ -753,7 +757,7 @@ loops/rail_chip d9d13da7dfe5
 
 loops/rail_chip_narrow c774d4977819
 
-loops/rail_chip_opens 726cff0236eb
+loops/rail_chip_opens a09a561e0745
 
 markdown/autolink 5f07415eade4
 
@@ -831,7 +835,7 @@ markdown/palette_mistral_light dba784b3c7e6
 
 markdown/palette_textual_dark a4c5131f1c4c
 
-markdown/table_cache_viewport 0001bbaf8803
+markdown/table_cache_viewport 392bd3aabbca
 
 markdown/table_in_list 2d48963f53d6
 
@@ -1003,7 +1007,7 @@ model/model_refresh e5c880e8f41c
 
 model/model_refresh_unconfigured 490505bd45f1
 
-model/model_search b23da88f3727
+model/model_search b98e9847c850
 
 model/model_search_empty 6ce0360578f6
 
@@ -1213,7 +1217,7 @@ queue/merged_prompts_promoted 98c8c7b42aae
 
 queue/paused_queue 4429f3aa8182
 
-queue/paused_queue_header 159665003731
+queue/paused_queue_header 160f56664504
 
 queue/paused_queue_header_narrow 58c269ff1f4d
 
@@ -1235,7 +1239,7 @@ queue/retry_with_paused_queue 199567cde5e8
 
 queue/select_queued_prompt 1cd6148c414d
 
-queue/server_steers_into_waiting_turn ec6b48d4ced0
+queue/server_steers_into_waiting_turn 3adcbfc8e9e0
 
 queue/steer_keeps_output_order 134d23156f51
 
@@ -1249,17 +1253,17 @@ queue/two_queued_prompts 0ad1639d6167
 
 rail/agents_list c774d4977819
 
-rail/agents_list_open 1449804aaaf8
+rail/agents_list_open 17c966622472
 
-rail/arrow_windows 0bc8d686b971
+rail/arrow_windows 3c37642b19f6
 
 rail/child_view_esc c774d4977819
 
 rail/click_chip_closes c774d4977819
 
-rail/click_window 485ebfdf1840
+rail/click_window 1b0111144d5d
 
-rail/copy_notice_above 9b64e22f608e
+rail/copy_notice_above 8512ece52bd6
 
 rail/ctrl_c_keeps_hidden_draft c774d4977819
 
@@ -1269,13 +1273,13 @@ rail/ctrl_x_toggles c774d4977819
 
 rail/ctrl_x_twice_hides_letters c774d4977819
 
-rail/focus_mistral_dark 55ce76262bdc
+rail/focus_mistral_dark 034d67855ff9
 
 rail/goal_panel c774d4977819
 
-rail/goal_paused 2f16abec7931
+rail/goal_paused 543397be9561
 
-rail/goal_window e7f4b5698015
+rail/goal_window 8666b0d8f3c0
 
 rail/goal_window_clear 395135b1bb35
 
@@ -1289,23 +1293,23 @@ rail/hint_hides_after_click c774d4977819
 
 rail/hint_hides_after_ctrl_x c774d4977819
 
-rail/hover 57e1947fdc13
+rail/hover 7c5f78451d86
 
-rail/items 6d576ac91f3d
+rail/items ac91064e9ad8
 
-rail/keyboard a5f58413c67c
+rail/keyboard 33c99b03c186
 
 rail/letters c774d4977819
 
 rail/narrow_shrinks c774d4977819
 
-rail/switch_window c8d254d0ae4c
+rail/switch_window 1b8d63a460eb
 
-rail/tab_windows 5d3eec8b6ca7
+rail/tab_windows 8baecd82e7d4
 
-rail/tasks_click 6f496d3265a8
+rail/tasks_click c5e47f64fcbf
 
-rail/tasks_output 34037ef21e9f
+rail/tasks_output 3adbc6939ce2
 
 rail/tasks_output_back c774d4977819
 
@@ -1315,7 +1319,7 @@ rail/tasks_output_scroll c774d4977819
 
 rail/tasks_output_scrollbar c774d4977819
 
-rail/tasks_output_search 36affb9e36c6
+rail/tasks_output_search 002228545029
 
 rail/tasks_output_search_clear c774d4977819
 
@@ -1339,17 +1343,17 @@ rail/tasks_output_selection c774d4977819
 
 rail/tasks_output_selection_edge c774d4977819
 
-rail/tasks_output_selection_scroll f8c174d8652d
+rail/tasks_output_selection_scroll 2cc07ce730ab
 
-rail/tasks_panel b3868dd77179
+rail/tasks_panel 607c012d628f
 
-rail/tasks_scroll 13198fd11406
+rail/tasks_scroll dab93cbe6044
 
-rail/todo_window 136237ee9458
+rail/todo_window f96c7d44cfa8
 
 rail/todo_window_scroll c774d4977819
 
-rail/window_selection 32120668a763
+rail/window_selection d9721196ad0a
 
 raw/raw_copy_indented 0f5463fc4912
 
@@ -1421,9 +1425,13 @@ scroll/scrollbar_drag 370486a406e6
 
 scroll/scrollbar_track_click 86cbae370714
 
+session_tabs/chord_new_single_tab 78a677b0d7f7
+
 session_tabs/disabled f017ea2887ed
 
-session_tabs/new_switch f1cb7faa7fed
+session_tabs/gone_tab_removed ae71e105909a
+
+session_tabs/new_switch 8e7319f049b2
 
 sessions_page/archive_notice e61ec8c884a8
 
@@ -1451,13 +1459,13 @@ sessions_page/open_long_history 85ac7eaeb82c
 
 sessions_page/open_other_folder 7a0f7b328868
 
-sessions_page/preview_interact cabad333c04d
+sessions_page/preview_interact 3f0781d9ac5e
 
 sessions_page/preview_link e5406fa5ca7d
 
 sessions_page/preview_running_turn 370431378211
 
-sessions_page/preview_select 7e5f7fd11035
+sessions_page/preview_select 50c6bec68263
 
 sessions_page/rename 2474373900a1
 
@@ -1471,7 +1479,7 @@ sessions_page/three_columns ce5d051cfdf0
 
 skill_mention/atomic_mention f017ea2887ed
 
-skill_mention/invocation e2f03c59e354
+skill_mention/invocation 27ec78538918
 
 skill_mention/popup_accept f017ea2887ed
 
@@ -1837,7 +1845,7 @@ startup/resume_by_id_prompt 8f77ec1dd57e
 
 startup/resume_by_id_subagents 461d1a530806
 
-startup/resume_mixed_history d1d6604f4a4c
+startup/resume_mixed_history 86e15aa102e9
 
 startup/resume_picker b6d4bb0080a5
 
@@ -1881,7 +1889,7 @@ sticky_prompt/disabled_live 8ab25deec6a9
 
 sticky_prompt/long_prompt 3cd85cee668d
 
-sticky_prompt/loop_prompt c85034af04a9
+sticky_prompt/loop_prompt 516d21900e4a
 
 sticky_prompt/sections bed4e4e04aac
 
@@ -1983,7 +1991,7 @@ terminal_title/status c774d4977819
 
 text_selection/ansi_dark_group_header_selection c774d4977819
 
-text_selection/ansi_light_reasoning_header_selection cd71331f6dca
+text_selection/ansi_light_reasoning_header_selection 23afd772940f
 
 text_selection/answered_question_copy c774d4977819
 
@@ -2011,7 +2019,7 @@ text_selection/bottom_bar_drag_copy f017ea2887ed
 
 text_selection/bottom_bar_word_copy f017ea2887ed
 
-text_selection/chrome_selection 19957db093cf
+text_selection/chrome_selection f9e55b573e8c
 
 text_selection/code_block_clipboard c774d4977819
 
@@ -2037,13 +2045,13 @@ text_selection/copied_notice_expires f017ea2887ed
 
 text_selection/copy_light_disabled ae0cacd96f95
 
-text_selection/copy_light_long_tools 56a0cfccba89
+text_selection/copy_light_long_tools f52f1ba6896c
 
 text_selection/copy_light_sweep 59618660723c
 
 text_selection/cross_surface_selection 4886744382ea
 
-text_selection/diff_selection af565e8b7cbd
+text_selection/diff_selection 763102232f6a
 
 text_selection/full_screen_selection 25bbd849c4a4
 
@@ -2065,7 +2073,7 @@ text_selection/mcp_row_drag_selection f017ea2887ed
 
 text_selection/multiline_header_copy c774d4977819
 
-text_selection/passive_click 5e76d1f20cc1
+text_selection/passive_click 5cf3b8c06e6c
 
 text_selection/path_row_selection 3529078eea9c
 
@@ -2093,7 +2101,7 @@ text_selection/queue_spacer_copy cecbaa44c378
 
 text_selection/queue_spacer_copy_below cecbaa44c378
 
-text_selection/reasoning_header_selection b3aac6c1c868
+text_selection/reasoning_header_selection 695a00c5d3a0
 
 text_selection/scrolled_transcript_copy 370431378211
 
@@ -2111,7 +2119,7 @@ text_selection/selection_lost_release_copy c774d4977819
 
 text_selection/startup_warnings_copy f017ea2887ed
 
-text_selection/streaming_selection 554be465631b
+text_selection/streaming_selection dd91a15a94ba
 
 text_selection/subagent_list_collapses_composer_selection c774d4977819
 
@@ -2165,7 +2173,7 @@ theme/ctrl_c_while_busy 149c9ac483c4
 
 theme/late_report 1edd6b51c1ea
 
-theme/light_diff_body 0b8cc5e028ac
+theme/light_diff_body fe67a56d1d3f
 
 theme/select_auto 529c787656a1
 
@@ -2179,7 +2187,7 @@ theme/theme_cancel f1cd70d30519
 
 theme/theme_click 1705b317e938
 
-theme/theme_diff_ansi 6a8fce8b7963
+theme/theme_diff_ansi 36600c48af83
 
 theme/theme_jk a863526b14ed
 
@@ -2263,11 +2271,11 @@ trusted_folders_command/empty ba783814c2cc
 
 trusted_folders_command/search ba783814c2cc
 
-turn_details/blank_after_tool_group 05f08f2d2acb
+turn_details/blank_after_tool_group 7ce38050ebe5
 
 turn_details/click_collapses c774d4977819
 
-turn_details/click_expands 9e7eaac84c47
+turn_details/click_expands 71b1cc62a2ab
 
 turn_details/code_triple_click_inside c774d4977819
 
@@ -2277,25 +2285,25 @@ turn_details/copy_across c774d4977819
 
 turn_details/copy_across_expanded c774d4977819
 
-turn_details/copy_from_tool_group 372b53cad689
+turn_details/copy_from_tool_group 58fd3b1f117c
 
-turn_details/ctrl_o a770e45e59b1
+turn_details/ctrl_o 688a10de2359
 
-turn_details/expand_reveals_steps a9fe8af52fa7
+turn_details/expand_reveals_steps 1b62a06dd5c4
 
-turn_details/running_turn 0b750258cf4d
+turn_details/running_turn 4e47af4f253d
 
-turn_details/select_inside 7a25cf7fff0f
+turn_details/select_inside eee89ea6d8e7
 
 turn_details/setting_off_live c774d4977819
 
 turn_details/steer_click_second c774d4977819
 
-turn_details/steer_expanded fc7398378293
+turn_details/steer_expanded ced4a14d9430
 
-turn_details/steer_outside f7fe021828f6
+turn_details/steer_outside e9d2bca1e3cc
 
-turn_details/table_cell_inside d14a7f7224b4
+turn_details/table_cell_inside 067a1d21b14f
 
 turn_details/tool_first_click_answer c774d4977819
 

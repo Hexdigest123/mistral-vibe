@@ -118,6 +118,7 @@ fn shift_tab_moves_the_config_save_target_back() {
             kind: "int".into(),
             raw_value: json!(1),
             popular: false,
+            category: "advanced".into(),
             writable: true,
             overridden: false,
             enum_choices: Vec::new(),

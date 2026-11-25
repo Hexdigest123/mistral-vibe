@@ -1,49 +1,44 @@
 //! Config option row construction.
 
-use super::config::{Opt, ADVANCED, CURSOR_W, GAP, NAME_W, POPULAR, VALUE_W};
+use super::config::{Opt, CURSOR_W, GAP, NAME_W, VALUE_W};
 use crate::config::ConfigField;
+use crate::config_fields::section_label;
 
 pub(super) fn build_lines(fields: &[ConfigField], sections: bool) -> Vec<Opt> {
-    let mut out: Vec<Opt> = Vec::new();
     if !sections {
         return fields
             .iter()
             .enumerate()
-            .map(|(index, field)| Opt::Row {
-                index,
-                name: truncate(&field.name, NAME_W),
-                value: truncate(&field.display_value(), VALUE_W),
-                dangerous: field.dangerous,
-            })
+            .map(|(index, field)| row(index, field))
             .collect();
     }
-    let popular: Vec<&ConfigField> = fields.iter().filter(|f| f.popular).collect();
-    let advanced: Vec<&ConfigField> = fields.iter().filter(|f| !f.popular).collect();
-    let mut rank = 0usize;
-    let mut first = true;
-    for (label, section) in [(POPULAR, popular), (ADVANCED, advanced)] {
-        if section.is_empty() {
-            continue;
-        }
-        if !first {
+    // `fields` arrives in section order (config::filtered sorts by rank), so a
+    // new section starts whenever the category changes.
+    let mut out: Vec<Opt> = Vec::new();
+    let mut current: Option<&str> = None;
+    for (rank, field) in fields.iter().enumerate() {
+        if current != Some(field.category.as_str()) {
+            if current.is_some() {
+                out.push(Opt::Blank);
+                out.push(Opt::Blank);
+            }
+            out.push(Opt::Section(section_label(&field.category)));
             out.push(Opt::Blank);
-            out.push(Opt::Blank);
+            out.push(Opt::Header(columns_header()));
+            current = Some(field.category.as_str());
         }
-        out.push(Opt::Section(label.to_owned()));
-        out.push(Opt::Blank);
-        out.push(Opt::Header(columns_header()));
-        for field in section {
-            out.push(Opt::Row {
-                index: rank,
-                name: truncate(&field.name, NAME_W),
-                value: truncate(&field.display_value(), VALUE_W),
-                dangerous: field.dangerous,
-            });
-            rank += 1;
-        }
-        first = false;
+        out.push(row(rank, field));
     }
     out
+}
+
+fn row(index: usize, field: &ConfigField) -> Opt {
+    Opt::Row {
+        index,
+        name: truncate(&field.name, NAME_W),
+        value: truncate(&field.display_value(), VALUE_W),
+        dangerous: field.dangerous,
+    }
 }
 
 fn columns_header() -> String {

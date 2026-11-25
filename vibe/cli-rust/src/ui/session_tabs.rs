@@ -57,7 +57,11 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             .set_stringn(x, area.y, padded, width as usize, style);
         x += width + 1;
     }
-    let hints = [(key::TAB, action::SWITCH_TAB)];
+    let hints = if app.session_tabs.chord {
+        [(key::CTRL_X, action::TAB_CHORD)]
+    } else {
+        [(key::CTRL_X, action::TABS)]
+    };
     let width = crate::hints::width(&hints);
     if width < area.width {
         hint_line::draw(

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::actions::{notice, settle_refusal};
 use super::requests;
 use crate::app::{App, Severity};
-use crate::server::request_error::SESSION_BUSY_MESSAGE;
+use crate::server::request_error::{SESSION_BUSY_MESSAGE, SESSION_NOT_FOUND_MESSAGE};
 use crate::server::{Client, PublicSessionState};
 
 /// The archived title the notice quotes, at most this wide.
@@ -45,10 +45,13 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, event: Event) {
         }
         Event::Started(_, Ok(state)) => super::adopted(app, client, *state, "Started"),
         Event::Opened(_, Err(message)) | Event::Started(_, Err(message)) => {
-            super::switch::failed(app);
+            // Fork feature (AGENTS.md "Fork features"): a tab whose session is
+            // gone is removed from the tab list instead of failing forever.
+            let session_gone = message == SESSION_NOT_FOUND_MESSAGE;
+            super::switch::failed(app, session_gone);
             // A session another Vibe holds is a refusal to wait on, like the
             // local lease check, not a failure.
-            let severity = match message == SESSION_BUSY_MESSAGE {
+            let severity = match message == SESSION_BUSY_MESSAGE || session_gone {
                 true => Severity::Warning,
                 false => Severity::Error,
             };

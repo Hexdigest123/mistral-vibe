@@ -3,6 +3,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use unicode_width::UnicodeWidthStr;
 
 use crate::selection::cells::is_blank;
 use crate::selection::region::RowSpan;
@@ -12,7 +13,9 @@ use crate::selection::Granularity;
 use crate::ui::theme;
 
 /// Leading chrome glyphs, each followed by its own padding column (body text may open with one too).
-const CHROME_GLYPHS: [&str; 4] = ["⏵", "⏷", "■", "▌"];
+fn is_chrome_glyph(symbol: &str) -> bool {
+    matches!(symbol, "■" | "▌") || crate::ui::icons::ALL.contains(&symbol)
+}
 /// Entry border glyphs, chrome only inside the entry's border columns: tool output often draws them too.
 const BORDER_GLYPHS: [&str; 2] = ["│", "└"];
 /// Prompt and settled markers, chrome only in the first column: deeper in, a wrapped `>` or `/ path` row is content.
@@ -167,7 +170,7 @@ fn body(
     }
     let mut lo = first_x.min(content_start);
     let is_chrome = |x: u16, symbol: &str| {
-        (CHROME_GLYPHS.contains(&symbol)
+        (is_chrome_glyph(symbol)
             || (BORDER_GLYPHS.contains(&symbol) && x < chat.x.saturating_add(border))
             // A fence's leading rail opens the row: content quoting a rail,
             // in whatever color, never does.
@@ -176,7 +179,7 @@ fn body(
             && is_blank(buf, x.saturating_add(1), y)
     };
     if chrome && is_chrome(first_x, first_symbol) {
-        // Skip nested borders (`│ │ `), then a diff row's gutter; a header ends on its arrow.
+        // Skip nested borders (`│ │ `), then a diff row's gutter; a header ends on its icon.
         let run = visible
             .iter()
             .take_while(|(x, symbol)| is_chrome(*x, symbol));
@@ -188,7 +191,10 @@ fn body(
         } else {
             0
         };
-        lo = end.saturating_add(CHROME_WIDTH).saturating_add(gutter);
+        // The chrome run's last glyph plus its own pad column.
+        lo = end
+            .saturating_add(last.width() as u16 + 1)
+            .saturating_add(gutter);
     }
     x0 = x0.max(lo);
     if x0 > x1 {

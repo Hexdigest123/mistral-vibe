@@ -13,7 +13,7 @@ from e2e.app_server.scenario import Timeline
 
 env = {"TZ": "UTC"}
 
-screen_contains = ["⏷ CI watch", "└ loop 1a2b3c4d - 2026-08-24 17:41:00 UTC"]
+screen_contains = [" CI watch", "└ loop 1a2b3c4d - 2026-08-24 17:41:00 UTC"]
 
 timeline: Timeline = [
     "watch CI every minute\r",

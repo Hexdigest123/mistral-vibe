@@ -6304,6 +6304,31 @@ def test_unified_turn_error_keeps_unknown_harness_code_as_is():
 
 
 @pytest.mark.asyncio
+async def test_unified_session_not_found_carries_its_harness_code() -> None:
+    """A resume naming a gone session (e.g. an empty one discarded when a tab
+    replaced it) answers NOT_FOUND with `harnessCode: session_not_found`, so
+    clients can recognize it instead of showing the raw message.
+    """
+    pytest.importorskip("mistralai_vibe_local_harness.vibe")
+    from mistralai_vibe_local_harness.vibe import HarnessSessionNotFoundError
+    from vibe.app_server._harness_errors import harness_call
+
+    async def fail() -> None:
+        raise HarnessSessionNotFoundError("55f77d2d-081a-68c1-4cee-e338035e2137")
+
+    with pytest.raises(SessionBackendError) as exc_info:
+        await harness_call(fail())
+
+    assert exc_info.value.code is ProtocolErrorCode.NOT_FOUND
+    assert (
+        str(exc_info.value) == "Session not found: 55f77d2d-081a-68c1-4cee-e338035e2137"
+    )
+    assert (
+        cast(dict[str, Any], exc_info.value.data)["harnessCode"] == "session_not_found"
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("active_turn_id", "expected_code", "expected_message"),
     [

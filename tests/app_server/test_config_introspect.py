@@ -68,6 +68,9 @@ def test_field_category_prefers_fork_then_popular_then_topic() -> None:
     assert field_category("disable_all_telemetry", POPULAR_SETTINGS) == "fork"
     assert field_category("theme", POPULAR_SETTINGS) == "popular"
     assert field_category("providers", POPULAR_SETTINGS) == "models"
+    assert field_category("transcribe_models", POPULAR_SETTINGS) == "voice"
+    assert field_category("active_tts_model", POPULAR_SETTINGS) == "tts"
+    assert field_category("tts_providers", POPULAR_SETTINGS) == "tts"
     assert field_category("api_timeout", POPULAR_SETTINGS) == "advanced"
 
 
@@ -137,6 +140,9 @@ def test_build_field_wires_sets_section_categories(
     assert by_name["max_context_length"].category == "models"
     assert by_name["auto_compact_threshold"].category == "popular"
     assert by_name["worktree_limit"].category == "worktrees"
+    assert by_name["active_transcribe_model"].category == "voice"
+    assert by_name["active_tts_model"].category == "tts"
+    assert by_name["tts_models"].category == "tts"
     assert by_name["api_timeout"].category == "advanced"
 
 

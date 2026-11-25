@@ -109,6 +109,8 @@ mod composer_yank;
 mod config_dangerous;
 #[path = "units/config_filter.rs"]
 mod config_filter;
+#[path = "units/config_sections.rs"]
+mod config_sections;
 #[path = "units/config_selection.rs"]
 mod config_selection;
 #[path = "units/config_write.rs"]
@@ -597,6 +599,8 @@ mod storage_leftovers;
 mod storage_panel;
 #[path = "units/storage_review_prune.rs"]
 mod storage_review_prune;
+#[path = "units/stream_pace.rs"]
+mod stream_pace;
 #[path = "units/stress_command.rs"]
 mod stress_command;
 #[path = "units/subagent_notification.rs"]

@@ -13,6 +13,7 @@ fn enum_field(value: &str) -> ConfigField {
     ConfigField {
         name: "mode".into(),
         popular: true,
+        category: "popular".into(),
         path: "/mode".into(),
         raw_value: json!(value),
         kind: "enum".into(),

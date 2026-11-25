@@ -39,21 +39,26 @@ def field(
     *,
     layers: list[tuple[str, Any]] | None = None,
     choices: list[str] | None = None,
+    popular: bool = True,
+    category: str | None = None,
 ) -> dict[str, Any]:
-    """One popular `/config` row; `layers` lists its layer values, highest first."""
-    return {
+    """One `/config` row; `layers` lists its layer values, highest first."""
+    row: dict[str, Any] = {
         "name": name,
         "kind": kind,
         "value": value,
         "description": "",
         "path": f"/{name}",
-        "popular": True,
+        "popular": popular,
         "enumChoices": choices or [],
         "valueLabels": {},
         "layerValues": [
             {"layer": layer, "value": v} for layer, v in layers or [("default", value)]
         ],
     }
+    if category is not None:
+        row["category"] = category
+    return row
 
 
 def fields_read(*fields: dict[str, Any]) -> dict[str, Any]:

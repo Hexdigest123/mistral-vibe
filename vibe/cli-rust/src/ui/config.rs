@@ -1,5 +1,5 @@
-//! `/config` settings screen: a centered modal listing config rows in Popular
-//! and Advanced sections.
+//! `/config` settings screen: a centered modal listing config rows grouped in
+//! the sections the server filed them under (labels and order are client-owned).
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -20,8 +20,6 @@ pub(super) const GAP: usize = 2;
 pub(super) const CURSOR_W: usize = 2;
 const ROW_W: usize = CURSOR_W + NAME_W + GAP + VALUE_W;
 const OPT_W: u16 = 76;
-pub(super) const POPULAR: &str = "Popular settings";
-pub(super) const ADVANCED: &str = "Advanced settings";
 const HELP: &[Hint] = &[
     hints::NAVIGATE,
     (key::ENTER, action::EDIT),

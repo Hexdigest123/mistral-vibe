@@ -32,7 +32,7 @@ handshake = {
 
 client_args = ("--continue",)
 
-screen_contains = ("⏵ Ran 2 commands",)
+screen_contains = (" Ran 2 commands",)
 screen_excludes = ("Running 2 commands",)
 
 

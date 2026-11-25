@@ -150,7 +150,12 @@ pub fn submit(
                 app.pending_commands.push(value);
                 return false;
             }
-            if !is_side_channel(command) && reject_while_shell_runs(app, &value) {
+            // Fork feature (AGENTS.md "Fork features"): `/tab` queues its switch
+            // while busy instead of being rejected, so it always dispatches.
+            if !is_side_channel(command)
+                && command != "/tab"
+                && reject_while_shell_runs(app, &value)
+            {
                 return false;
             }
             if let Some(hint) = command_hint(app, command) {
@@ -256,6 +261,10 @@ fn reject_input(app: &mut App, value: &str, message: String) {
 
 /// Why this slash command cannot run now.
 fn command_hint(app: &App, command: &str) -> Option<&'static str> {
+    // Fork feature (AGENTS.md "Fork features"): `/tab` runs while busy and queues.
+    if command == "/tab" {
+        return None;
+    }
     if !is_side_channel(command) {
         return idle_hint(app, drops_queue(command));
     }

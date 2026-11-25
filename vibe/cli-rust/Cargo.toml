@@ -60,6 +60,7 @@ uuid = { version = "1", features = ["v4"] }
 percent-encoding = "2"
 # fzf's matching and scoring (nucleo, from Helix) for every searchable list.
 nucleo-matcher = "0.3"
+nerd-font-symbols = "0.3.0"
 
 [dev-dependencies]
 ctor = "0.2"

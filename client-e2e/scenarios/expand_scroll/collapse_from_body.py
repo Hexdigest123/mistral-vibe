@@ -11,7 +11,7 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline, take_snapshot
 
-screen_rows = {8: "⏵ Ran cat app.log"}
+screen_rows = {8: " Ran cat app.log"}
 
 _WHEEL_UP = "\x1b[<64;60;10M"
 _CTRL_O = "\x0f"

@@ -56,10 +56,11 @@ pub(super) fn landed(app: &mut App) {
 }
 
 /// The switch failed: the previous conversation comes back under the page,
-/// which reopens to say why.
-pub(super) fn failed(app: &mut App) {
+/// which reopens to say why. `session_gone` marks a resume of a session that
+/// no longer exists.
+pub(super) fn failed(app: &mut App, session_gone: bool) {
     // Fork feature (AGENTS.md "Fork features"): a tab switch settling here is cancelled too.
-    crate::session_tabs::on_switch_failed(app);
+    crate::session_tabs::on_switch_failed(app, session_gone);
     let reopen = app
         .sessions_page
         .switching

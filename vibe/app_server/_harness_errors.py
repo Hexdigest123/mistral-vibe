@@ -23,7 +23,13 @@ async def harness_call[ResultT](operation: Awaitable[ResultT]) -> ResultT:
     try:
         return await operation
     except HarnessSessionNotFoundError as exc:
-        raise SessionBackendError(ProtocolErrorCode.NOT_FOUND, str(exc)) from exc
+        # The typed `harnessCode` lets clients recognize a gone session (e.g. an
+        # empty session discarded when a tab replaced it), not just a raw message.
+        raise SessionBackendError(
+            ProtocolErrorCode.NOT_FOUND,
+            str(exc),
+            {"harnessCode": "session_not_found", "sessionId": exc.session_id},
+        ) from exc
     except HarnessNotImplementedError as exc:
         raise SessionBackendError(ProtocolErrorCode.INTERNAL_ERROR, str(exc)) from exc
     except HarnessSessionError as exc:

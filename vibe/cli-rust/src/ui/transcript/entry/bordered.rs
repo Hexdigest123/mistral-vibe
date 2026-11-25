@@ -1,12 +1,11 @@
 //! The expanding border every result body sits in.
 
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::expand_marker;
 use crate::transcript::grouping::Group;
 use crate::ui::markdown::LinkedLines;
-use crate::ui::{pulse, theme};
+use crate::ui::{icons, pulse, theme};
 use crate::utils::text;
 
 /// Columns a tool border occupies: the glyph under its toggle arrow, then one pad.
@@ -48,13 +47,24 @@ pub(super) fn push_group_header(
             theme::text(theme::foreground()),
         )
     } else {
-        (expand_marker(expanded).to_owned(), label_style)
+        // The icon carries the fold state on every theme: dim folded, bold unfolded.
+        (
+            icons::TOOL.to_owned(),
+            if expanded {
+                theme::text(theme::effect_message()).add_modifier(Modifier::BOLD)
+            } else {
+                label_style
+            },
+        )
     };
     lines.push(Line::from(vec![
         Span::styled(format!("{marker} "), marker_style),
         // One row, so hit-testing and cached heights never depend on the label.
         Span::styled(
-            text::ellipsize(&group.label(), usize::from(width).saturating_sub(2)),
+            text::ellipsize(
+                &group.label(),
+                usize::from(width.saturating_sub(icons::WIDTH)),
+            ),
             label_style,
         ),
     ]));

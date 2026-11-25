@@ -3,10 +3,10 @@
 use ratatui::text::{Line, Span};
 
 use super::bordered::prefix;
-use super::{expand_marker, RenderedEntry};
+use super::RenderedEntry;
 use crate::transcript::TurnDetails;
 use crate::ui::markdown::{self, LinkedLines};
-use crate::ui::theme;
+use crate::ui::{icons, theme};
 use crate::utils::text;
 
 /// Columns the rail of an unfolded group indents its steps by.
@@ -75,15 +75,18 @@ fn expanded_style() -> ratatui::style::Style {
     theme::text(theme::text_primary())
 }
 
-/// `⏵ Worked for 1m 12s · 2 messages · 3 tool calls` on one row, primary once unfolded.
+/// `⏳ Worked for 1m 12s · 2 messages · 3 tool calls` on one row, primary once unfolded.
 fn push_header(lines: &mut LinkedLines, view: DetailsView<'_>, width: u16) {
     let style = match view.expanded {
         true => expanded_style(),
         false => theme::dim(theme::effect_message()),
     };
-    let label = text::ellipsize(&view.details.label(), usize::from(width).saturating_sub(2));
+    let label = text::ellipsize(
+        &view.details.label(),
+        usize::from(width.saturating_sub(icons::WIDTH)),
+    );
     lines.push(Line::from(vec![
-        Span::styled(format!("{} ", expand_marker(view.expanded)), style),
+        Span::styled(format!("{} ", icons::TURN), style),
         Span::styled(label, style),
     ]));
 }

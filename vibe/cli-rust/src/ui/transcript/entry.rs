@@ -124,7 +124,6 @@ fn render_entry(
                     in_progress,
                     local: entry.local,
                     expanded: expansion.entry,
-                    grouped: entry.group.is_some(),
                     stream_delta: entry.stream_delta,
                 },
                 entry.attached_output,
@@ -203,12 +202,4 @@ fn push_interrupt(lines: &mut LinkedLines, retryable: bool) {
         spans.push(Span::styled(" Or /retry to resume.", theme::muted_style()));
     }
     lines.push(Line::from(spans));
-}
-
-pub(super) fn expand_marker(expanded: bool) -> &'static str {
-    if expanded {
-        "⏷"
-    } else {
-        "⏵"
-    }
 }

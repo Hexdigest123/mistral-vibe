@@ -8,9 +8,9 @@ use super::super::super::{pulse, theme};
 use super::super::diff;
 use super::bordered::{prefix, BORDER_WIDTH};
 use super::effect_body::{push_edit_diff, push_effect_body, push_todo_body};
-use super::expand_marker;
 use crate::selection::{fold, Fold};
 use crate::server::BodyLine;
+use crate::ui::icons;
 use crate::ui::markdown::LinkedLines;
 use crate::utils::{clean::clean_output, text};
 
@@ -21,7 +21,6 @@ pub(super) struct EffectView<'a> {
     pub in_progress: bool,
     pub local: bool,
     pub expanded: bool,
-    pub grouped: bool,
     /// The latest text appended to a running effect's `state.outputText`.
     pub stream_delta: Option<&'a str>,
 }
@@ -61,7 +60,6 @@ pub(super) fn push_effect(
         in_progress,
         local,
         expanded,
-        grouped,
         stream_delta,
     } = view;
     let (verb, message, suffix) = effect.summary();
@@ -85,7 +83,7 @@ pub(super) fn push_effect(
         effect.has_body() || attached_output.is_some_and(|text| !clean_output(text).is_empty());
     let shown = (expanded && has_body) || settled_open;
     // A settled collapsible result with nothing to unfold
-    // shows the inert marker in the disclosure slot instead of the fold triangle.
+    // shows the inert marker in the marker column instead of the tool icon.
     let inert = !in_progress && effect.is_collapsible() && !has_body;
     let settled_marker = |glyph: &str| {
         if settled_open {
@@ -93,7 +91,7 @@ pub(super) fn push_effect(
         } else if inert {
             "▪".to_string()
         } else {
-            expand_marker(expanded).to_string()
+            icons::TOOL.to_string()
         }
     };
     let (marker, marker_color) = if in_progress && local {
@@ -105,20 +103,17 @@ pub(super) fn push_effect(
     } else if effect.is_muted() {
         (settled_marker("□"), theme::muted())
     } else if effect.success() {
-        (
-            if grouped && !inert {
-                expand_marker(expanded).to_string()
-            } else {
-                settled_marker("✓")
-            },
-            theme::status_ready(),
-        )
+        (settled_marker("✓"), theme::status_ready())
     } else {
         (settled_marker("✕"), theme::error())
     };
+    // The tool icon carries the fold state on every theme: dim folded, bold unfolded.
+    let icon_marker = !in_progress && !settled_open && !inert;
     let marker_style = if effect.is_muted() || inert {
         theme::muted_style()
-    } else if effect.status() == Some("failed") {
+    } else if icon_marker && shown {
+        theme::text(marker_color).add_modifier(Modifier::BOLD)
+    } else if icon_marker || effect.status() == Some("failed") {
         theme::dim(marker_color)
     } else {
         theme::text(marker_color)

@@ -60,9 +60,10 @@ Contract:
   filters live, `↑↓`/Enter act on the list while the field is focused, Esc
   leaves the field, then clears the filter, then closes; the search row sits
   under the title (`/  Search …`); typing never resizes the box.
-- `/config` keeps its Popular/Advanced sections when a search has more than
-  `MERGED_MATCHES` rows: `filtered()` then returns popular fields first, since
-  the sectioned rows are numbered in that order.
+- `/config` keeps its category sections (Popular, Fork features, the topic
+  sections such as Models/Voice/TTS, Advanced) when a search has more than
+  `MERGED_MATCHES` rows: `filtered()` then returns fields in section order,
+  since the sectioned rows are numbered in that order.
 
 Map: `vibe/cli-rust/src/utils/fzf.rs` (the only matcher for lists; the older
 `utils/fuzzy.rs` stays for path and command completion), `model_picker.rs`,
@@ -240,19 +241,32 @@ Contract:
   snapshot, scroll and composer draft client-side, and their session in the
   store. A tab switch sends `session/resume` (or `session/start` for a new
   tab) on the same connection, so it waits for the current turn to finish
-  (same gate as the Sessions page's switch). The in-flight switch rides the
-  Sessions page's `switching` record, so input/Esc/Ctrl+C gating is shared.
+  (same gate as the Sessions page's switch): while a turn, queue or shell
+  command runs, the switch is **queued** (`SessionTabs.queued`) with a notice
+  and runs when the session goes idle (`maybe_run_queued`, fired from the
+  steady loop after notifications and ui events). The in-flight switch rides
+  the Sessions page's `switching` record, so input/Esc/Ctrl+C gating is shared.
+  A tab whose session is already attached (the server reused it, e.g. for an
+  empty session a new tab replaced) switches locally with no round-trip, even
+  mid-turn. A switch whose resume fails `session_not_found` removes the target
+  tab from the list instead of leaving a dead tab.
 - UI: a one-row tab bar above the conversation, shown when more than one tab
-  is open (`1 Title  2 Title …`, active tab on the cursor bar, `Tab switch
-  tab` hint at the right edge). Left click switches, middle click closes.
-- Keys (composer only): `Tab`/`Shift+Tab` step (wrapping), `Alt+1-9` jump.
-  With 2+ tabs open, `focus::tab_navigates` is true for the composer, so
-  Shift+Tab reaches the tabs instead of cycling approval policies.
-- `/tab [new|next|prev|close [N]|N]` runs the same actions; hidden from help
-  and completion while the feature is off (`Feature::SessionTabs`), typing it
-  while off shows a notice. Opening a session from the Sessions page opens it
-  as a new tab (or switches to its tab if already open). `/clear`/`/compact`
-  still replace the active tab's session in place.
+  is open or the chord is armed (`1 Title  2 Title …`, active tab on the
+  cursor bar, `Ctrl+X tabs` hint at the right edge, or the chord keys while
+  armed). Left click switches, middle click closes.
+- Keys (composer only): `Ctrl+X` arms a chord, even with a single tab (`n` is
+  how the second tab opens); the next key `1-9` switches to that tab, `n` opens
+  a new one, `c` closes the active one; any other key cancels the chord and
+  falls through to the upstream `Ctrl+X` rail chord (a priority key such as
+  Ctrl+C cancels it too). `Tab`/`Shift+Tab`/`Alt+1-9` do not touch tabs
+  (`focus::tab_navigates` stays false for the composer).
+- `/tab [new|next|prev|close [N]|N]` runs the same actions and is never
+  rejected while busy (submission lets `/tab` dispatch; it queues instead);
+  hidden from help and completion while the feature is off
+  (`Feature::SessionTabs`), typing it while off shows a notice. Opening a
+  session from the Sessions page opens it as a new tab (or switches to its tab
+  if already open). `/clear`/`/compact` still replace the active tab's session
+  in place.
 - Config: `enable_session_tabs: bool = true` in `vibe_schema.py`, projected
   in `ConfigView` (`app_server/config.py`, `_projection.py`, ADR 0014 default
   `yes` in the Rust `proto_runtime.rs`), read by `startup::read_enable_session_tabs`
@@ -268,14 +282,53 @@ Map: `vibe/cli-rust/src/session_tabs/` (`mod.rs` state + tab bookkeeping,
 titles), `src/input.rs`, `src/focus.rs`, `src/mouse.rs` + `src/mouse/dispatch.rs`,
 `src/ui/mod.rs`, `src/commands/{commands,dispatch}.rs`,
 `src/sessions_page/{mod,requests,switch,adopt}.rs`, `src/server/proto_runtime.rs`,
-`src/startup/{mod,reads}.rs`, `src/transcript.rs` (`Snapshot: Clone`).
+`src/startup/{mod,reads}.rs`, `src/transcript.rs` (`Snapshot: Clone`),
+`src/event_loop/keys.rs` (the armed chord takes the next key before the
+composer-level bindings).
 Python: `vibe/core/config/vibe_schema.py`, `vibe/app_server/config.py`,
-`vibe/app_server/_projection.py`, `vibe/app_server/_config_introspect.py`.
+`vibe/app_server/_projection.py`, `vibe/app_server/_config_introspect.py`,
+`vibe/app_server/_harness_errors.py` (`HarnessSessionNotFoundError` maps to
+NOT_FOUND with `data.harnessCode = "session_not_found"`, which the client
+recognizes to drop a gone tab).
 
 Guards: `vibe/cli-rust/tests/units/session_tabs.rs`, scenarios
 `client-e2e/scenarios/session_tabs/new_switch.py` and `disabled.py`,
 `tests/app_server/test_projection.py::test_config_view_projects_enable_session_tabs`,
 `tests/test_fork_features.py`.
+
+## 8. TTFT and TPS in the bottom bar
+
+Contract:
+- The bottom bar's right side ends with the turn's pace after the `ctx` gauge:
+  `… · ctx ▏ 0/800k · 0.8s ttft · 20.0 tok/s` (labels are OpenCode's footer wording).
+- Measured like OpenCode's TUI, client-side from the app-server notifications: TTFT runs
+  from `turn/started` to the first streamed text (an `history/entryAdded` in-progress
+  assistant/reasoning entry with text, or the first `history/entryUpdated` patch appending
+  `/content/<n>/text` or `/text`). TPS divides output tokens by the sum of per-entry decode
+  windows — each streamed entry's last-to-first token span, so tool time and waits between
+  entries are excluded — OpenCode's `tokensPerSecond`, which weights each step by its own
+  provider-active duration.
+- While streaming, the wire carries cumulative text only, so the live rate estimates
+  tokens as chars/4 (OpenCode's plugins do the same) over the summed windows (`now` extends
+  only the latest entry's). Once `session/statsUpdated` reports
+  `lastTurnCompletionTokens`, the shown reading uses the exact count instead of the
+  estimate.
+- The last finished turn's reading stays in the bar when idle; a new session
+  (`set_session_id`) resets it. A turn that streamed nothing shows no segment.
+- Under narrow widths the segment is the first to shrink: full form, then tok/s only,
+  then hidden — after the gauges have turned to levels; the gauges never hide.
+- The UI clock drives all of it (`clock::now`), so replay scenarios advance it with
+  `advance(ms)` and goldens are deterministic.
+
+Map: `vibe/cli-rust/src/stream_pace.rs` (tracker + hooks; the only fork-only module),
+hooks marked `Fork feature (AGENTS.md "Fork features")` in `src/lib.rs`, `src/app.rs`
+(`Session.pace`, reset in `set_session_id`), `src/event_handler.rs` (`turn/started`,
+`history/entryAdded`, `history/entryUpdated`, `turn/completed`, `session/statsUpdated`);
+presentation in `src/ui/footer_gauge.rs` (`pace_forms`), `src/ui/footer_fit.rs` (the
+third segment, `Slot::Pace` last in the `LADDER`), `src/ui/bottom_bar.rs`.
+
+Guards: `vibe/cli-rust/tests/units/stream_pace.rs`, scenario
+`client-e2e/scenarios/footer/stream_pace.py`, `tests/test_fork_features.py`.
 
 ## Adding a fork feature
 

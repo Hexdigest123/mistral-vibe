@@ -109,6 +109,8 @@ pub mod skill;
 pub mod skills_browser;
 pub mod startup;
 pub mod storage_panel;
+// Fork feature (AGENTS.md "Fork features"): TTFT/TPS measured from the stream, shown in the bottom bar.
+pub mod stream_pace;
 pub mod subagents;
 pub mod tab_bar;
 pub mod tasks_panel;

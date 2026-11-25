@@ -18,6 +18,10 @@ pub const SESSION_BUSY_MESSAGE: &str =
 /// The notice when a resume hits a store written by a newer Vibe.
 pub const STORE_REQUIRES_NEWER_READER_MESSAGE: &str = "This session was created by a newer version of Vibe. Restart with --check-upgrade to update Vibe, then resume this session.";
 
+/// The notice when a resume names a session that no longer exists (e.g. an
+/// empty session the server discarded when a new tab replaced it).
+pub const SESSION_NOT_FOUND_MESSAGE: &str = "That session no longer exists.";
+
 /// The resume-failure notice: a self-contained instruction for the harness
 /// codes with a known message, else the prefixed server message.
 pub fn resume_failure_message(error: &anyhow::Error) -> String {
@@ -30,6 +34,9 @@ pub fn resume_failure_message(error: &anyhow::Error) -> String {
     }
     if rpc.harness_code() == Some("store_requires_newer_reader") {
         return STORE_REQUIRES_NEWER_READER_MESSAGE.to_owned();
+    }
+    if rpc.harness_code() == Some("session_not_found") {
+        return SESSION_NOT_FOUND_MESSAGE.to_owned();
     }
     format!("Failed to resume session: {}", describe(error))
 }

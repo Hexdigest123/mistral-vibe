@@ -3,14 +3,14 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::expand_marker;
+use super::bordered::BORDER_WIDTH;
 use crate::selection::Fold;
 use crate::transcript::{split_loop_prompt, FiredLoop};
 use crate::ui::markdown::{self, LinkedLines, Sc};
-use crate::ui::theme;
+use crate::ui::{icons, theme};
 use crate::utils::{datetime, text};
 
-/// `⏵ title`; unfolded, the instructions and `loop {id} - {fired at}` hang under a `│`/`└` border.
+/// `🔁 title`; unfolded, the instructions and `loop {id} - {fired at}` hang under a `│`/`└` border.
 pub(super) fn push_loop_prompt(
     lines: &mut LinkedLines,
     prompt: &str,
@@ -20,11 +20,16 @@ pub(super) fn push_loop_prompt(
     width: usize,
 ) {
     let (title, body) = split_loop_prompt(prompt);
-    let mut header = wrapped(title, title_style, width);
-    let marker = format!("{} ", expand_marker(expanded));
+    let mut header = wrapped(
+        title,
+        title_style,
+        width.saturating_sub(icons::WIDTH as usize),
+    );
+    let marker = format!("{} ", icons::LOOP);
+    let hang = " ".repeat(icons::WIDTH as usize);
     header.prefix(|index| match index {
         0 => Span::styled(marker.clone(), marker_style),
-        _ => Span::raw("  "),
+        _ => Span::raw(hang.clone()),
     });
     lines.append(header);
     if !expanded {
@@ -32,8 +37,9 @@ pub(super) fn push_loop_prompt(
     }
     let muted = theme::muted_style();
     let mut content = LinkedLines::default();
+    let body_width = width.saturating_sub(BORDER_WIDTH as usize);
     for line in body.lines() {
-        content.append(wrapped(line, muted, width));
+        content.append(wrapped(line, muted, body_width));
     }
     push_fired_loop(&mut content, fired);
     let last = content.len() - 1;

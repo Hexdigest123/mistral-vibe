@@ -32,4 +32,4 @@ timeline: Timeline = [
     take_snapshot(),
 ]
 
-screen_rows = {14: "│ ⏷ Ran 3 commands", 17: "└ └ ⏵ Ran git status", 18: "", 19: ""}
+screen_rows = {14: "│  Ran 3 commands", 17: "└ └  Ran git status", 18: "", 19: ""}

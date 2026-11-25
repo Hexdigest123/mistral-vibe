@@ -31,11 +31,11 @@ timeline: Timeline = [
 ]
 
 screen_rows = {
-    10: "⏵ Worked for 10s · 1 message · 1 tool call",
+    10: " Worked for 10s · 1 message · 1 tool call",
     11: "",
     12: "↳ also check the docs",
     13: "",
-    14: "⏵ Worked for 1m 2s · 1 tool call",
+    14: " Worked for 1m 2s · 1 tool call",
     15: "",
     16: "  Fixed, and the docs match.",
 }

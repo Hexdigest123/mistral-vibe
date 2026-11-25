@@ -168,6 +168,7 @@ fn history_shortcuts_do_not_clear_a_config_validation_error() {
             kind: "int".into(),
             raw_value: json!("invalid"),
             popular: false,
+            category: "advanced".into(),
             writable: true,
             overridden: false,
             enum_choices: Vec::new(),

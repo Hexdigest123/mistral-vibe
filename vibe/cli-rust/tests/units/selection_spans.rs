@@ -86,9 +86,14 @@ fn extracted(rows: &[&str]) -> String {
     region::extract(&buf, &region::spans(&app, &buf, chat))
 }
 
+/// A tool header row: four indent cells, the tool icon, its pad, then the label.
+fn tool_row() -> String {
+    format!("    {} Read file", vibe_rs::ui::icons::TOOL)
+}
+
 #[test]
 fn drag_left_of_an_indented_tool_header_selects_nothing() {
-    assert_eq!(selected("    ⏵ Read file", 0, 2), Vec::new());
+    assert_eq!(selected(&tool_row(), 0, 2), Vec::new());
 }
 
 #[test]
@@ -124,7 +129,7 @@ fn frame_regions_select_without_chrome_gaps() {
 
 #[test]
 fn drag_over_an_indented_tool_header_skips_its_chrome() {
-    assert_eq!(selected("    ⏵ Read file", 0, 14), vec![(0, 6, 14)]);
+    assert_eq!(selected(&tool_row(), 0, 14), vec![(0, 6, 14)]);
 }
 
 /// The whole of a transcript `row` painted by an entry with `(border, gutter)` chrome columns.
@@ -170,7 +175,8 @@ fn an_inset_notice_border_is_chrome() {
 
 #[test]
 fn an_edit_header_keeps_its_text_from_the_diff_gutter() {
-    assert_eq!(selected_in_entry("⏵ Edited a.rs", (2, 7)), vec![(0, 2, 12)]);
+    let edit_row = format!("{} Edited a.rs", vibe_rs::ui::icons::TOOL);
+    assert_eq!(selected_in_entry(&edit_row, (2, 7)), vec![(0, 2, 12)]);
 }
 
 #[test]

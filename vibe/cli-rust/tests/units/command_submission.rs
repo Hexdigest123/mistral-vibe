@@ -338,3 +338,36 @@ async fn escape_on_a_running_shell_command_interrupts_that_command_only() {
     assert_eq!(frames[0]["params"]["action"], "interrupt");
     assert_eq!(frames[0]["params"]["operationId"], operation_id.as_str());
 }
+
+#[tokio::test]
+async fn tab_commands_queue_while_busy_but_other_commands_still_refuse() {
+    let mut harness = Harness::ready();
+    harness.app.session.status = Status::Generating {
+        since: vibe_rs::clock::now(),
+    };
+    assert!(!harness.submit("/tab new"));
+    assert!(
+        harness.app.chat_input.full_text().is_empty(),
+        "/tab dispatched instead of being rejected"
+    );
+    assert_eq!(
+        harness.app.session_tabs.queued,
+        Some(vibe_rs::session_tabs::QueuedAction::New)
+    );
+    assert!(harness
+        .notice()
+        .unwrap()
+        .contains("when the current turn finishes"));
+
+    let mut harness = Harness::ready();
+    harness.app.session.status = Status::Generating {
+        since: vibe_rs::clock::now(),
+    };
+    assert!(!harness.submit("/model"));
+    assert_eq!(
+        harness.app.chat_input.full_text(),
+        "/model",
+        "other commands stay rejected while busy"
+    );
+    assert!(harness.notice().unwrap().contains("cannot be queued"));
+}

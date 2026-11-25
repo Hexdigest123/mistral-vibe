@@ -97,7 +97,7 @@ pub(super) fn push(
     collapsed
 }
 
-/// The pinned prompt cut to `max_rows` (a loop pins as `⏵ title`), then the separator.
+/// The pinned prompt cut to `max_rows` (a loop pins as `🔁 title`), then the separator.
 /// Under a `steer`, the prompt and the steer each take one row.
 pub(in crate::ui::transcript) fn sticky(
     message: &MessageEntry,
@@ -139,13 +139,13 @@ fn push_loop_title(
     styles: (Style, Style),
     max_rows: usize,
 ) {
-    let content_width = width.saturating_sub(2) as usize;
+    let header_width = width.saturating_sub(crate::ui::icons::WIDTH) as usize;
     let text = super::message_text(message);
     let (title, _) = split_loop_prompt(&text);
     // Graphemes past the rows kept are never wrapped.
     let budget = max_rows
         .saturating_add(1)
-        .saturating_mul(content_width.max(1));
+        .saturating_mul(header_width.max(1));
     let mut kept = String::new();
     let mut cells = 0;
     let mut cut = false;
@@ -158,7 +158,14 @@ fn push_loop_title(
         kept.push_str(grapheme);
     }
     let mut header = LinkedLines::default();
-    super::loop_prompt::push_loop_prompt(&mut header, &kept, fired, false, styles, content_width);
+    super::loop_prompt::push_loop_prompt(
+        &mut header,
+        &kept,
+        fired,
+        false,
+        styles,
+        usize::from(width),
+    );
     let cut = cut || header.len() > max_rows;
     header.retain(|index, _| index < max_rows);
     if cut {

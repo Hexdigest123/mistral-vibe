@@ -58,7 +58,7 @@ handshake = {
 
 request_methods = frozenset({"session/read"})
 
-screen_contains = ("⏷ Watcher ping", "└ loop 1a2b3c4d - 2026-08-24 17:41:00 UTC")
+screen_contains = (" Watcher ping", "└ loop 1a2b3c4d - 2026-08-24 17:41:00 UTC")
 
 timeline: Timeline = [
     f"{_PROMPT}\r",

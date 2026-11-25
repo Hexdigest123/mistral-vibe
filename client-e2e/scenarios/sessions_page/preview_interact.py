@@ -109,4 +109,4 @@ timeline: Timeline = [
 ]
 
 # The click unfolds the call Ctrl+O folded back, at the end of the conversation.
-screen_contains = ("Model      mistral-large · high", "⏷ Ran ls docs", "└ usage.md")
+screen_contains = ("Model      mistral-large · high", " Ran ls docs", "└ usage.md")

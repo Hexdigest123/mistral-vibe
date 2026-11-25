@@ -3,7 +3,8 @@
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::footer_gauge::{context_forms, usage_forms, Usage};
+use super::footer_gauge::{context_forms, pace_forms, usage_forms, Usage};
+use crate::stream_pace::PaceView;
 
 /// Between the gauges.
 pub const GAUGE_SEP: &str = " · ";
@@ -31,6 +32,7 @@ pub type Form = Vec<(String, Tone)>;
 enum Slot {
     Usage,
     Context,
+    Pace,
 }
 
 impl Slot {
@@ -39,13 +41,22 @@ impl Slot {
         match self {
             Slot::Usage => 0,
             Slot::Context => 1,
+            Slot::Pace => 2,
         }
     }
 }
 
 /// Each step moves one segment to its next narrower form; a segment past its last form is hidden.
-/// The gauges turn from bars to one-cell levels, then lose their numbers, but never hide.
-const LADDER: [Slot; 4] = [Slot::Context, Slot::Usage, Slot::Context, Slot::Usage];
+/// The gauges turn from bars to one-cell levels, then lose their numbers, but never hide; the
+/// TTFT/TPS segment shrinks last and is the only one that hides.
+const LADDER: [Slot; 6] = [
+    Slot::Context,
+    Slot::Usage,
+    Slot::Context,
+    Slot::Usage,
+    Slot::Pace,
+    Slot::Pace,
+];
 /// The steps taken before the cwd shortens: the gauges turn into levels.
 const BEFORE_CWD: usize = 2;
 
@@ -58,6 +69,7 @@ pub struct Inputs<'a> {
     pub quit: Option<usize>,
     pub tokens: (u64, u64),
     pub usage: Option<Usage>,
+    pub pace: Option<PaceView>,
 }
 
 /// The chosen forms; an empty form or string is hidden.
@@ -68,6 +80,7 @@ pub struct Fitted {
     pub copy_icon: bool,
     pub context: Form,
     pub usage: Form,
+    pub pace: Form,
 }
 
 struct Segment {
@@ -94,6 +107,7 @@ pub fn fit(inputs: Inputs) -> Fitted {
     let mut segments = [
         Segment::new(usage_forms(inputs.usage)),
         Segment::new(context_forms(inputs.tokens)),
+        Segment::new(pace_forms(inputs.pace)),
     ];
     let cwd_full = inputs.quit.unwrap_or_else(|| inputs.cwd.width());
     let floor = if quit {
@@ -124,7 +138,7 @@ pub fn fit(inputs: Inputs) -> Fitted {
         .rev()
         .find(|&cells| total(&segments, cwd(cells)) <= inputs.width)
         .unwrap_or(0);
-    let [usage, context] = segments.map(|segment| segment.current());
+    let [usage, context, pace] = segments.map(|segment| segment.current());
     Fitted {
         cwd: if quit {
             String::new()
@@ -134,14 +148,15 @@ pub fn fit(inputs: Inputs) -> Fitted {
         copy_icon: icon > 0 && shortened(cwd_width),
         context,
         usage,
+        pace,
     }
 }
 
 /// The whole row's cells with a `cwd`-cell cwd: left side, one-cell spacer, right side.
-fn total(segments: &[Segment; 2], cwd: usize) -> usize {
-    let [usage, context] = segments.each_ref().map(Segment::width);
-    let sep = GAUGE_SEP.width() * usize::from(usage > 0 && context > 0);
-    let right = usage + context + sep;
+fn total(segments: &[Segment; 3], cwd: usize) -> usize {
+    let widths = segments.each_ref().map(Segment::width);
+    let shown = widths.iter().filter(|&&width| width > 0).count();
+    let right = widths.iter().sum::<usize>() + GAUGE_SEP.width() * shown.saturating_sub(1);
     cwd + right + usize::from(cwd > 0 && right > 0)
 }
 

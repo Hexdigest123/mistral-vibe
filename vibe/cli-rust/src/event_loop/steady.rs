@@ -231,6 +231,8 @@ impl EventLoop {
                         notification,
                         &mut deferred_notification,
                     );
+                    // Fork feature (AGENTS.md "Fork features"): a tab switch queued while busy runs now.
+                    crate::session_tabs::maybe_run_queued(&mut self.app, &self.client);
                     state.redraw_pending = true;
                 }
                 Some(loaded) = sources.config.recv() => {
@@ -267,6 +269,8 @@ impl EventLoop {
                 }
                 Some(event) = sources.events.recv() => {
                     crate::ui_event::apply(&mut self.app, &self.client, event);
+                    // Fork feature (AGENTS.md "Fork features"): a tab switch queued while busy runs now.
+                    crate::session_tabs::maybe_run_queued(&mut self.app, &self.client);
                     state.redraw_pending = true;
                 }
                 _ = clock::sleep_until(self.app.sessions_page.preview.at) => {
