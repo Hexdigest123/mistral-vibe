@@ -79,6 +79,19 @@ impl State {
         Ok(true)
     }
 
+    /// Fork feature (AGENTS.md "Fork features"): drop the callbacks of `session_id` (all when `None`)
+    /// a session switch made moot, unanswered and not remembered, so a re-sent one still shows.
+    pub fn forget(&mut self, session_id: Option<&str>) {
+        let moot = |callback: &ApprovalCallback| {
+            session_id.is_none_or(|id| callback.address.session_id.as_deref() == Some(id))
+        };
+        self.pending.retain(|callback| !moot(callback));
+        if self.active.as_ref().is_some_and(moot) {
+            self.finish_active();
+            self.recent_callback_ids.pop_back();
+        }
+    }
+
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }

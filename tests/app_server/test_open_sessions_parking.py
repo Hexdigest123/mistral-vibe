@@ -233,3 +233,39 @@ async def test_an_open_leaves_a_settle_it_did_not_start_alone() -> None:
 async def _open_while(sessions: OpenSessions, session_id: str) -> None:
     async with sessions.opening(session_id):
         assert sessions.settling(session_id)
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_parked_session_ends_it_while_its_turn_work_goes_on() -> None:
+    sessions = OpenSessions()
+    session = _Session()
+    sessions.park("s", session)
+
+    await sessions.stop("s")
+    await asyncio.sleep(0.05)
+
+    assert session.stops == 1
+    assert session.stopped
+    assert sessions.parked("s") is None
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_session_that_is_not_parked_does_nothing() -> None:
+    await OpenSessions().stop("s")
+
+
+@pytest.mark.asyncio
+async def test_a_stop_that_fails_keeps_the_session_parked_for_the_exit() -> None:
+    sessions = OpenSessions()
+    session = _Session()
+
+    async def fail() -> None:
+        raise RuntimeError("stuck")
+
+    session.stop = fail  # type: ignore[method-assign]
+    sessions.park("s", session)
+
+    await sessions.stop("s")
+
+    assert sessions.parked("s") is session
+    await sessions.close()

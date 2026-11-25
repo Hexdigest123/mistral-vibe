@@ -66,8 +66,10 @@ merged into its summary refuses the fork until it ends.
 Left and `/sessions` open the Sessions page as a side-channel command. While
 busy, the page only lists and reads sessions, lists projects, renames any
 session, and archives or marks as seen a session other than the busy one. It
-refuses to switch to another session until the turn ends. `/resume` opens the
-same page but stays idle-only, since it attaches another session.
+refuses to switch to another session until the turn ends, unless the client
+declared `parkRunningSession` ([0022](0022-parking-on-session-switch.md)): the
+server then parks the running session and the switch runs at once. `/resume`
+opens the same page but stays idle-only, since it attaches another session.
 
 MCP, connector, and plugin changes stay idle-only: the Harness refuses them
 while a turn runs.
@@ -99,6 +101,35 @@ queued-message UI.
   New queued work belongs in an explicit app-server API.
 - Preserve the submitted input when rejecting a busy command so the user can
   retry it after the active work finishes.
+
+## Amendment: Session Tabs and Commands While Busy (fork)
+
+The Rust client no longer refuses most slash commands while busy. This is an
+explicit product decision for the fork's session tabs, and it overrides the
+idle-only rules above where they differ:
+
+- Tab actions (`/tab`, `Ctrl+X` chord, tab clicks: new, switch, close) run at
+  once, even while a turn, a queue or a shell command runs. A session switch
+  parks the running session on the app server, which keeps its turn going
+  ([0022](0022-parking-on-session-switch.md); the client opts in with
+  `initialize.capabilities.parkRunningSession`); the client marks the tab and
+  polls `session/list` while a background turn runs.
+  Only a session that is still starting or compacting refuses a tab action.
+- Every slash command that does not rewrite the history the running turn reads
+  (`/config`, `/model`, `/thinking`, `/mcp`, `/plugins`, `/skills`, `/agent`,
+  `/cd`, `/help`, …) runs at once. Opening a picker is always allowed; a write is
+  decided by the app server (`config/model/write` parks the pick, other
+  refusals come back as errors the client shows as a notice).
+- The commands that rewrite or replace the history (`/clear`, `/compact`,
+  `/rewind`, `/resume`, `/retry`) are *deferred*: submitted while busy, the
+  client keeps that one command in a single slot with a notice ("/compact will
+  run when the current turn finishes") and runs it when the session goes idle.
+  A later one replaces it, Esc on the turn or a session change drops it, and a
+  paused queue still refuses it (it would never go idle).
+
+The single deferred slot is a deliberate, bounded exception to "no
+client-side deferred queue": it holds one command text, never a turn, and
+never reorders what the app server accepted. Shell commands keep their rules.
 
 ## Flag To User When
 

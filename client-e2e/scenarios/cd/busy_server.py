@@ -18,7 +18,7 @@ handshake = {
 client_args = CLIENT_ARGS
 request_methods = REQUEST_METHODS
 screen_contains = (
-    "Slash commands cannot be queued — wait for the current job to finish.",
+    "The session can't move while a turn runs — try /cd again once it ends.",
 )
 screen_excludes = ("Moved to",)
 

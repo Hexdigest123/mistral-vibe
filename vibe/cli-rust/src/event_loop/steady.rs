@@ -231,8 +231,8 @@ impl EventLoop {
                         notification,
                         &mut deferred_notification,
                     );
-                    // Fork feature (AGENTS.md "Fork features"): a tab switch queued while busy runs now.
-                    crate::session_tabs::maybe_run_queued(&mut self.app, &self.client);
+                    // Fork feature (AGENTS.md "Fork features"): a command scheduled for idle runs now.
+                    crate::commands::deferred::run_when_idle(&mut self.app, &self.client, &self.config_tx);
                     state.redraw_pending = true;
                 }
                 Some(loaded) = sources.config.recv() => {
@@ -269,8 +269,13 @@ impl EventLoop {
                 }
                 Some(event) = sources.events.recv() => {
                     crate::ui_event::apply(&mut self.app, &self.client, event);
-                    // Fork feature (AGENTS.md "Fork features"): a tab switch queued while busy runs now.
-                    crate::session_tabs::maybe_run_queued(&mut self.app, &self.client);
+                    // Fork feature (AGENTS.md "Fork features"): a command scheduled for idle runs now.
+                    crate::commands::deferred::run_when_idle(&mut self.app, &self.client, &self.config_tx);
+                    state.redraw_pending = true;
+                }
+                // Fork feature (AGENTS.md "Fork features"): poll the tabs running in the background.
+                _ = clock::sleep_until(self.app.session_tabs.poll_at) => {
+                    crate::session_tabs::poll(&mut self.app, &self.client);
                     state.redraw_pending = true;
                 }
                 _ = clock::sleep_until(self.app.sessions_page.preview.at) => {
@@ -286,6 +291,8 @@ impl EventLoop {
                 }
                 Some(command) = sources.commands.recv() => {
                     apply_command(&mut self.app, &self.client, command);
+                    // Fork feature (AGENTS.md "Fork features"): a compaction or shell command may have ended.
+                    crate::commands::deferred::run_when_idle(&mut self.app, &self.client, &self.config_tx);
                     state.redraw_pending = true;
                 }
                 event = next_input(input, &mut state.deferred_input) => match handle_input_batch(

@@ -160,6 +160,8 @@ pub async fn initialize_connection(client: &Client) -> Result<String> {
         },
         capabilities: ClientCapabilities {
             callback_kinds: CALLBACK_KINDS.iter().map(|k| (*k).into()).collect(),
+            // Fork feature (AGENTS.md "Fork features"): a tab switch leaves its running turn parked.
+            park_running_session: true,
             ..Default::default()
         },
     };

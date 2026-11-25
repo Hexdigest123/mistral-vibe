@@ -10,7 +10,7 @@ use crate::server::{
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use super::{dispatch, drops_queue, is_side_channel, parse, runs, waits_for_jobs};
+use super::{deferred, dispatch, drops_queue, is_deferred, parse, runs, waits_for_jobs};
 use crate::app::{App, QueuedPrompt, Severity, Status};
 use crate::input_modes::{classify_submitted, submitted_value, ClassifiedInput};
 use crate::startup::banners;
@@ -150,12 +150,11 @@ pub fn submit(
                 app.pending_commands.push(value);
                 return false;
             }
-            // Fork feature (AGENTS.md "Fork features"): `/tab` queues its switch
-            // while busy instead of being rejected, so it always dispatches.
-            if !is_side_channel(command)
-                && command != "/tab"
-                && reject_while_shell_runs(app, &value)
-            {
+            // Fork feature (AGENTS.md "Fork features"): a command that rewrites the
+            // history waits for idle; every other one runs at once (ADR 0012 amendment).
+            if deferred::must_wait(app, command) {
+                clear_and_remember(app, &value);
+                deferred::schedule(app, command, &value);
                 return false;
             }
             if let Some(hint) = command_hint(app, command) {
@@ -228,7 +227,7 @@ pub fn submit(
 }
 
 /// A `!` shell command is waiting for the session or still running.
-fn shell_in_flight(app: &App) -> bool {
+pub(super) fn shell_in_flight(app: &App) -> bool {
     app.session.shell_operation_id.is_some() || app.session.pending_shell.is_some()
 }
 
@@ -261,11 +260,8 @@ fn reject_input(app: &mut App, value: &str, message: String) {
 
 /// Why this slash command cannot run now.
 fn command_hint(app: &App, command: &str) -> Option<&'static str> {
-    // Fork feature (AGENTS.md "Fork features"): `/tab` runs while busy and queues.
-    if command == "/tab" {
-        return None;
-    }
-    if !is_side_channel(command) {
+    // Fork feature (AGENTS.md "Fork features"): only history rewrites wait for idle.
+    if is_deferred(command) {
         return idle_hint(app, drops_queue(command));
     }
     let job_running = app.compacting || app.agents.installing;
@@ -277,7 +273,12 @@ pub(crate) fn rewind_hint(app: &App) -> Option<&'static str> {
     idle_hint(app, true)
 }
 
-/// Whether a typed non-side-channel command such as `/model` would run at once: `submit`'s gates, without deferring or rejecting.
+/// Whether an immediate command such as `/model` would run now (fork feature: busy or not): the session is attached.
+pub(crate) fn accepts_command(app: &App) -> bool {
+    !matches!(app.session.status, Status::Starting | Status::Failed)
+}
+
+/// Whether the session is idle: nothing a switch to another session would abandon. `submit`'s gates, without deferring or rejecting.
 pub(crate) fn accepts_idle_command(app: &App) -> bool {
     !matches!(app.session.status, Status::Starting | Status::Failed)
         && !shell_in_flight(app)
@@ -285,7 +286,7 @@ pub(crate) fn accepts_idle_command(app: &App) -> bool {
 }
 
 /// Why a non-side-channel command cannot run now; a paused queue holds back only those that drop it.
-fn idle_hint(app: &App, drops_queue: bool) -> Option<&'static str> {
+pub(super) fn idle_hint(app: &App, drops_queue: bool) -> Option<&'static str> {
     if app.queue.paused && !drops_queue && !working(app) {
         return None;
     }
@@ -304,7 +305,7 @@ fn reject_hint(app: &App) -> Option<&'static str> {
 }
 
 /// A turn, a compaction or an agent install is running.
-fn working(app: &App) -> bool {
+pub(super) fn working(app: &App) -> bool {
     matches!(app.session.status, Status::Generating { .. })
         || app.compacting
         || app.agents.installing
@@ -332,6 +333,8 @@ fn remember(app: &mut App, value: &str) {
 /// drop the loading spinner, and mount the local interrupt marker. A turn the
 /// server has not started yet has no id: interrupt it once it starts.
 pub fn interrupt_turn(app: &mut App, client: &Arc<Client>) {
+    // Fork feature (AGENTS.md "Fork features"): Esc also cancels the command waiting for the turn.
+    deferred::cancel(app);
     let unstarted = app.session.active_turn_id.is_none();
     app.set_status(Status::Ready);
     if unstarted && crate::message_queue::interrupt_pending(app) {

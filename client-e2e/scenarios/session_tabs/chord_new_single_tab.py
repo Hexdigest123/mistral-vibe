@@ -2,26 +2,23 @@
 
 from __future__ import annotations
 
-import json
-
-from e2e.app_server.config import FIXTURE_PATH
-from e2e.app_server.events import cleared_state
+from e2e.app_server.events import turn_completed, turn_started
 from e2e.app_server.scenario import Timeline, take_snapshot
-
-_fixture = json.loads(FIXTURE_PATH.read_text())
-_START = _fixture["handshake"]["session/start"]
-_NEW_TAB = {"lastEventId": 0, "state": cleared_state()}
+from scenarios.session_tabs._tabs import CTRL_X, FIRST_ID, SECOND_ID, START, answer, exchange
 
 # Startup start, then the Ctrl+X n start.
-handshake = {"session/start": [_START, _NEW_TAB]}
+handshake = {"session/start": [START, answer(SECOND_ID)]}
 request_methods = {"session/start"}
 screen_contains = ("1 00000001", "2 00000003", "Ctrl+X tabs")
 screen_excludes = ("Opening session",)
 
-_CTRL_X = "\x18"
-
 timeline: Timeline = [
-    _CTRL_X,
+    # The first tab is used: a tab nothing was run in would be dropped for the new one.
+    "hi\r",
+    turn_started(),
+    *exchange(FIRST_ID, "hi", "Hello."),
+    turn_completed(),
+    CTRL_X,
     take_snapshot("chord_armed"),
     "n",
     take_snapshot("second_tab_opened"),

@@ -16,7 +16,7 @@ use crate::utils::paths::{collapse_home, user_home};
 pub const NO_PREVIOUS: &str = "No previous directory.";
 pub const CANCELLED: &str = "Directory change cancelled.";
 pub const NO_SESSION: &str = "No session to move yet.";
-const BUSY: &str = "Slash commands cannot be queued — wait for the current job to finish.";
+const BUSY: &str = "The session can't move while a turn runs — try /cd again once it ends.";
 
 /// A `session/relocate` answer for the session and folder it asked for.
 pub struct Event {

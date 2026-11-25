@@ -103,7 +103,7 @@ async fn shell_commands_still_wait_for_a_paused_queue() {
 }
 
 #[tokio::test]
-async fn a_running_turn_still_holds_back_idle_commands() {
+async fn a_running_turn_schedules_history_commands_for_when_it_ends() {
     let (mut app, client, _frames) = paused_session();
     app.session.status = Status::Generating {
         since: vibe_rs::clock::now(),
@@ -111,10 +111,11 @@ async fn a_running_turn_still_holds_back_idle_commands() {
 
     submit(&mut app, &client, "/retry");
 
-    assert_eq!(app.chat_input.full_text(), "/retry");
+    assert!(app.chat_input.full_text().is_empty());
+    assert_eq!(app.deferred_command.as_deref(), Some("/retry"));
     assert_eq!(
         notice_text(&app),
-        Some("Slash commands cannot be queued — wait for the current job to finish.")
+        Some("/retry will run when the current turn finishes")
     );
 }
 

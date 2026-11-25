@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+pub use crate::config_sections::{section_label, section_rank, SECTION_ORDER};
+
 #[derive(Clone)]
 pub struct ConfigField {
     pub name: String,
@@ -27,6 +29,20 @@ pub struct ConfigField {
 }
 
 impl ConfigField {
+    /// The readable name shown instead of the raw key (`name` stays the key).
+    pub fn label(&self) -> String {
+        crate::config_label::humanize(&self.name)
+    }
+
+    /// The text a search ranks: the raw key when it matches, else the label.
+    pub fn searched(&self, query: &crate::utils::fzf::Query) -> String {
+        if query.score(&self.name).is_some() {
+            self.name.clone()
+        } else {
+            self.label()
+        }
+    }
+
     /// The effective value as shown to the user, preferring its human label.
     pub fn display_value(&self) -> String {
         self.labeled(&self.raw_value)
@@ -131,53 +147,6 @@ fn resolve_category(category: &str, popular: bool) -> String {
         }
     } else {
         category.to_owned()
-    }
-}
-
-/// The settings-screen sections in display order. The client owns the labels
-/// and this order; a newer server's unknown key sorts after the known ones,
-/// ahead of "advanced" (ADR 0014).
-pub const SECTION_ORDER: &[&str] = &[
-    "popular",
-    "fork",
-    "models",
-    "voice",
-    "tts",
-    "tools",
-    "agents",
-    "appearance",
-    "safety",
-    "worktrees",
-];
-
-/// Where a section sits in the list: known keys by `SECTION_ORDER`, unknown
-/// keys after them, "advanced" last.
-pub fn section_rank(category: &str) -> usize {
-    if category == "advanced" {
-        usize::MAX
-    } else {
-        SECTION_ORDER
-            .iter()
-            .position(|key| *key == category)
-            .unwrap_or(SECTION_ORDER.len())
-    }
-}
-
-/// The heading drawn over a section.
-pub fn section_label(category: &str) -> String {
-    match category {
-        "popular" => "Popular settings".to_owned(),
-        "fork" => "Fork features".to_owned(),
-        "models" => "Models".to_owned(),
-        "voice" => "Voice".to_owned(),
-        "tts" => "TTS".to_owned(),
-        "tools" => "Tools".to_owned(),
-        "agents" => "Agents".to_owned(),
-        "appearance" => "Appearance".to_owned(),
-        "safety" => "Safety".to_owned(),
-        "worktrees" => "Worktrees".to_owned(),
-        "advanced" => "Advanced settings".to_owned(),
-        other => other.to_owned(),
     }
 }
 

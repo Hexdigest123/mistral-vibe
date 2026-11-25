@@ -110,6 +110,20 @@ class OpenSessions:
         self._watchers.add(watcher)
         watcher.add_done_callback(self._watchers.discard)
 
+    async def stop(self, session_id: str) -> None:
+        """Stop a parked session now, though its turn work goes on: the
+        connection that parked it is closing. A stop that fails keeps it
+        parked, so the process exit tries again.
+        """
+        parked = self._parked.pop(session_id, None)
+        if parked is None:
+            await self.wait_stopped(session_id)
+            return
+        self._busy(session_id)
+        if not await _stop(session_id, parked):
+            self._parked[session_id] = parked
+        self.attached(session_id)
+
     def take_parked(self, session_id: str) -> ParkedSession | None:
         """Take the session for an attach: a resume meanwhile waits until
         ``attached`` or ``park`` settles it.

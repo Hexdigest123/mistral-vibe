@@ -64,6 +64,41 @@ def test_field_categories_are_valid_fields_and_known_sections() -> None:
     assert set(FIELD_CATEGORIES.values()) <= known
 
 
+def test_only_bookkeeping_fields_land_in_advanced(
+    make_config: Callable[..., VibeConfigSchema],
+) -> None:
+    wires = build_field_wires(make_config(), {}, popular=POPULAR_SETTINGS)
+    advanced = {wire.name for wire in wires if wire.category == "advanced"}
+    assert advanced == {"applied_migrations"}
+
+
+def test_topic_sections_split_finely() -> None:
+    expected = {
+        "max_concurrent_subagents": "subagents",
+        "default_approval_policy": "approvals",
+        "enabled_skills": "skills",
+        "disabled_plugins": "plugins",
+        "enabled_agents": "agents",
+        "enable_mcp": "mcp",
+        "experimental_enable_document_library_connector": "mcp",
+        "enabled_tools": "tools",
+        "outside_workdir": "safety",
+        "enable_otel": "telemetry",
+        "log_level": "telemetry",
+        "vim_keybindings": "input",
+        "cursor_blink": "appearance",
+        "compaction_model": "utility_models",
+        "agent_max_output_tokens": "limits",
+        "system_prompt_id": "prompts",
+        "api_timeout": "network",
+        "enable_update_checks": "system",
+        "experimental_target_runtime": "experimental",
+        "enable_pr_monitoring": "worktrees",
+    }
+    for name, section in expected.items():
+        assert field_category(name, POPULAR_SETTINGS) == section, name
+
+
 def test_field_category_prefers_fork_then_popular_then_topic() -> None:
     assert field_category("disable_all_telemetry", POPULAR_SETTINGS) == "fork"
     assert field_category("theme", POPULAR_SETTINGS) == "popular"
@@ -71,7 +106,8 @@ def test_field_category_prefers_fork_then_popular_then_topic() -> None:
     assert field_category("transcribe_models", POPULAR_SETTINGS) == "voice"
     assert field_category("active_tts_model", POPULAR_SETTINGS) == "tts"
     assert field_category("tts_providers", POPULAR_SETTINGS) == "tts"
-    assert field_category("api_timeout", POPULAR_SETTINGS) == "advanced"
+    assert field_category("applied_migrations", POPULAR_SETTINGS) == "advanced"
+    assert field_category("a_future_field", POPULAR_SETTINGS) == "advanced"
 
 
 @pytest.mark.parametrize(
@@ -143,7 +179,8 @@ def test_build_field_wires_sets_section_categories(
     assert by_name["active_transcribe_model"].category == "voice"
     assert by_name["active_tts_model"].category == "tts"
     assert by_name["tts_models"].category == "tts"
-    assert by_name["api_timeout"].category == "advanced"
+    assert by_name["api_timeout"].category == "network"
+    assert by_name["max_concurrent_subagents"].category == "subagents"
 
 
 def test_tracing_settings_are_public_and_described(

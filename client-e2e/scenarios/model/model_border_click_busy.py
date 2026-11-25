@@ -1,4 +1,4 @@
-"""While a turn runs the input box's model is not a link: hovering and clicking it leave /model closed."""
+"""While a turn runs the input box's model stays a link: a click on it opens /model."""
 
 from __future__ import annotations
 
@@ -20,5 +20,4 @@ timeline: Timeline = [
     _CLICK,
 ]
 
-screen_contains = ("Working on it.",)
-screen_excludes = ("Select Model",)
+screen_contains = ("Working on it.", "Select Model")

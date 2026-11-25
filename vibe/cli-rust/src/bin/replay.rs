@@ -589,7 +589,10 @@ fn main() {
                 "approvalPolicies",
                 "activeApprovalPolicy",
             ),
-            SESSION_RESUME => resume_response(&handshake, msg.get("params")),
+            // A scenario can pin one resume answer per session (`session/resume#<id>`).
+            SESSION_RESUME => session_scoped_response(&handshake, method, msg.get("params"))
+                .cloned()
+                .or_else(|| resume_response(&handshake, msg.get("params"))),
             // Session-scoped pins win, then the shared (list-consuming) canned answers.
             _ => {
                 let scoped =

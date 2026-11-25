@@ -1208,6 +1208,23 @@ lease is free. A resume that attaches it applies only its `historyLimit` and
 (`capabilities.clientTools`, `agentPlugins`, `clientToolDefinitions`) than the
 one that started it.
 
+A client that sends `initialize.capabilities.parkRunningSession: true` (and
+declares no `agentPlugins` or `clientToolDefinitions`) gets the same for a
+session it leaves open: `session/start`, `session/resume` and `session/continue`
+on a connection whose session has turn work (a running turn, a pending callback
+or queued turns) answer with the new session at once, and the old one keeps
+running, parked. An idle session is stopped as before; a failed switch leaves
+the connection on its session. `session/list` and `session/read` report the
+parked session's live status (`running`, `blocked`, then `idle` once its turn
+work ended and it stopped), and a `session/resume` of it, on this connection or
+another channel of the process, attaches it as above: `turn/started` again, its
+open callbacks re-sent, and, on a connection that holds a session with turn
+work, that session parked in its place. Callbacks and client requests of a
+parked session wait for that attach. A connection that does not opt in keeps
+`conflict` for a resume of a parked session while it has a session. A server
+that is not multiplexed stops the sessions its connection parked when the
+connection closes. See ADR 0022.
+
 A client that sends `initialize.capabilities.resumeLeftTurns: true` with an
 `account` has the server carry on, by itself, the turns that owner (its
 entrypoint and account) left mid-flight in an earlier process: once per owner

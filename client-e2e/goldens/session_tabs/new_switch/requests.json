@@ -10,6 +10,33 @@
   }
  },
  {
+  "method": "session/turn/enqueue",
+  "params": {
+   "entries": [
+    {
+     "annotations": {},
+     "content": [
+      {
+       "text": "hi",
+       "type": "text"
+      }
+     ],
+     "entryId": "<client-message-id>",
+     "role": "user"
+    }
+   ],
+   "idempotencyKey": "<client-message-id>",
+   "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ },
+ {
+  "method": "feedback/shouldShow",
+  "params": {
+   "pendingUserMessages": 1,
+   "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ },
+ {
   "method": "session/start",
   "params": {
    "agentConfig": {
@@ -17,6 +44,33 @@
     "terminalKey": "e2e-terminal"
    },
    "historyLimit": 200
+  }
+ },
+ {
+  "method": "session/turn/enqueue",
+  "params": {
+   "entries": [
+    {
+     "annotations": {},
+     "content": [
+      {
+       "text": "hi",
+       "type": "text"
+      }
+     ],
+     "entryId": "<client-message-id>",
+     "role": "user"
+    }
+   ],
+   "idempotencyKey": "<client-message-id>",
+   "sessionId": "00000000-0000-4000-8000-000000000003"
+  }
+ },
+ {
+  "method": "feedback/shouldShow",
+  "params": {
+   "pendingUserMessages": 1,
+   "sessionId": "00000000-0000-4000-8000-000000000003"
   }
  },
  {
@@ -28,6 +82,17 @@
    },
    "historyLimit": 200,
    "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ },
+ {
+  "method": "session/resume",
+  "params": {
+   "agentConfig": {
+    "cwd": "<cwd>",
+    "terminalKey": "e2e-terminal"
+   },
+   "historyLimit": 200,
+   "sessionId": "00000000-0000-4000-8000-000000000003"
   }
  }
 ]

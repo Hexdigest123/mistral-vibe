@@ -38,6 +38,8 @@ ui_events! {
     Thinking(thinking_picker::Event),
     Agents(agents::Event),
     Sessions(sessions_page::Event),
+    // Fork feature (AGENTS.md "Fork features"): the background tabs' poll answers here.
+    Tabs(crate::session_tabs::Event),
     Storage(storage_panel::Event),
     Rewind(rewind::Event),
     Mcp(mcp::Event),
@@ -86,6 +88,7 @@ pub fn apply(app: &mut App, client: &Arc<Client>, event: UiEvent) {
         UiEvent::Feedback(event) => feedback::apply_event(app, event),
         UiEvent::Narrator(event) => turn_summary::apply_event(app, event),
         UiEvent::Sessions(event) => sessions_page::apply_event(app, client, event),
+        UiEvent::Tabs(event) => crate::session_tabs::apply_event(app, event),
         UiEvent::Storage(event) => storage_panel::apply_event(app, client, event),
         UiEvent::Queue(event) => {
             if let Some(session) = message_queue::apply_event(app, client, event) {

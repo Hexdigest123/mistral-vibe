@@ -73,18 +73,19 @@ pub fn apply_loaded(app: &mut App, mut loaded: Loaded) {
 /// Above this many matches the list keeps its sections.
 pub const MERGED_MATCHES: usize = 5;
 
-/// Fields for the search (fork feature, AGENTS.md): fzf on names first, then
+/// Fields for the search (fork feature, AGENTS.md): fzf on the raw key (else the label), then
 /// descriptions holding every term; section order wins ties. A sectioned list
 /// (`ui::config_options`) numbers its rows in that order, so it gets them so.
 pub fn filtered(app: &App) -> Vec<&ConfigField> {
     let mut fields: Vec<_> = app.config_screen.fields.iter().collect();
     fields.sort_by_key(|field| crate::config_fields::section_rank(&field.category));
     let query = app.config_screen.search.query.as_str();
-    let mut ranked: Vec<_> =
-        crate::utils::fzf::rank(&fields, query, |f| f.name.clone(), |f| &f.description)
-            .into_iter()
-            .map(|index| fields[index])
-            .collect();
+    let parsed = crate::utils::fzf::Query::new(query);
+    let name = |f: &&ConfigField| parsed.as_ref().map_or_else(String::new, |q| f.searched(q));
+    let mut ranked: Vec<_> = crate::utils::fzf::rank(&fields, query, name, |f| &f.description)
+        .into_iter()
+        .map(|index| fields[index])
+        .collect();
     if ranked.len() > MERGED_MATCHES {
         ranked.sort_by_key(|field| crate::config_fields::section_rank(&field.category));
     }

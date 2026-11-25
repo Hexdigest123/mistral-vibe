@@ -1,4 +1,4 @@
-"""`/cd` while a turn runs is refused and kept in the composer, like every idle-only command."""
+"""`/cd` while a turn runs is sent at once; the server's busy refusal is shown, not hidden by the client."""
 
 from __future__ import annotations
 
@@ -9,11 +9,20 @@ from scenarios.cd._dirs import CLIENT_ARGS, REQUEST_METHODS, handshake
 handshake = {
     **handshake(),
     "workspace/prompt/prepare": {"prompt": {"promptText": None}},
+    "session/relocate": {
+        "error": {
+            "code": "conflict",
+            "message": "A turn is already running: turn-1",
+            "data": {"activeTurnId": "turn-1"},
+        }
+    },
 }
 client_args = CLIENT_ARGS
 request_methods = REQUEST_METHODS
-screen_contains = ("Slash commands cannot be queued", "/ cd alpha")
-screen_excludes = ("Moved to",)
+screen_contains = (
+    "The session can't move while a turn runs — try /cd again once it ends.",
+)
+screen_excludes = ("Moved to", "cannot be queued")
 
 timeline: Timeline = [
     "long task\r",

@@ -28,6 +28,6 @@ handshake = {
     }
 }
 
-screen_contains = ("api_timeout",)
-screen_excludes = ("max_tokens", "color_depth")
+screen_contains = ("API timeout",)
+screen_excludes = ("Max tokens", "Color depth", "max_tokens", "color_depth")
 timeline: Timeline = ["/config\r", "/network", "\x7f" * 7 + "APTO"]

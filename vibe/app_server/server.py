@@ -58,7 +58,12 @@ from vibe.app_server._local_projects import LocalProjectStore
 from vibe.app_server._local_projects_controller import list_local_projects
 from vibe.app_server._model import ProtocolModel, validate_wire
 from vibe.app_server._open_sessions import OpenSessions
-from vibe.app_server._parked_sessions import attach_parked, park_running_session
+from vibe.app_server._parked_sessions import (
+    SwitchAway,
+    attach_parked,
+    begin_switch_away,
+    park_running_session,
+)
 from vibe.app_server._platform_credential_lenders import (
     AccountPlatformCredentialProvider,
     LenderAvailability,
@@ -437,7 +442,7 @@ class AppServer:
     _lending: AccountPlatformCredentialProvider | None = None
     _client_instance: str | None = None
 
-    def __init__(  # noqa: PLR0913 - one collaborator per concern, all keyword-only
+    def __init__(  # noqa: PLR0913, PLR0915 - one collaborator per concern, all keyword-only
         self,
         transport: JsonRpcTransport,
         *,
@@ -461,12 +466,21 @@ class AppServer:
         ]
         | None = None,
         open_sessions: OpenSessions | None = None,
+        background_sessions: OpenSessions | None = None,
         left_turns: LeftTurns | None = None,
         open_left_turn_channel: OpenLeftTurnChannel | None = None,
         list_on_own_channel: ListOnOwnChannel | None = None,
         left_turn_session: str | None = None,
     ) -> None:
         self._root: SessionBackend | None = None
+        # Fork feature (AGENTS.md "Fork features"), ADR 0022: where a session
+        # this connection parked while it attached another waits, and how a
+        # holder for it is made. A multiplexed server parks in its process's
+        # ``open_sessions``, also when it closes; any other keeps them in
+        # ``background_sessions`` for its own life.
+        self._background_sessions = background_sessions
+        self._spawn_holder: Callable[[], AppServer] | None = None
+        self._switch_parked: set[str] = set()
         self._setup_oidc = SetupOidcHandler(
             lambda client: self._host_handler.setup_telemetry(client)
         )
@@ -544,6 +558,10 @@ class AppServer:
             left_turn_session,
         )
         self._list_on_own_channel = list_on_own_channel
+
+    @property
+    def _parking(self) -> OpenSessions | None:
+        return self._open_sessions or self._background_sessions
 
     @property
     def session_link(self) -> SessionLink:
@@ -930,6 +948,7 @@ class AppServer:
                     await self._close_root()
                 except BaseException as exc:
                     errors.append(exc)
+            errors.extend(await self._stop_switch_parked())
             self._callback_deliveries.requests.clear()
             self._abandon_client_requests("The app server closed")
             self._abandon_platform_credential_requests("The app server closed")
@@ -954,16 +973,53 @@ class AppServer:
         return park_running_session(self, self._open_sessions)
 
     def _opening(self, session_id: str) -> AbstractAsyncContextManager[None]:
-        if self._open_sessions is None or self._left_turn_session == session_id:
+        parking = self._parking
+        if parking is None or self._left_turn_session == session_id:
             return nullcontext()
-        return self._open_sessions.opening(session_id)
+        return parking.opening(session_id)
 
     async def _attach_parked(
         self, params: SessionResumeParams
     ) -> SessionReadResponse | None:
-        if self._open_sessions is None:
+        parking = self._parking
+        if parking is None:
             return None
-        return await attach_parked(self, self._open_sessions, params)
+        return await attach_parked(self, parking, params)
+
+    @asynccontextmanager
+    async def _switching(self, target: str | None) -> AsyncIterator[SwitchAway | None]:
+        """Fork feature (AGENTS.md "Fork features"), ADR 0022: the attach this
+        wraps keeps the connection's running session running, parked, instead
+        of stopping it; a failed attach leaves it as it was.
+        """
+        parking = self._parking
+        away = (
+            None if parking is None else await begin_switch_away(self, parking, target)
+        )
+        try:
+            yield away
+        except BaseException:
+            if away is not None:
+                await away.abort()
+            raise
+        if away is not None:
+            away.park()
+
+    async def _stop_switch_parked(self) -> list[BaseException]:
+        """Sessions this connection parked end with it, unless its process
+        keeps them for other channels.
+        """
+        parking, ids = self._background_sessions, tuple(self._switch_parked)
+        self._switch_parked.clear()
+        if parking is None or self._open_sessions is not None:
+            return []
+        errors: list[BaseException] = []
+        for session_id in ids:
+            try:
+                await parking.stop(session_id)
+            except BaseException as exc:
+                errors.append(exc)
+        return errors
 
     def _subscribe_artifacts(self) -> None:
         self._stop_artifact_subscription()
@@ -1754,21 +1810,21 @@ class AppServer:
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult:
         if method == "session/start":
-            async with scratch_folder_for(
-                validate_wire(SessionStartParams, raw_params)
-            ) as params:
-                lifecycle = await self._session_backend_host.start(params)
-                try:
-                    first_turn = await self._apply_start_choices(
-                        lifecycle.backend, params
-                    )
-                except BaseException:
-                    await self._discard_started(lifecycle.backend)
-                    raise
-            self._record_session_created(lifecycle.backend)
-            response = await self._activate_lifecycle_backend(
-                method, lifecycle.backend, params.history_limit
-            )
+            start_params = validate_wire(SessionStartParams, raw_params)
+            async with self._switching(None) as away:
+                async with scratch_folder_for(start_params) as params:
+                    lifecycle = await self._session_backend_host.start(params)
+                    try:
+                        first_turn = await self._apply_start_choices(
+                            lifecycle.backend, params
+                        )
+                    except BaseException:
+                        await self._discard_started(lifecycle.backend)
+                        raise
+                self._record_session_created(lifecycle.backend)
+                response = await self._activate_switching(
+                    method, lifecycle.backend, params.history_limit, away
+                )
             return DispatchResult(
                 SessionStartResponse(
                     state=response.state, last_event_id=response.last_event_id
@@ -1788,11 +1844,14 @@ class AppServer:
             response = await self._attach_parked(params)
             attached_parked = response is not None
             if response is None:
-                async with self._opening(params.session_id):
+                async with (
+                    self._switching(params.session_id) as away,
+                    self._opening(params.session_id),
+                ):
                     lifecycle = await self._session_backend_host.resume(params)
                     after_response = lifecycle.after_response
-                    response = await self._activate_lifecycle_backend(
-                        method, lifecycle.backend, params.history_limit
+                    response = await self._activate_switching(
+                        method, lifecycle.backend, params.history_limit, away
                     )
             return DispatchResult(
                 SessionResumeResponse(
@@ -1805,10 +1864,11 @@ class AppServer:
             )
         if method == "session/continue":
             params = validate_wire(SessionContinueParams, raw_params)
-            lifecycle = await self._session_backend_host.continue_latest(params)
-            response = await self._activate_lifecycle_backend(
-                method, lifecycle.backend, params.history_limit
-            )
+            async with self._switching(None) as away:
+                lifecycle = await self._session_backend_host.continue_latest(params)
+                response = await self._activate_switching(
+                    method, lifecycle.backend, params.history_limit, away
+                )
             return DispatchResult(
                 SessionContinueResponse(
                     state=response.state, last_event_id=response.last_event_id
@@ -2493,6 +2553,19 @@ class AppServer:
             history_limit,
             announce_running_turn=method in _RUNNING_TURN_ANNOUNCEMENT_METHODS,
         )
+
+    async def _activate_switching(
+        self,
+        method: str,
+        backend: SessionBackend,
+        history_limit: int,
+        away: SwitchAway | None,
+    ) -> SessionReadResponse:
+        # The session left running is no longer this connection's root, so
+        # attaching the new one does not stop it.
+        if away is not None:
+            await away.detach()
+        return await self._activate_lifecycle_backend(method, backend, history_limit)
 
     async def _announce_running_turn(self) -> None:
         root = self._root

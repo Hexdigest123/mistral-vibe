@@ -220,13 +220,22 @@ class _Multiplex:
     async def close_channel(self, channel: str) -> None:
         await self._transport.send({"channelId": channel, "message": None})
 
+    def mark(self, channel: str) -> int:
+        """What ``wait_for`` skips with ``after``: the frames received so far."""
+        return len(self.received.get(channel, []))
+
     async def wait_for(
-        self, channel: str, what: str, predicate: Callable[[Frame], bool]
+        self,
+        channel: str,
+        what: str,
+        predicate: Callable[[Frame], bool],
+        *,
+        after: int = 0,
     ) -> Frame:
         async def find() -> Frame:
             async with self._arrived:
                 while True:
-                    for message in self.received.get(channel, []):
+                    for message in self.received.get(channel, [])[after:]:
                         if predicate(message):
                             return message
                     await self._arrived.wait()
@@ -236,11 +245,14 @@ class _Multiplex:
         except TimeoutError:
             raise AssertionError(f"No {what} on channel {channel}") from None
 
-    async def wait_for_method(self, channel: str, method: str) -> dict[str, Any]:
+    async def wait_for_method(
+        self, channel: str, method: str, *, after: int = 0
+    ) -> dict[str, Any]:
         message = await self.wait_for(
             channel,
             method,
             lambda frame: frame is not None and frame.get("method") == method,
+            after=after,
         )
         assert message is not None
         return message
@@ -1016,3 +1028,314 @@ async def test_a_lease_watch_keeps_reporting_after_its_channel_attaches(
             and frame["params"]["sessionId"] == other_id
         ),
     )
+
+
+# A connection that attaches another session while its own has turn work
+# parks it, and a later resume of it attaches it live again (ADR 0022).
+
+_PARK = {"parkRunningSession": True}
+
+
+class _AsChannel:
+    """The peer of a plain, not multiplexed, app server, shown to ``_Multiplex``
+    as its channel "1".
+    """
+
+    def __init__(self, inner: JsonRpcTransport) -> None:
+        self._inner = inner
+
+    async def messages(self) -> AsyncIterator[dict[str, Any]]:
+        async for message in self._inner.messages():
+            yield {"channelId": "1", "message": message}
+
+    async def send(self, frame: dict[str, Any]) -> None:
+        await self._inner.send(frame["message"])
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+class _Plain:
+    def __init__(self, client: _Multiplex, serving: asyncio.Task[None]) -> None:
+        self.client = client
+        self.serving = serving
+
+    async def open(self, *, park: bool = True) -> _Multiplex:
+        await self.client.initialize("1", client_tools=_PARK if park else None)
+        return self.client
+
+    async def shut_down(self) -> None:
+        await self.client.aclose()
+        await asyncio.wait_for(self.serving, 10)
+
+
+@pytest_asyncio.fixture
+async def plain(
+    persistent_sessions: None, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[_Plain]:
+    pytest.importorskip("mistralai_vibe_local_harness.vibe")
+    peer, transport = memory_transport_pair()
+    monkeypatch.setattr(
+        StdioJsonRpcTransport, "from_standard_streams", lambda: transport
+    )
+    serving = asyncio.create_task(serve_stdio())
+    client = _Multiplex(cast(Any, _AsChannel(peer)))
+    server = _Plain(client, serving)
+    try:
+        yield server
+    finally:
+        await server.shut_down()
+
+
+def _by_tool_result(request: httpx.Request) -> httpx.Response:
+    messages = json.loads(request.content)["messages"]
+    if any(message.get("role") == "tool" for message in messages):
+        return _sse("Shipped")
+    return _sse("", [_QUESTION_CALL])
+
+
+@pytest.fixture
+def each_asks_once(model: respx.Route) -> respx.Route:
+    model.mock(side_effect=_by_tool_result)
+    return model
+
+
+@pytest.fixture
+def gated_model(respx_mock: respx.MockRouter, model: respx.Route) -> asyncio.Event:
+    gate = asyncio.Event()
+
+    async def answer(request: httpx.Request) -> httpx.Response:
+        await gate.wait()
+        return _sse("Shipped")
+
+    model.mock(side_effect=answer)
+    return gate
+
+
+async def _ask(client: _Multiplex, channel: str) -> tuple[str, dict[str, Any]]:
+    """A session whose turn waits on a question, and that question."""
+    mark = client.mark(channel)
+    started = await client.request(
+        channel,
+        "session/start",
+        {"agentConfig": {"enabledTools": ["ask_user_question"]}},
+    )
+    session_id = started["state"]["session"]["id"]
+    await client.request(
+        channel,
+        "turn/start",
+        {"sessionId": session_id, "message": [{"type": "text", "text": "ask me"}]},
+    )
+    return session_id, await _question(client, channel, session_id, mark)
+
+
+async def _question(
+    client: _Multiplex, channel: str, session_id: str, mark: int
+) -> dict[str, Any]:
+    call = await client.wait_for(
+        channel,
+        f"question of {session_id}",
+        lambda frame: (
+            frame is not None
+            and frame.get("method") == "callback/call"
+            and frame["params"]["callback"]["sessionId"] == session_id
+        ),
+        after=mark,
+    )
+    assert call is not None
+    return call
+
+
+async def _statuses(client: _Multiplex, channel: str) -> dict[str, str]:
+    listed = await client.request(channel, "session/list", {})
+    return {item["id"]: item["status"]["type"] for item in listed["items"]}
+
+
+async def _resume_and_answer(client: _Multiplex, channel: str, session_id: str) -> None:
+    mark = client.mark(channel)
+    resumed = await client.request(channel, "session/resume", {"sessionId": session_id})
+    assert resumed["state"]["turns"][-1]["status"] == "in_progress"
+    await client.wait_for_method(channel, "turn/started", after=mark)
+    call = await _question(client, channel, session_id, mark)
+    await _answer_yes(client, channel, session_id, call)
+    await client.wait_for_method(channel, "turn/completed", after=mark)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("each_asks_once")
+async def test_switching_away_keeps_a_running_turn_running_and_a_resume_attaches_it(
+    plain: _Plain, tmp_path: Path
+) -> None:
+    client = await plain.open()
+    # Prepare: session A waits on a question.
+    first, _ = await _ask(client, "1")
+
+    # Do: the connection starts another session.
+    started = await client.request("1", "session/start", {"agentConfig": {}})
+    second = started["state"]["session"]["id"]
+
+    # Assert: A still runs, parked: its lease is held and the list says so.
+    assert second != first
+    assert _held(_lease(tmp_path, first))
+    assert (await _statuses(client, "1"))[first] in {"running", "blocked"}
+
+    # Do/Assert: resuming A attaches it live, announces its turn again, resends
+    # its open question, and the idle session left behind is stopped.
+    await _resume_and_answer(client, "1", first)
+    await _released(_lease(tmp_path, second))
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("each_asks_once")
+async def test_two_running_sessions_swap_both_ways(plain: _Plain) -> None:
+    client = await plain.open()
+    # Prepare: A waits on a question; the connection switches to B, which waits too.
+    first, _ = await _ask(client, "1")
+    second, _ = await _ask(client, "1")
+    assert (await _statuses(client, "1"))[first] in {"running", "blocked"}
+
+    # Do/Assert: back to A, which finishes; B runs on, parked, then finishes.
+    await _resume_and_answer(client, "1", first)
+    assert (await _statuses(client, "1"))[second] in {"running", "blocked"}
+    await _resume_and_answer(client, "1", second)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("model")
+async def test_an_idle_session_is_still_stopped_when_the_connection_attaches_another(
+    plain: _Plain, tmp_path: Path
+) -> None:
+    client = await plain.open()
+    # Prepare: a session with no turn.
+    started = await client.request("1", "session/start", {"agentConfig": {}})
+    idle = started["state"]["session"]["id"]
+
+    # Do
+    await client.request("1", "session/start", {"agentConfig": {}})
+
+    # Assert: its lease is released, as before.
+    await _released(_lease(tmp_path, idle))
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("each_asks_once")
+async def test_a_failed_switch_leaves_the_running_session_attached(
+    plain: _Plain,
+) -> None:
+    client = await plain.open()
+    # Prepare: A waits on a question.
+    first, call = await _ask(client, "1")
+
+    # Do: the switch to a session that does not exist fails.
+    failed = await client.call("1", "session/resume", {"sessionId": "nope"})
+
+    # Assert: A is still this connection's session and its turn goes on.
+    assert "error" in failed
+    assert (await _statuses(client, "1"))[first] in {"running", "blocked"}
+    await _answer_yes(client, "1", first, call)
+    await client.wait_for_method("1", "turn/completed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("gated_model")
+async def test_a_parked_turn_finishes_in_the_background_and_its_status_follows(
+    plain: _Plain, gated_model: asyncio.Event, tmp_path: Path
+) -> None:
+    client = await plain.open()
+    # Prepare: A's turn waits for the model; the connection switches away.
+    started = await client.request("1", "session/start", {"agentConfig": {}})
+    first = started["state"]["session"]["id"]
+    await client.request(
+        "1",
+        "turn/start",
+        {"sessionId": first, "message": [{"type": "text", "text": "go"}]},
+    )
+    await client.request("1", "session/start", {"agentConfig": {}})
+    assert (await _statuses(client, "1"))[first] == "running"
+
+    # Do: the model answers.
+    gated_model.set()
+
+    # Assert: polling the list shows the session idle, and it was stopped.
+    for _ in range(100):
+        if (await _statuses(client, "1"))[first] == "idle":
+            break
+        await asyncio.sleep(0.1)
+    assert (await _statuses(client, "1"))[first] == "idle"
+    await _released(_lease(tmp_path, first))
+    read = await client.request("1", "session/read", {"sessionId": first})
+    assert read["state"]["turns"][-1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("each_asks_once")
+async def test_closing_the_connection_stops_the_sessions_it_parked(
+    plain: _Plain, tmp_path: Path
+) -> None:
+    client = await plain.open()
+    # Prepare: A waits on a question, parked while B (idle) is attached.
+    first, _ = await _ask(client, "1")
+    started = await client.request("1", "session/start", {"agentConfig": {}})
+    second = started["state"]["session"]["id"]
+    assert _held(_lease(tmp_path, first))
+
+    # Do
+    await plain.shut_down()
+
+    # Assert: the process is done with both sessions.
+    assert not _held(_lease(tmp_path, first))
+    assert not _held(_lease(tmp_path, second))
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("each_asks_once")
+async def test_other_connections_see_a_session_busy_until_its_connection_switches_away(
+    multiplex: _Multiplex,
+) -> None:
+    # Prepare: channel 1 runs A.
+    await multiplex.initialize("1", client_tools=_PARK)
+    first, _ = await _ask(multiplex, "1")
+    await multiplex.initialize("2")
+
+    # Do/Assert: channel 2 cannot take it while channel 1 holds it.
+    busy = await multiplex.call("2", "session/resume", {"sessionId": first})
+    assert busy["error"]["code"] == "conflict"
+
+    # Do: channel 1 switches to B, parking A for any channel.
+    started = await multiplex.request("1", "session/start", {"agentConfig": {}})
+    second = started["state"]["session"]["id"]
+
+    # Assert: channel 2 attaches the running A; channel 1 keeps B.
+    await _resume_and_answer(multiplex, "2", first)
+    read = await multiplex.request("1", "session/read", {"sessionId": second})
+    assert read["state"]["session"]["id"] == second
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.usefixtures("each_asks_once")
+async def test_a_turn_attached_again_can_be_interrupted(plain: _Plain) -> None:
+    client = await plain.open()
+    # Prepare: A waits on a question, parked, then attached again.
+    first, _ = await _ask(client, "1")
+    await client.request("1", "session/start", {"agentConfig": {}})
+    mark = client.mark("1")
+    resumed = await client.request("1", "session/resume", {"sessionId": first})
+    turn_id = resumed["state"]["session"]["status"]["activeTurnId"]
+    await client.wait_for_method("1", "turn/started", after=mark)
+
+    # Do
+    await client.request(
+        "1", "turn/interrupt", {"sessionId": first, "expectedTurnId": turn_id}
+    )
+
+    # Assert
+    await client.wait_for_method("1", "turn/completed", after=mark)
+    assert (await _statuses(client, "1"))[first] == "idle"

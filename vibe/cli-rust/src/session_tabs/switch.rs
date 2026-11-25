@@ -10,7 +10,44 @@ use crate::server::{AgentConfig, Client};
 use crate::sessions_page::{requests, Switching};
 use crate::ui::loading::OPENING_SESSION_STATUS;
 
-use super::{switching, TabSnapshot, BUSY};
+use super::{actions, switching, Activity, TabSnapshot};
+
+/// Say the empty tab at `index` was dropped: the server drops a session nothing was run in.
+pub(super) fn say_empty(app: &mut App, index: usize) {
+    let text = format!(
+        "Closed the empty tab {}: nothing was written in it.",
+        index + 1
+    );
+    crate::ui::notice::show(app, Severity::Information, &text, 4);
+}
+
+/// Save the active tab's view from the page's in-flight switch record; true
+/// when that session was empty, so the server drops it.
+pub(super) fn save_current_from_switching(app: &mut App) -> bool {
+    let from = app.session_tabs.active;
+    let Some(switching) = &app.sessions_page.switching else {
+        return false;
+    };
+    let empty = !switching.previous.has_server_entries();
+    let snapshot = TabSnapshot {
+        transcript: switching.previous.clone(),
+        scroll: switching.scroll,
+        draft: app.chat_input.input.clone(),
+        cursor: app.chat_input.cursor,
+    };
+    if let Some(tab) = app.session_tabs.list.get_mut(from) {
+        tab.snapshot = Some(snapshot);
+    }
+    empty
+}
+
+/// Remove the tab at `index` when its session was empty: the server dropped it with the switch.
+pub(super) fn drop_empty(app: &mut App, index: usize, empty: bool) {
+    if empty && index < app.session_tabs.list.len() && app.session_tabs.list.len() > 1 {
+        actions::remove_tab(app, index);
+        say_empty(app, index);
+    }
+}
 
 /// The agent config a new tab's session opens with: the current one, minus a
 /// pinned worktree (a tab is not a worktree run).
@@ -20,8 +57,15 @@ fn config_for_new(app: &App) -> AgentConfig {
     config
 }
 
-/// Switch to tab `to`: save the active tab, show the target's saved view, and
-/// send the resume/start request. The answer lands in `super::on_session_id`.
+/// Whether the attached session has turn work the server parks when it is left.
+fn running(app: &App) -> bool {
+    matches!(app.session.status, crate::app::Status::Generating { .. })
+        || (!app.queue.paused && !app.queue.is_empty())
+}
+
+/// Switch to tab `to`, even while a turn runs: save the active tab, show the
+/// target's saved view, and send the resume/start request. The answer lands in
+/// `super::on_session_id`.
 pub(super) fn start(app: &mut App, client: &Arc<Client>, to: usize) {
     if !app.session_tabs.enabled
         || to >= app.session_tabs.list.len()
@@ -31,11 +75,19 @@ pub(super) fn start(app: &mut App, client: &Arc<Client>, to: usize) {
     {
         return;
     }
-    if !crate::sessions_page::idle(app) {
-        crate::notices::inline(app, Severity::Warning, BUSY);
-        return;
-    }
     let from = app.session_tabs.active;
+    // The server parks a running turn, and drops a session nothing was ever run in.
+    let running = running(app);
+    let empty = !running && !app.view.transcript.has_server_entries();
+    app.session_tabs.list[from].activity = if running {
+        Activity::Running
+    } else {
+        Activity::Idle
+    };
+    if empty && app.session_tabs.pending_close.is_none() {
+        app.session_tabs.pending_close = Some(from);
+        app.session_tabs.pending_empty = true;
+    }
     let snapshot = TabSnapshot {
         transcript: app.view.transcript.snapshot(),
         scroll: (app.view.scroll, app.view.scroll_target),

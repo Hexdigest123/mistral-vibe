@@ -25,6 +25,8 @@ pub mod config;
 pub mod config_command;
 pub mod config_edit;
 pub mod config_fields;
+pub mod config_label;
+pub mod config_sections;
 pub mod config_write;
 pub mod connector_auth;
 pub mod context_app;

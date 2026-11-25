@@ -109,6 +109,8 @@ mod composer_yank;
 mod config_dangerous;
 #[path = "units/config_filter.rs"]
 mod config_filter;
+#[path = "units/config_labels.rs"]
+mod config_labels;
 #[path = "units/config_sections.rs"]
 mod config_sections;
 #[path = "units/config_selection.rs"]

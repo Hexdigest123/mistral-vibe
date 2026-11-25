@@ -605,6 +605,11 @@ fn is_foreign_session_notification(app: &App, event: &Notification) -> bool {
     let Some(session_id) = event.params["sessionId"].as_str() else {
         return false;
     };
+    // Fork feature (AGENTS.md "Fork features"): the session a tab switch leaves is parked
+    // server-side, and its late events must not touch the view of the tab switched to.
+    if crate::session_tabs::switching(app) {
+        return true;
+    }
     app.session
         .session_id
         .as_deref()

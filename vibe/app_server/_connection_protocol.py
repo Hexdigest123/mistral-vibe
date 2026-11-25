@@ -134,6 +134,11 @@ class ClientCapabilities(ProtocolModel):
     # The server carries on, by itself, the turns this connection's owner
     # (``initialize.account``) left mid-flight in an earlier process.
     resume_left_turns: bool = False
+    # Fork feature (AGENTS.md "Fork features"): session tabs. Attaching another
+    # session (`session/start`, `session/resume`, `session/continue`) while the
+    # attached one has turn work parks it, still running, instead of stopping
+    # it (ADR 0022). A later `session/resume` of it attaches it live again.
+    park_running_session: bool = False
 
 
 class ClientAccount(ProtocolModel):

@@ -50,6 +50,17 @@ class SessionLeaseSubscription:
             on_response_abandoned=lambda: _settle(written, False),
         )
 
+    async def follow(self, host: SessionBackendHostLeaseWatch) -> None:
+        """Watch ``host`` instead, when the connection is subscribed: its
+        runtime moved to another Host, which a parked session keeps. The
+        client has its holders already, so only later changes are sent.
+        """
+        if self._task is None:
+            return
+        result = await self.subscribe(host)
+        if result.after_response is not None:
+            result.after_response()
+
     def take(self) -> list[asyncio.Task[None]]:
         task = self._task
         self._task = None

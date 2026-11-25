@@ -926,6 +926,8 @@ pub struct App {
     /// Slash commands submitted while the session is still starting, replayed
     /// once `apply_ready` settles.
     pub pending_commands: Vec<String>,
+    /// Fork feature (AGENTS.md "Fork features"): the history-rewriting slash command waiting for the session to go idle.
+    pub deferred_command: Option<String>,
     /// Ctrl+Z requested suspend; the event loop performs the SIGTSTP cycle.
     pub suspend_requested: bool,
     /// Ctrl+G requested the external editor; the event loop hands it the terminal.
@@ -959,6 +961,8 @@ impl App {
     pub fn set_session_id(&mut self, session_id: String) {
         if self.session.session_id.as_deref() != Some(session_id.as_str()) {
             self.session.deferred_completion = None;
+            // Fork feature (AGENTS.md "Fork features"): a command scheduled for the old session never runs on the new one.
+            self.deferred_command = None;
             self.branch_app = Default::default();
             crate::program_status::reset_shell(self);
             self.terminal_notifier.clear_outcome();

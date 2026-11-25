@@ -61,6 +61,13 @@ pub struct Snapshot {
     history_before_cursor: Option<HistoryCursor>,
 }
 
+impl Snapshot {
+    /// Fork feature (AGENTS.md "Fork features"): whether any entry is server history, not a client notice.
+    pub fn has_server_entries(&self) -> bool {
+        self.entries.iter().any(|raw| raw["local"] != true)
+    }
+}
+
 struct StoredEntry {
     id: String,
     raw: Value,

@@ -14,12 +14,21 @@ use crate::config::{self, ConfigField};
 use crate::hints::{self, action, key, Hint};
 use crate::search_field;
 
-pub(super) const NAME_W: usize = 38;
+/// The widest name column: room for `Document library connector (experimental)`.
+const NAME_W: usize = 42;
 pub(super) const VALUE_W: usize = 32;
+/// A narrow terminal gives the name column what the value column can spare.
+const MIN_VALUE_W: usize = 28;
 pub(super) const GAP: usize = 2;
 pub(super) const CURSOR_W: usize = 2;
-const ROW_W: usize = CURSOR_W + NAME_W + GAP + VALUE_W;
-const OPT_W: u16 = 76;
+const OPT_W: u16 = 80;
+
+/// The name column's width for an option list `opt_width` columns wide.
+fn name_width(opt_width: u16) -> usize {
+    usize::from(opt_width)
+        .saturating_sub(CURSOR_W + GAP + MIN_VALUE_W)
+        .clamp(24, NAME_W)
+}
 const HELP: &[Hint] = &[
     hints::NAVIGATE,
     (key::ENTER, action::EDIT),
@@ -115,9 +124,11 @@ fn draw_options(app: &mut App, f: &mut Frame, bx: u16, top: u16, w: u16, help_y:
         .set_style(region, Style::default().bg(theme::background()));
     let bg = theme::background();
     let fields: Vec<ConfigField> = config::filtered(app).into_iter().cloned().collect();
+    let name_w = name_width(opt_width);
     let lines = config_options::build_lines(
         &fields,
         app.config_screen.search.query.trim().is_empty() || fields.len() > config::MERGED_MATCHES,
+        name_w,
     );
     let total = lines.len() as u16;
     let options: Vec<_> = lines
@@ -134,7 +145,10 @@ fn draw_options(app: &mut App, f: &mut Frame, bx: u16, top: u16, w: u16, help_y:
         let y = top + row as u16;
         match line {
             Opt::Blank => {}
-            Opt::Section(label) => draw_section(f, Rect::new(opt_x, y, opt_width, 1), label, bg),
+            Opt::Section(label) => {
+                let row_w = CURSOR_W + name_w + GAP + VALUE_W;
+                draw_section(f, Rect::new(opt_x, y, opt_width, 1), label, bg, row_w)
+            }
             Opt::Header(text) => {
                 f.buffer_mut().set_stringn(
                     opt_x,
@@ -185,15 +199,15 @@ fn draw_options(app: &mut App, f: &mut Frame, bx: u16, top: u16, w: u16, help_y:
                     opt_x + CURSOR_W as u16,
                     y,
                     name,
-                    NAME_W.min(opt_width.saturating_sub(CURSOR_W as u16) as usize),
+                    name_w.min(opt_width.saturating_sub(CURSOR_W as u16) as usize),
                     name_style,
                 );
                 buf.set_stringn(
-                    opt_x + (CURSOR_W + NAME_W + GAP) as u16,
+                    opt_x + (CURSOR_W + name_w + GAP) as u16,
                     y,
                     value,
                     VALUE_W
-                        .min(opt_width.saturating_sub((CURSOR_W + NAME_W + GAP) as u16) as usize),
+                        .min(opt_width.saturating_sub((CURSOR_W + name_w + GAP) as u16) as usize),
                     value_style,
                 );
             }
@@ -227,8 +241,8 @@ fn draw_status(f: &mut Frame, area: Rect, status: &mut Notice, covered: bool) {
 }
 
 /// A centered section rule with the dim dashes and a brighter bold label.
-fn draw_section(f: &mut Frame, area: Rect, label: &str, bg: Color) {
-    let pad = ROW_W.saturating_sub(label.chars().count() + 2);
+fn draw_section(f: &mut Frame, area: Rect, label: &str, bg: Color, row_w: usize) {
+    let pad = row_w.saturating_sub(label.chars().count() + 2);
     let left = pad / 2;
     let dim = Style::default()
         .fg(theme::muted())

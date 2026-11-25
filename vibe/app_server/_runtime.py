@@ -1163,6 +1163,7 @@ class HarnessProcess:
         self._close_lock = asyncio.Lock()
         self._closed = False
         self._shared = shared
+        self._open_hosts = 0
         self._experimental_harness_host: object | None = None
         self._throwaway_storage_root = ThrowawayStorageRoot()
         self._session_configs = SessionConfigCache()
@@ -1374,7 +1375,25 @@ class HarnessProcess:
                 None if self._shared else self._throwaway_storage_root.lease().release
             ),
             owns_host=not self._shared,
+            last_host=None if self._shared else self._open_host_ref(),
         )
+
+    def _open_host_ref(self) -> Callable[[], bool]:
+        """One reference per Host adapter on this process's Runtime host: the
+        adapter that drops the last one may shut the Runtime host down, so a
+        session parked on its own adapter keeps running when another ends.
+        """
+        self._open_hosts += 1
+        released = False
+
+        def last() -> bool:
+            nonlocal released
+            if not released:
+                released = True
+                self._open_hosts -= 1
+            return self._open_hosts == 0
+
+        return last
 
     def utility_credentials(
         self, orchestrator: ConfigOrchestrator[VibeConfigSchema]
@@ -2896,29 +2915,38 @@ async def create_harness_server(
     """
     from vibe.app_server.server import AppServer
 
-    server = AppServer(
-        transport,
-        transport_kind=transport_kind,
-        host_handler=process.host_handler,
-        session_backend_host_factory=process.create_session_backend_host,
-        mcp_catalog_service=process.mcp_catalog,
-        connector_catalog_service=process.connector_catalog,
-        plugin_catalog_service=process.plugin_catalog,
-        imports_service=process.imports,
-        storage_usage=process.services.storage_usage,
-        config_changes=process.services.config_changes,
-        vibe_bot_sessions=process.services.vibe_bot_sessions,
-        account_gateway=account_gateway,
-        identity_gateway=identity_gateway,
-        oidc_tenants=process.services.oidc_tenants,
-        platform_credential_lenders=process.services.platform_credential_lenders,
-        configure_agent_plugins=process.configure_agent_plugins,
-        open_sessions=open_sessions,
-        left_turns=left_turns,
-        open_left_turn_channel=open_left_turn_channel,
-        list_on_own_channel=list_on_own_channel,
-        left_turn_session=left_turn_session,
-    )
+    def new_server() -> AppServer:
+        return AppServer(
+            transport,
+            transport_kind=transport_kind,
+            host_handler=process.host_handler,
+            session_backend_host_factory=process.create_session_backend_host,
+            mcp_catalog_service=process.mcp_catalog,
+            connector_catalog_service=process.connector_catalog,
+            plugin_catalog_service=process.plugin_catalog,
+            imports_service=process.imports,
+            storage_usage=process.services.storage_usage,
+            config_changes=process.services.config_changes,
+            vibe_bot_sessions=process.services.vibe_bot_sessions,
+            account_gateway=account_gateway,
+            identity_gateway=identity_gateway,
+            oidc_tenants=process.services.oidc_tenants,
+            platform_credential_lenders=process.services.platform_credential_lenders,
+            configure_agent_plugins=process.configure_agent_plugins,
+            open_sessions=open_sessions,
+            # Fork feature (AGENTS.md "Fork features"), ADR 0022: a connection
+            # without process-wide parking keeps the sessions it parks here.
+            background_sessions=process.services.open_sessions,
+            left_turns=left_turns,
+            open_left_turn_channel=open_left_turn_channel,
+            list_on_own_channel=list_on_own_channel,
+            left_turn_session=left_turn_session,
+        )
+
+    server = new_server()
+    # A holder for a session the connection parks: a server of its own, whose
+    # fresh runtime the connection takes over.
+    server._spawn_holder = new_server
     # One process per channel, except the in-process host, which every
     # connection of one entry point shares: the selection is the same for all.
     process.credentials.bind(server.session_link.platform_credentials)

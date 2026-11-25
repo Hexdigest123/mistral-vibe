@@ -27,7 +27,7 @@ screen_contains = (
     "Fork features",
     "Voice",
     "TTS",
-    "active_tts_model",
+    "Active TTS model",
     "Advanced settings",
 )
 

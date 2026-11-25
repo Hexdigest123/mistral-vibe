@@ -61,22 +61,29 @@ Contract:
   leaves the field, then clears the filter, then closes; the search row sits
   under the title (`/  Search …`); typing never resizes the box.
 - `/config` keeps its category sections (Popular, Fork features, the topic
-  sections such as Models/Voice/TTS, Advanced) when a search has more than
-  `MERGED_MATCHES` rows: `filtered()` then returns fields in section order,
-  since the sectioned rows are numbered in that order.
+  sections such as Models/Subagents/MCP & connectors/Telemetry & logging,
+  Advanced) when a search has more than `MERGED_MATCHES` rows: `filtered()`
+  then returns fields in section order, since the sectioned rows are numbered
+  in that order. Rows show a readable label (`config_label::humanize`:
+  `max_concurrent_subagents` -> `Max concurrent subagents`, acronyms cased,
+  `experimental_enable_x` -> `X (experimental)`); search ranks the raw key first
+  and falls back to the label, so both find the row, and the editor's title
+  shows the label with the raw `config.toml` key dim beside it.
 
 Map: `vibe/cli-rust/src/utils/fzf.rs` (the only matcher for lists; the older
 `utils/fuzzy.rs` stays for path and command completion), `model_picker.rs`,
-`config.rs` (`filtered`), `config_edit/search.rs`, `ui/config_edit/search.rs`,
+`config.rs` (`filtered`), `config_label.rs`, `config_sections.rs`,
+`config_edit/search.rs`, `ui/config_edit/search.rs`,
 `resume_picker/search.rs` (the fzf `shown` over session titles/previews; since
 upstream v3.1 `/resume` opens the sessions page, `sessions_page/model.rs` ranks
 its rows through it), `mcp/rows.rs`, `plugins/rows.rs`; dependency
 `nucleo-matcher` in `vibe/cli-rust/Cargo.toml`.
 
-Guards: `tests/units/{fzf_rank,config_filter,model_picker_search,fork_features}.rs`;
+Guards: `tests/units/{fzf_rank,config_filter,model_picker_search,fork_features}.rs`
+(`config_labels.rs` and `config_sections.rs` cover the labels and sections);
 scenarios `model/model_search`, `model/model_fzf_terms`,
 `slash_command/resume_search`, `slash_command/config_edit_choice_search`,
-`config/config_search`.
+`config/config_search`, `config/config_labels`, `config/config_label_edit`.
 
 Rebuild: add one shared ranking helper (`rank(items, query, name, prose)`)
 over nucleo's `Pattern::parse` (fuzzy) and `Pattern::new(…, Substring)`
@@ -240,16 +247,48 @@ Contract:
   connection, one session, as before); the other tabs keep their transcript
   snapshot, scroll and composer draft client-side, and their session in the
   store. A tab switch sends `session/resume` (or `session/start` for a new
-  tab) on the same connection, so it waits for the current turn to finish
-  (same gate as the Sessions page's switch): while a turn, queue or shell
-  command runs, the switch is **queued** (`SessionTabs.queued`) with a notice
-  and runs when the session goes idle (`maybe_run_queued`, fired from the
-  steady loop after notifications and ui events). The in-flight switch rides
-  the Sessions page's `switching` record, so input/Esc/Ctrl+C gating is shared.
-  A tab whose session is already attached (the server reused it, e.g. for an
-  empty session a new tab replaced) switches locally with no round-trip, even
-  mid-turn. A switch whose resume fails `session_not_found` removes the target
-  tab from the list instead of leaving a dead tab.
+  tab) on the same connection and runs **at once**, even while a turn, a queue
+  or a shell command runs (explicit product decision, overriding the old
+  "queue until idle" rule): the server **parks** the session whose turn still
+  runs, and `session/resume` of a parked session re-attaches it live (the
+  server re-announces `turn/started`, history replays, `adopt_active_turn`
+  shows the loader). Only a session that is still `Starting`/`Failed`, or a
+  running `/compact` (its answer belongs to the session being left), refuses a
+  tab action, with a notice (`session_tabs::ready`). There is no tab queue any
+  more. The in-flight switch rides the Sessions page's `switching` record, so
+  input/Esc/Ctrl+C gating is shared, and while it is in flight the left
+  session's late notifications are dropped (`is_foreign_session_notification`).
+  A tab whose session is already attached (the server reused it) switches
+  locally with no round-trip. A switch whose resume fails `session_not_found`
+  removes the target tab from the list instead of leaving a dead tab.
+- Server dependency (ADR 0022, `vibe/app_server/_parked_sessions.py`): parking
+  only happens when the TUI declares `initialize.capabilities.parkRunningSession
+  = true` (`startup::initialize_connection`, `ClientCapabilities.park_running_session`;
+  guard: `session_tabs.rs::the_client_opts_in_to_parking_a_running_session_on_a_switch`)
+  and declares no `agentPlugins`/`clientToolDefinitions` (it declares neither).
+  Without it the server replaces the attached session and the turn is stopped,
+  so never drop the capability. An idle old session is shut down as before; a
+  failed switch leaves the connection on its session. A parked session's
+  approvals/questions (`callback/call`) are re-sent when it is attached again,
+  so the switch landing closes the left session's callback UI unanswered
+  (`session_tabs/stale.rs`, `approval::State::forget`, `question_app::forget`).
+  Quitting stops parked sessions.
+- Background marks (`Tab.activity`): leaving a tab whose turn runs (status
+  generating, or a live non-paused queue) marks it `Running` (`●`, theme
+  `primary`); a poll flips it to `Waiting` (`!`, `warning`, status `blocked`),
+  `Done` (`✓`, `success`, the turn ended while away) or `Idle` (session not
+  listed). Landing on a tab clears its mark. The poll is `session/list` with
+  `sessionIds` of the background tabs only (a host method, no root needed),
+  armed by `poll_at` (3 s, UI clock) in the steady loop
+  (`session_tabs::poll`/`apply_event`, `UiEvent::Tabs`) and re-armed only
+  while a tab is `Running`/`Waiting`: no background tab, no polling.
+- Empty tabs: the server drops a session nothing was run in when the
+  connection leaves it, so the tab is removed from the bar when the switch
+  lands (`pending_close` + `pending_empty`, notice "Closed the empty tab N").
+  Empty = no server-owned entry in the transcript (`Snapshot::has_server_entries`)
+  and no running turn/queue; the Sessions page leaving an empty tab drops it
+  too (`drop_empty`). A failed switch keeps it. An index that no longer exists
+  is ignored by every action.
 - UI: a one-row tab bar above the conversation, shown when more than one tab
   is open or the chord is armed (`1 Title  2 Title …`, active tab on the
   cursor bar, `Ctrl+X tabs` hint at the right edge, or the chord keys while
@@ -261,7 +300,11 @@ Contract:
   Ctrl+C cancels it too). `Tab`/`Shift+Tab`/`Alt+1-9` do not touch tabs
   (`focus::tab_navigates` stays false for the composer).
 - `/tab [new|next|prev|close [N]|N]` runs the same actions and is never
-  rejected while busy (submission lets `/tab` dispatch; it queues instead);
+  rejected or delayed while busy (ADR 0012 amendment: every command but the
+  history rewrites runs at once; `/clear` `/compact` `/rewind` `/resume`
+  `/retry` are `deferred` in `commands.rs` and scheduled in one slot,
+  `commands/deferred.rs`, run by `deferred::run_when_idle` from the steady
+  loop, cancelled by Esc, dropped on a session change);
   hidden from help and completion while the feature is off
   (`Feature::SessionTabs`), typing it while off shows a notice. Opening a
   session from the Sessions page opens it as a new tab (or switches to its tab
@@ -276,11 +319,15 @@ Contract:
   README.md "Session tabs" documents it.
 
 Map: `vibe/cli-rust/src/session_tabs/` (`mod.rs` state + tab bookkeeping,
-`switch.rs` the switch mechanics, `keys.rs`, `command.rs`), `src/ui/session_tabs.rs`
-(tab bar). Hooks marked `Fork feature (AGENTS.md "Fork features")` in
-`src/lib.rs`, `src/app.rs` (`set_session_id`), `src/event_handler.rs` (flag +
-titles), `src/input.rs`, `src/focus.rs`, `src/mouse.rs` + `src/mouse/dispatch.rs`,
-`src/ui/mod.rs`, `src/commands/{commands,dispatch}.rs`,
+`actions.rs` new/switch/close/step/click, `switch.rs` the switch mechanics,
+`background.rs` the poll and marks, `keys.rs`, `command.rs`), `src/ui/session_tabs.rs`
+(tab bar + marks), `src/commands/deferred.rs` (the scheduled history command).
+Hooks marked `Fork feature (AGENTS.md "Fork features")` in
+`src/lib.rs`, `src/app.rs` (`set_session_id`, `deferred_command`), `src/event_handler.rs` (flag +
+titles, foreign-notification guard), `src/input.rs`, `src/focus.rs`, `src/mouse.rs` + `src/mouse/dispatch.rs`,
+`src/ui/mod.rs`, `src/ui_event.rs` (`Tabs`), `src/event_loop/steady.rs` (poll +
+`run_when_idle`), `src/commands/{commands,dispatch,submission}.rs`, `src/ui/composer_title.rs`,
+`src/bin/replay.rs` (`session/resume#<id>` pins),
 `src/sessions_page/{mod,requests,switch,adopt}.rs`, `src/server/proto_runtime.rs`,
 `src/startup/{mod,reads}.rs`, `src/transcript.rs` (`Snapshot: Clone`),
 `src/event_loop/keys.rs` (the armed chord takes the next key before the
@@ -291,8 +338,9 @@ Python: `vibe/core/config/vibe_schema.py`, `vibe/app_server/config.py`,
 NOT_FOUND with `data.harnessCode = "session_not_found"`, which the client
 recognizes to drop a gone tab).
 
-Guards: `vibe/cli-rust/tests/units/session_tabs.rs`, scenarios
-`client-e2e/scenarios/session_tabs/new_switch.py` and `disabled.py`,
+Guards: `vibe/cli-rust/tests/units/{session_tabs,command_submission}.rs`, scenarios
+`client-e2e/scenarios/session_tabs/{new_switch,disabled,chord_new_single_tab,gone_tab_removed,empty_tab_dropped,busy_switch,busy_switch_back}.py`,
+`client-e2e/scenarios/slash_command/{compact_deferred,compact_deferred_cancel,model_while_busy}.py`,
 `tests/app_server/test_projection.py::test_config_view_projects_enable_session_tabs`,
 `tests/test_fork_features.py`.
 

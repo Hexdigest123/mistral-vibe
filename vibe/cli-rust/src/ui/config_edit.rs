@@ -3,9 +3,10 @@
 mod layout;
 mod persistence;
 mod search;
+mod title;
 
 use ratatui::layout::{Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -49,14 +50,7 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::primary()).bg(bg))
-            .title(Line::from(vec![
-                Span::raw("─ "),
-                Span::styled(
-                    edit.field.name.as_str(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-            ])),
+            .title(title::line(&edit.field, layout.modal.width)),
         layout.modal,
     );
     let mut description = edit.field.description.clone();

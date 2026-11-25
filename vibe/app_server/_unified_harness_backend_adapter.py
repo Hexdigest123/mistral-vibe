@@ -2408,6 +2408,7 @@ def adapt_harness_host(  # noqa: PLR0913 - one collaborator per concern, all key
     launch_context_getter: LaunchContextGetter | None = None,
     release_storage: Callable[[], None] | None = None,
     owns_host: bool = True,
+    last_host: Callable[[], bool] | None = None,
     pin_session_options: Callable[[SessionOptions], SessionOptions] | None = None,
     worktree_housekeeping: WorktreeHousekeeping | None = None,
     worktree_naming_credentials: UtilityCredentialsFactory | None = None,
@@ -2422,6 +2423,7 @@ def adapt_harness_host(  # noqa: PLR0913 - one collaborator per concern, all key
         launch_context_getter=launch_context_getter,
         release_storage=release_storage,
         owns_host=owns_host,
+        last_host=last_host,
         pin_session_options=pin_session_options,
         worktree_housekeeping=worktree_housekeeping,
         worktree_naming_credentials=worktree_naming_credentials,
@@ -2521,6 +2523,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         launch_context_getter: LaunchContextGetter | None = None,
         release_storage: Callable[[], None] | None = None,
         owns_host: bool = True,
+        last_host: Callable[[], bool] | None = None,
         pin_session_options: Callable[[SessionOptions], SessionOptions] | None = None,
         worktree_housekeeping: WorktreeHousekeeping | None = None,
         worktree_naming_credentials: UtilityCredentialsFactory | None = None,
@@ -2529,6 +2532,10 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
     ) -> None:
         self._host = host
         self._owns_host = owns_host
+        # Fork feature (AGENTS.md "Fork features"), ADR 0022: a connection that
+        # parks a running session keeps a second Host adapter on the same
+        # Runtime host; only the last one to shut down may shut that down.
+        self._last_host = last_host
         # Every channel's Host, this one included, so an archive reaches a
         # session another channel holds open. Alone without it.
         self._open_sessions = open_sessions or OpenSessions()
@@ -5601,7 +5608,7 @@ class UnifiedHarnessBackendHostAdapter:  # noqa: PLR0904 - implements app-server
         with contextlib.suppress(Exception):
             await host_hooks_drain
         try:
-            if self._owns_host:
+            if self._owns_host and (self._last_host is None or self._last_host()):
                 await self._host.shutdown()
             else:
                 await self._close_owned_sessions()

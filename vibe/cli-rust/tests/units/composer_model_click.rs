@@ -126,13 +126,16 @@ fn a_click_on_the_mode_or_the_border_does_not_open_the_picker() {
 }
 
 #[test]
-fn the_model_is_neither_clickable_nor_hovered_while_a_turn_runs() {
-    let (mut app, at) = composer();
+fn the_model_stays_clickable_while_a_turn_runs() {
+    let (mut app, (x, y)) = composer();
     app.set_status(Status::Generating {
         since: vibe_rs::clock::now(),
     });
+    redraw(&mut app);
 
-    assert_inert(&mut app, at);
+    assert!(composer_title::model_at(&app, (x + 2, y)));
+    click(&mut app, x + 2, y);
+    assert!(app.model_picker.open, "/model runs while busy");
 }
 
 #[test]
@@ -144,11 +147,14 @@ fn the_model_is_neither_clickable_nor_hovered_while_the_session_starts() {
 }
 
 #[test]
-fn the_model_is_neither_clickable_nor_hovered_while_a_shell_command_runs() {
-    let (mut app, at) = composer();
+fn the_model_stays_clickable_while_a_shell_command_runs() {
+    let (mut app, (x, y)) = composer();
     app.session.shell_operation_id = Some("shell-1".into());
+    redraw(&mut app);
 
-    assert_inert(&mut app, at);
+    assert!(composer_title::model_at(&app, (x + 2, y)));
+    click(&mut app, x + 2, y);
+    assert!(app.model_picker.open);
 }
 
 #[test]

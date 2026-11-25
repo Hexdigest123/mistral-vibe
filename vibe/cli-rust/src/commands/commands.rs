@@ -29,10 +29,13 @@ pub struct Command {
     pub aliases: &'static [&'static str],
     pub description: &'static str,
     pub side_channel: bool,
-    /// A side-channel command that still waits for a compaction or agent install.
+    /// A command that still waits for a compaction or agent install.
     pub waits_for_jobs: bool,
     /// Replaces the session or its history, dropping the server's queue with it.
     pub drops_queue: bool,
+    /// Fork feature (AGENTS.md "Fork features"): rewrites the history the running turn reads, so
+    /// it is scheduled for when the session is idle instead of running at once (ADR 0012 amendment).
+    pub deferred: bool,
     /// Inline hint shown after `/command ` until an argument is typed; empty when none.
     pub arguments: &'static str,
     /// Hidden from help and completion while this feature is off; typing it still runs it.
@@ -52,6 +55,7 @@ const fn cmd(
         side_channel,
         waits_for_jobs: false,
         drops_queue: false,
+        deferred: false,
         arguments: "",
         requires: None,
         prompt_when_off: false,
@@ -73,6 +77,13 @@ impl Command {
     const fn drops_queue(self) -> Self {
         Self {
             drops_queue: true,
+            ..self
+        }
+    }
+
+    const fn deferred(self) -> Self {
+        Self {
+            deferred: true,
             ..self
         }
     }
@@ -100,7 +111,7 @@ const COMMANDS: &[Command] = &[
     cmd(&["/model"], "Select active model", false).args("[refresh]"),
     cmd(&["/thinking"], "Select thinking level", false).args("[level]"),
     cmd(&["/reload"], "Reload configuration, agent instructions, and skills from disk", false),
-    cmd(&["/clear", "/new"], "Start a new conversation. Optionally pass a prompt to seed it.", false).args("[prompt]").drops_queue(),
+    cmd(&["/clear", "/new"], "Start a new conversation. Optionally pass a prompt to seed it.", false).args("[prompt]").drops_queue().deferred(),
     cmd(&["/copy"], "Copy the last agent message to the clipboard", true),
     cmd(&["/raw"], "Show agent messages as raw Markdown for easier copying", true).args("[on|off]"),
     cmd(&["/log"], "Show path to current interaction log file", true),
@@ -112,14 +123,14 @@ const COMMANDS: &[Command] = &[
         true,
     )
     .args("[entries]"),
-    cmd(&["/compact"], "Compact conversation history by summarizing. Optionally pass instructions to guide the summary", false).args("[instructions]").drops_queue(),
+    cmd(&["/compact"], "Compact conversation history by summarizing. Optionally pass instructions to guide the summary", false).args("[instructions]").drops_queue().deferred(),
     cmd(&["/exit", ":q", ":quit", "exit", "quit"], "Exit the application", true),
     cmd(&["/status"], "Display agent statistics and model and provider details", true),
     cmd(&["/context"], "Show what fills the context window (system prompt, skills, conversation)", true),
     cmd(&["/whoami"], "Display the Mistral signed-in user, workspace, and plan", true),
     cmd(&["/proxy-setup"], "Configure proxy and SSL certificate settings", true).after_jobs(),
     cmd(&["/cd"], "Move this session to another folder, keeping the conversation", false).args("[path]"),
-    cmd(&["/resume", "/continue"], "Open the Sessions page to resume a saved session", false).drops_queue(),
+    cmd(&["/resume", "/continue"], "Open the Sessions page to resume a saved session", false).drops_queue().deferred(),
     cmd(&["/tab"], "Switch session tabs: open one in the current session's place, or manage the open ones", false)
         .args("[new|next|prev|close [N]|N]")
         .requires(Feature::SessionTabs),
@@ -138,11 +149,11 @@ const COMMANDS: &[Command] = &[
     cmd(&["/trusted-folders"], "Browse trusted and untrusted folders, toggle or forget one", true),
     cmd(&["/voice"], "Configure voice settings", true).after_jobs(),
     cmd(&["/agent"], "List agents, or switch the session to one", false).args("[name]"),
-    cmd(&["/leanstall"], "Install the Lean 4 agent (leanstral)", false),
-    cmd(&["/unleanstall"], "Uninstall the Lean 4 agent", false),
-    cmd(&["/rewind"], "Rewind to a previous message (or press Esc twice)", false).drops_queue(),
+    cmd(&["/leanstall"], "Install the Lean 4 agent (leanstral)", false).after_jobs(),
+    cmd(&["/unleanstall"], "Uninstall the Lean 4 agent", false).after_jobs(),
+    cmd(&["/rewind"], "Rewind to a previous message (or press Esc twice)", false).drops_queue().deferred(),
     cmd(&["/branch", "/fork"], "Fork the current conversation into a new resumable session, leaving this session unchanged. Resume the copy with `vibe --resume <id>`.", true).after_jobs(),
-    cmd(&["/retry"], "Retry a failed or interrupted response; optionally pass additional instructions", false).args("[instructions]"),
+    cmd(&["/retry"], "Retry a failed or interrupted response; optionally pass additional instructions", false).args("[instructions]").deferred(),
     cmd(&["/loop"], "Manage scheduled loops, or schedule one: /loop [schedule] [prompt]", true).args("[schedule] [prompt]"),
     cmd(&["/data-retention"], "Show data retention information", true),
     cmd(&["/release-notes", "/whatsnew"], "Browse the release notes of every Vibe version", true),
@@ -214,6 +225,11 @@ pub fn is_side_channel(label: &str) -> bool {
 /// Whether a side-channel command still waits for a compaction or agent install.
 pub fn waits_for_jobs(label: &str) -> bool {
     available().any(|command| command.aliases.contains(&label) && command.waits_for_jobs)
+}
+
+/// Whether the command rewrites the history a running turn reads, so it waits for idle.
+pub fn is_deferred(label: &str) -> bool {
+    available().any(|command| command.aliases.contains(&label) && command.deferred)
 }
 
 /// Whether the command replaces the session or its history, and the queue with it.

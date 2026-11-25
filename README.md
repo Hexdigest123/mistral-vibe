@@ -26,7 +26,7 @@ Mistral Vibe is an open-source coding agent for your terminal. Describe what you
 - Custom provider tag \[provider\] with automatic discovery of the provider's models (see [Provider model auto-discovery](#provider-model-auto-discovery))
   - Also auto-discovers Mistral's model catalog, since `mistral-large-4` is still listed with a 400k max context window, which is simply false
 - FZF search in every long list: `/model`, `/config`, `/resume`, `/mcp` and `/plugins` (see [FZF search](#fzf-search))
-- Session tabs (see [Session tabs](#session-tabs)): several sessions in one window, switched with `Tab`/`Shift+Tab`, `Alt+1-9`, a click on the tab bar, or `/tab`
+- Session tabs (see [Session tabs](#session-tabs)): several sessions in one window, switched with `Ctrl+X` then `1-9`, a click on the tab bar, or `/tab`, even while a turn runs
 - TTFT and tok/s in the bottom bar (see [TTFT and TPS](#ttft-and-tps)): time to first token and tokens per second next to the usage and context gauges, like OpenCode's TUI
 - On Linux, child processes Vibe starts (MCP stdio servers, hooks, background processes) carry `PR_SET_PDEATHSIG`, so the kernel kills them if the app-server dies — no more orphaned `node`/shell processes after a `SIGKILL`
 - Builds to `vibes` instead of `vibe` (for my personal testing)
@@ -35,7 +35,7 @@ Mistral Vibe is an open-source coding agent for your terminal. Describe what you
 
 **Where to find the settings**
 
-- In the CLI: `/config` opens the settings screen (type `/` to search, e.g. `/telemetry`); every setting can also be edited there and is written to `~/.vibe/config.toml`. This fork's own settings (`disable_all_telemetry`, `enable_session_tabs`) get a "Fork features" section at the top
+- In the CLI: `/config` opens the settings screen (type `/` to search, e.g. `/telemetry`); every setting can also be edited there and is written to `~/.vibe/config.toml`. Settings are grouped into sections (Popular, Fork features, Models, Subagents, MCP & connectors, Appearance, Telemetry & logging, …) and shown by readable name (`Max concurrent subagents`); search matches both that name and the raw key (`max_concurrent_subagents`), and the editor shows the key so you can find it in the TOML. This fork's own settings (`disable_all_telemetry`, `enable_session_tabs`) get a "Fork features" section at the top
 - Or edit the TOML directly: `~/.vibe/config.toml` (user-wide) or `.vibe/config.toml` in a trusted project
 - `/model` lists the models, with fzf search and `/model refresh`
 
@@ -88,8 +88,10 @@ Open several sessions side by side in one window. When more than one tab is open
 - `/tab new` opens a fresh session in a new tab (opening a session from `/sessions` opens it as a new tab too)
 - `Ctrl+X` then `1-9` jumps to a numbered tab, `n` opens a new tab, `c` closes the active one; a click on a tab switches to it, a middle click closes it
 - `/tab next|prev|close [N]|N` does the same from the prompt
-- Each tab keeps its conversation, scroll position and draft while another tab is active; while a turn runs, a switch is queued and happens when the turn finishes (only the active tab is attached)
-- A tab whose session no longer exists (e.g. an empty session the server discarded) is removed from the tab bar instead of erroring
+- Each tab keeps its conversation, scroll position and draft while another tab is active (only the active tab is attached)
+- Tab actions run at once, even while a turn runs: the turn keeps running in the background and the tab shows `●` while it runs, `!` while it waits for your answer and `✓` once it ended while you were away (the mark clears when you switch back; the background tabs are polled every few seconds, and only while one of them runs). Switching back to a tab whose turn still runs re-attaches it live
+- A tab nothing was run in (no prompt) is dropped from the bar when you leave it, as the server drops its empty session; a tab whose session no longer exists is removed instead of erroring
+- Slash commands follow the same rule: `/clear`, `/compact`, `/rewind`, `/resume` and `/retry` rewrite the history the running turn reads, so typed during a turn they are scheduled (one at a time, shown as a notice) and run when the turn ends (`Esc` cancels); every other command (`/config`, `/model`, `/tab`, `/mcp`, …) runs at once
 
 Tabs are **on by default**; hide the tab bar and disable the keys with:
 

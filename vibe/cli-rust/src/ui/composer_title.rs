@@ -109,9 +109,9 @@ pub fn place_model(app: &mut App, area: Rect, title: &Title) {
     };
 }
 
-/// Whether `at` is on the composer's model name while a click there may open `/model`, which needs an idle session like the typed command.
+/// Whether `at` is on the composer's model name while a click there may open `/model`, which runs while busy like the typed command.
 pub fn model_at(app: &App, at: (u16, u16)) -> bool {
     app.focus() == crate::focus::Focus::Composer
         && app.view.model_area.contains(at.into())
-        && crate::commands::submission::accepts_idle_command(app)
+        && crate::commands::submission::accepts_command(app)
 }

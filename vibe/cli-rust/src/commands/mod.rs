@@ -7,6 +7,7 @@ pub mod clear;
 #[allow(clippy::module_inception)]
 mod commands;
 pub mod compact;
+pub mod deferred;
 mod dispatch;
 pub mod event;
 pub mod leanstall;
@@ -22,7 +23,7 @@ pub mod submission;
 mod thinking;
 
 pub use commands::{
-    argument_hint, builtin, drops_queue, entries, has_command, is_side_channel, parse, removed,
-    runs, waits_for_jobs, Feature,
+    argument_hint, builtin, drops_queue, entries, has_command, is_deferred, is_side_channel, parse,
+    removed, runs, waits_for_jobs, Feature,
 };
 pub use event::{spawn_session, CommandEvent};

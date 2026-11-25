@@ -1,6 +1,6 @@
 //! Slash-command resolution: aliases, bare exit synonyms, arguments and side-channel routing.
 
-use vibe_rs::commands::{argument_hint, is_side_channel, parse, waits_for_jobs};
+use vibe_rs::commands::{argument_hint, is_deferred, is_side_channel, parse, waits_for_jobs};
 use vibe_rs::input_modes::{classify, ClassifiedInput};
 
 #[test]
@@ -70,7 +70,34 @@ fn bare_exit_synonyms_exit_only_as_the_whole_input() {
 }
 
 #[test]
-fn commands_a_turn_never_reads_run_while_busy_and_the_others_wait_for_idle() {
+fn only_history_rewrites_wait_for_idle_and_every_other_command_runs_while_busy() {
+    for command in ["/clear", "/compact", "/rewind", "/resume", "/retry"] {
+        assert!(is_deferred(command), "{command} is scheduled for idle");
+    }
+    for command in [
+        "/config",
+        "/model",
+        "/thinking",
+        "/reload",
+        "/mcp",
+        "/connectors",
+        "/plugins",
+        "/reload-plugins",
+        "/skills",
+        "/agent",
+        "/cd",
+        "/tab",
+        "/help",
+        "/sessions",
+        "/theme",
+        "/branch",
+    ] {
+        assert!(!is_deferred(command), "{command} runs at once while busy");
+    }
+}
+
+#[test]
+fn commands_a_turn_never_reads_stay_side_channel_commands() {
     for command in [
         "/help",
         "/status",
@@ -91,22 +118,6 @@ fn commands_a_turn_never_reads_run_while_busy_and_the_others_wait_for_idle() {
         "/skills",
     ] {
         assert!(is_side_channel(command), "{command} runs while busy");
-    }
-    for command in [
-        "/config",
-        "/model",
-        "/thinking",
-        "/resume",
-        "/clear",
-        "/compact",
-        "/rewind",
-        "/reload",
-        "/mcp",
-        "/connectors",
-        "/plugins",
-        "/reload-plugins",
-    ] {
-        assert!(!is_side_channel(command), "{command} waits for idle");
     }
 }
 

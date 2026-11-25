@@ -7,6 +7,11 @@ reaches its client only through the link. Attaching swaps the two channels'
 runtimes and repoints the link, so the live session moves as a whole; the
 attaching channel's own, unused host goes to the closed channel and is shut
 down.
+
+Fork feature (AGENTS.md "Fork features"), ADR 0022: a connection that attaches
+another session while its own has turn work parks it the same way, on a holder
+of its own, so the old session keeps running and a later ``session/resume`` of
+it, from this connection or another, attaches it live again.
 """
 
 from __future__ import annotations
@@ -23,11 +28,13 @@ from vibe.app_server._session_backend_port import (
     SessionBackend,
     SessionBackendError,
     SessionBackendHostClientLoss,
+    SessionBackendHostLeaseWatch,
     SessionBackendTurnWork,
 )
 from vibe.app_server.models import BlockedSessionStatus, RunningSessionStatus
 from vibe.app_server.protocol import (
     ClientCapabilities,
+    EventNotificationParams,
     ProtocolErrorCode,
     SessionReadParams,
     SessionReadResponse,
@@ -50,19 +57,187 @@ class ParkedChannel:
         self.server = server
 
     def has_turn_work(self) -> bool:
-        root = self.server._root
-        return isinstance(root, SessionBackendTurnWork) and root.has_turn_work
+        return _has_turn_work(self.server._root)
 
     async def stop(self) -> None:
         await self.server._close_root()
 
 
+def _has_turn_work(root: SessionBackend | None) -> bool:
+    return isinstance(root, SessionBackendTurnWork) and root.has_turn_work
+
+
 def park_running_session(server: AppServer, open_sessions: OpenSessions) -> bool:
     root = server._root
-    if not isinstance(root, SessionBackendTurnWork) or not root.has_turn_work:
+    if root is None or not _has_turn_work(root):
         return False
     open_sessions.park(root.session_id, ParkedChannel(server))
     return True
+
+
+def may_park_on_switch(server: AppServer) -> bool:
+    """Whether the connection's client asked to keep its running session when
+    it attaches another. Plugin client tools stay bound to the first link, so
+    a connection declaring them never parks.
+    """
+    capabilities = server._client_capabilities
+    return (
+        capabilities.park_running_session
+        and not capabilities.agent_plugins
+        and not capabilities.client_tool_definitions
+    )
+
+
+class SwitchAway:
+    """The running session a connection leaves while it attaches another.
+
+    Its runtime (host, link) moves to ``holder``, so it keeps running with no
+    client; ``detach`` then stops forwarding its events, ``park`` registers it
+    for a later attach and ``abort`` takes everything back when the attach
+    failed.
+    """
+
+    def __init__(
+        self,
+        server: AppServer,
+        holder: AppServer,
+        root: SessionBackend,
+        open_sessions: OpenSessions,
+    ) -> None:
+        self.server = server
+        self.holder = holder
+        self.root = root
+        self._open_sessions = open_sessions
+        self._detached = False
+        self.watches_artifacts = False
+
+    async def detach(self) -> None:
+        """The connection forwards no more of the session's events and holds
+        no root: the new session replaces it without stopping this one.
+        """
+        server, session_id = self.server, self.root.session_id
+        events = server._backend_event_task
+        server._backend_event_task = None
+        server._backend_event_backend = None
+        if events is not None:
+            await cancel_tasks([events], label="parked session events")
+        server._root = None
+        # What the session announced while the attach ran is in its history
+        # still; replayed, it would reach the new session's stream.
+        server._pending_notifications = [
+            notification
+            for notification in server._pending_notifications
+            if not _is_event_of(notification.params, session_id)
+        ]
+        # Delivered to the client before it left: a refusal of one is no
+        # rejection of the callback, which is sent again when the session is
+        # attached again.
+        for delivery in server._callback_deliveries.requests.values():
+            delivery.answered = True
+        _carry_watermark(server, self.holder, session_id)
+        self._detached = True
+
+    def park(self) -> None:
+        self.server._switch_parked.add(self.root.session_id)
+        self._open_sessions.park(self.root.session_id, ParkedChannel(self.holder))
+
+    async def abort(self) -> None:
+        """The attach failed: the connection runs its session again."""
+        server, holder = self.server, self.holder
+        server._stop_artifact_subscription()
+        _swap_runtime(server, holder)
+        holder._root = None
+        await _follow_host(server, watches_artifacts=self.watches_artifacts)
+        try:
+            await holder._session_backend_host.shutdown()
+        except Exception:
+            logger.warning("Could not shut down an unused session host", exc_info=True)
+        if self._detached:
+            await _forward_again(server, self.root)
+
+
+_RESUME_HISTORY_LIMIT = 200
+
+
+async def _forward_again(server: AppServer, root: SessionBackend) -> None:
+    """The connection holds ``root`` again, after a failed attach, and forwards
+    its events.
+    """
+    try:
+        await server._activate_backend(root, _RESUME_HISTORY_LIMIT)
+    except Exception:
+        logger.warning(
+            "Could not forward the events of session %s again",
+            root.session_id,
+            exc_info=True,
+        )
+        server._root = root
+
+
+async def begin_switch_away(
+    server: AppServer, open_sessions: OpenSessions, target_session_id: str | None
+) -> SwitchAway | None:
+    """Move the connection's running session to a holder of its own, with a
+    fresh runtime for the connection, before it opens ``target_session_id``;
+    None when nothing is to be kept and the open replaces the session as ever.
+    """
+    root = server._root
+    if (
+        root is None
+        or server._spawn_holder is None
+        or not may_park_on_switch(server)
+        or not _has_turn_work(root)
+        or root.session_id == target_session_id
+    ):
+        return None
+    holder = server._spawn_holder()
+    _adopt_connection(server, holder)
+    away = SwitchAway(server, holder, root, open_sessions)
+    away.watches_artifacts = server._unsubscribe_artifacts is not None
+    server._stop_artifact_subscription()
+    _swap_runtime(server, holder)
+    holder._root = root
+    await _follow_host(server, watches_artifacts=away.watches_artifacts)
+    return away
+
+
+async def _follow_host(server: AppServer, *, watches_artifacts: bool) -> None:
+    """The connection's host-bound subscriptions follow its runtime's host."""
+    if watches_artifacts:
+        server._subscribe_artifacts()
+    host = server._session_backend_host
+    if isinstance(host, SessionBackendHostLeaseWatch):
+        try:
+            await server._leases.follow(host)
+        except Exception:
+            logger.warning("Could not follow the new host's leases", exc_info=True)
+
+
+def _adopt_connection(server: AppServer, holder: AppServer) -> None:
+    """The holder answers for the session as the connection does: the same
+    client, account and sign-in, and no way to reach the client itself.
+    """
+    holder._initialization = server._initialization
+    holder._client_info = server._client_info
+    holder._client_capabilities = server._client_capabilities
+    holder._client_account = server._client_account
+    holder._client_instance = server._client_instance
+    holder._platform_credentials = server._platform_credentials
+    holder._credential_selection = server._credential_selection
+    holder._lending = server._lending
+    holder._transport = None
+
+
+def _carry_watermark(source: AppServer, target: AppServer, session_id: str) -> None:
+    mark = source._event_watermark(session_id)
+    if mark > target._event_watermark(session_id):
+        target._event_watermarks[session_id] = mark
+
+
+def _is_event_of(params: object, session_id: str) -> bool:
+    return isinstance(params, EventNotificationParams) and (
+        params.session_id == session_id
+    )
 
 
 def _account(server: AppServer) -> AccountKey | None:
@@ -141,10 +316,10 @@ async def attach_parked(
         except BaseException:
             open_sessions.park(params.session_id, parked)
             raise
+    current = server._root
     watches_artifacts = server._unsubscribe_artifacts is not None
     server._stop_artifact_subscription()
-    _swap_runtime(server, holder)
-    holder._root = None
+    away = await _exchange_runtimes(server, holder, open_sessions)
     try:
         response = await server._activate_lifecycle_backend(
             "session/resume", root, params.history_limit
@@ -159,19 +334,43 @@ async def attach_parked(
         _swap_runtime(server, holder)
         holder._root = root
         open_sessions.park(params.session_id, parked)
-        if watches_artifacts:
-            server._subscribe_artifacts()
+        if current is not None:
+            await _forward_again(server, current)
+        await _follow_host(server, watches_artifacts=watches_artifacts)
         raise
+    _carry_watermark(holder, server, params.session_id)
     open_sessions.attached(params.session_id)
     if isinstance(server._session_backend_host, SessionBackendHostClientLoss):
         server._session_backend_host.mark_client_reconnected()
-    if watches_artifacts:
-        server._subscribe_artifacts()
+    await _follow_host(server, watches_artifacts=watches_artifacts)
+    if away is not None:
+        # The holder runs the session the connection left: it keeps its host.
+        away.park()
+        return response
     try:
         await holder._session_backend_host.shutdown()
     except Exception:
         logger.warning("Could not shut down an unused session host", exc_info=True)
     return response
+
+
+async def _exchange_runtimes(
+    server: AppServer, holder: AppServer, open_sessions: OpenSessions
+) -> SwitchAway | None:
+    """The connection takes the parked session's runtime. The session it runs
+    now goes to the holder, still running, if it has turn work; else it is
+    replaced as an attach always did.
+    """
+    current = server._root
+    _swap_runtime(server, holder)
+    if current is None or not _has_turn_work(current):
+        holder._root = None
+        return None
+    _adopt_connection(server, holder)
+    away = SwitchAway(server, holder, current, open_sessions)
+    holder._root = current
+    await away.detach()
+    return away
 
 
 async def interrupt_running_turn(root: SessionBackend) -> None:
@@ -225,7 +424,10 @@ async def _check_attach(
     root: SessionBackend,
     params: SessionResumeParams,
 ) -> None:
-    if server._root is not None:
+    # Fork feature (AGENTS.md "Fork features"), ADR 0022: a client that keeps
+    # its running session when it attaches another also attaches this one over
+    # the session it has; any other holds one connection to one session.
+    if server._root is not None and not may_park_on_switch(server):
         raise RequestFailure(
             ProtocolErrorCode.CONFLICT,
             "Resume a session that runs with no connection on a connection of its own",
@@ -264,7 +466,10 @@ def _client_tools(
 
 __all__ = [
     "ParkedChannel",
+    "SwitchAway",
     "attach_parked",
+    "begin_switch_away",
     "interrupt_running_turn",
+    "may_park_on_switch",
     "park_running_session",
 ]

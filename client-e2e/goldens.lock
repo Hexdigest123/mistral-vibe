@@ -59,7 +59,7 @@ cd/arrow_enter 0f7b7851f773
 
 cd/back 27a71bc7f482
 
-cd/busy b41bcf65853c
+cd/busy c7f7b880e5ee
 
 cd/busy_server a7c09073b435
 
@@ -85,13 +85,19 @@ cd/trust_cancel 537a46e11c52
 
 cd/trust_decline 537a46e11c52
 
-config/config 1aad48800785
+config/config fd4eb40b57e2
+
+config/config_label_edit 7d9386a08182
+
+config/config_labels 5ee02b5003dd
+
+config/config_labels_bottom f7f7284a5da8
 
 config/config_search f017ea2887ed
 
-config/config_sections c96a11864b88
+config/config_sections 814f1e500770
 
-config/telemetry_kill_switch 71f349cd7ad7
+config/telemetry_kill_switch 23a3241871f7
 
 context/context_click_over_rail_window 92418a263362
 
@@ -537,7 +543,7 @@ goal/unsupported 17eae9d90958
 
 goal/usage_limit 1a4f29bba575
 
-hints/narrow_config e050ab04d245
+hints/narrow_config 7e1ebd19e7c6
 
 hints/narrow_picker f5e36dd61e9b
 
@@ -695,7 +701,7 @@ input_undo_queue_exit ded2a05af9fc
 
 input_undo_redo adc726c2e1b0
 
-input_undo_rejected_completion 707fcb9ff21e
+input_undo_rejected_completion 102b4f7d7e0a
 
 input_undo_selection_paste b9378032332b
 
@@ -993,7 +999,7 @@ model/model_fzf_terms b86cd876d68b
 
 model/model_hover 45ef02ee558e
 
-model/model_locked_hidden 3329193e1471
+model/model_locked_hidden c10be4acb864
 
 model/model_nav 17c0ac30345b
 
@@ -1023,7 +1029,7 @@ model/model_session_chain 628219a362b0
 
 model/model_session_enter_chain 237d3085f7fc
 
-model/model_source_groups a5db3d55e471
+model/model_source_groups 670f6ae2a255
 
 model/model_write_fallback 4ff5c7763aa3
 
@@ -1083,7 +1089,7 @@ notice/startup_warnings_resume_cancel f017ea2887ed
 
 notice/startup_warnings_then_row c774d4977819
 
-onboarding/onboarding_acp_entrypoint fdb19e006021
+onboarding/onboarding_acp_entrypoint 0f4dab1ddaa9
 
 onboarding/onboarding_api_key e4adc9203a6e
 
@@ -1095,9 +1101,9 @@ onboarding/onboarding_custom_domain 5cc0017a6062
 
 onboarding/onboarding_missing_key 6eba280cbcf0
 
-onboarding/onboarding_missing_key_env_empty 1ad8c6159ebd
+onboarding/onboarding_missing_key_env_empty ecbea0edab2b
 
-onboarding/onboarding_missing_key_probe_wrong bb9d3a630b06
+onboarding/onboarding_missing_key_probe_wrong 243a681a57c9
 
 onboarding/onboarding_oidc_abandoned_domain 6d218d102747
 
@@ -1425,13 +1431,19 @@ scroll/scrollbar_drag 370486a406e6
 
 scroll/scrollbar_track_click 86cbae370714
 
-session_tabs/chord_new_single_tab 78a677b0d7f7
+session_tabs/busy_switch 10ac83c67eed
+
+session_tabs/busy_switch_back d778d238fc46
+
+session_tabs/chord_new_single_tab 9dc4dc87750a
 
 session_tabs/disabled f017ea2887ed
 
-session_tabs/gone_tab_removed ae71e105909a
+session_tabs/empty_tab_dropped bae8df410284
 
-session_tabs/new_switch 8e7319f049b2
+session_tabs/gone_tab_removed 5e15a110499a
+
+session_tabs/new_switch a49341fc2cd1
 
 sessions_page/archive_notice e61ec8c884a8
 
@@ -1597,6 +1609,10 @@ slash_command/clear_then_prompt 67919534cb28
 
 slash_command/compact 3ca16441e869
 
+slash_command/compact_deferred 9a69805c9c36
+
+slash_command/compact_deferred_cancel 18518d7f99b7
+
 slash_command/compact_empty a52fda080306
 
 slash_command/compact_gauge 11a84d48dae3
@@ -1607,21 +1623,21 @@ slash_command/compact_manual_checkpoint 11a84d48dae3
 
 slash_command/compact_manual_handoff 92aa07de0a08
 
-slash_command/config_edit b05ffb5912e6
+slash_command/config_edit 94c7b18d57a6
 
-slash_command/config_edit_bool_flip 1e29d1e6fa1a
+slash_command/config_edit_bool_flip 9cefb049027e
 
 slash_command/config_edit_bool_layers f017ea2887ed
 
-slash_command/config_edit_choice_search 012033cb429a
+slash_command/config_edit_choice_search 70661b7a7f92
 
-slash_command/config_edit_enum_choice 820c8749dc95
+slash_command/config_edit_enum_choice 885f6170f129
 
 slash_command/config_edit_exact_width f017ea2887ed
 
 slash_command/config_edit_failures 4582d3a52244
 
-slash_command/config_edit_grapheme_cursor a6cd1e3efd31
+slash_command/config_edit_grapheme_cursor b0df63948a49
 
 slash_command/config_edit_invalid f017ea2887ed
 
@@ -1637,7 +1653,7 @@ slash_command/config_edit_layout_breakpoint f017ea2887ed
 
 slash_command/config_edit_models f017ea2887ed
 
-slash_command/config_edit_mouse fd937d017bd0
+slash_command/config_edit_mouse 5e8c86577cbb
 
 slash_command/config_edit_multiline f017ea2887ed
 
@@ -1649,17 +1665,17 @@ slash_command/config_edit_rpc_error 4582d3a52244
 
 slash_command/config_edit_scrollbar f017ea2887ed
 
-slash_command/config_edit_session_target 85e9435087a7
+slash_command/config_edit_session_target ec4d1b4d8081
 
-slash_command/config_edit_theme_choice 84727f61306f
+slash_command/config_edit_theme_choice 18ee09b7f96d
 
 slash_command/config_edit_then_reset 8e49101315b5
 
-slash_command/config_edit_unknown_choice 3d331dfacb64
+slash_command/config_edit_unknown_choice b0a1a1b4840d
 
 slash_command/config_edit_wrapped_choices f017ea2887ed
 
-slash_command/config_edit_wrapped_input 83516b62d28c
+slash_command/config_edit_wrapped_input de1119406bcf
 
 slash_command/config_environment_override f017ea2887ed
 
@@ -1667,7 +1683,7 @@ slash_command/config_fuzzy_filter f017ea2887ed
 
 slash_command/config_load_error f017ea2887ed
 
-slash_command/config_modal d61224c2f90b
+slash_command/config_modal 0186160270ad
 
 slash_command/config_reset_user_override dc2c0e684c60
 
@@ -1706,6 +1722,8 @@ slash_command/loop_management b0f57d9b3c52
 slash_command/loop_while_busy 08fc578f7408
 
 slash_command/mcp_argument_hint f017ea2887ed
+
+slash_command/model_while_busy f0fa82b1dccf
 
 slash_command/release_notes f017ea2887ed
 
@@ -1795,7 +1813,7 @@ slash_command/slash_command_scroll faddd8c86d58
 
 slash_command/slash_command_wheel b042f02db827
 
-slash_command/slash_command_while_busy c5c2529d4f18
+slash_command/slash_command_while_busy 1b4a65138e72
 
 slash_command/status 540392a4a7cd
 
@@ -2153,7 +2171,7 @@ text_selection/wrapped_transcript_copy c774d4977819
 
 theme/ansi_dark_subagent_hover 57897152bff0
 
-theme/ansi_light_config_scrollbar 32113839d4ac
+theme/ansi_light_config_scrollbar 64b29b18758c
 
 theme/ansi_light_copy_notice 6d0c454035b9
 

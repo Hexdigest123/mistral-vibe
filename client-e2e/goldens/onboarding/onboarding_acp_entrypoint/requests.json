@@ -8,7 +8,8 @@
      "user_input"
     ],
     "clientTools": [],
-    "disabledNotifications": []
+    "disabledNotifications": [],
+    "parkRunningSession": true
    },
    "clientInfo": {
     "entrypoint": "acp",

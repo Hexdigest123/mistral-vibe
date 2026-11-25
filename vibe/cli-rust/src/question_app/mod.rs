@@ -45,6 +45,22 @@ pub fn callback_active(app: &App) -> bool {
         || (state.open && matches!(state.source, Some(QuestionSource::Callback(_))))
 }
 
+/// Fork feature (AGENTS.md "Fork features"): drop the questions of `session_id` (all when `None`)
+/// a session switch made moot, unanswered.
+pub fn forget(app: &mut App, session_id: Option<&str>) {
+    let moot = |source: &QuestionSource| {
+        let QuestionSource::Callback(address) = source;
+        session_id.is_none_or(|id| address.session_id.as_deref() == Some(id))
+    };
+    let state = &app.question_app;
+    let open = state.source.clone().filter(|_| state.open);
+    let queued = state.pending.iter().map(|(source, _)| source.clone());
+    let sources: Vec<_> = queued.chain(open).filter(|source| moot(source)).collect();
+    for source in &sources {
+        dismiss(app, source);
+    }
+}
+
 /// Whether another question fits in the queue.
 pub fn has_capacity(app: &App) -> bool {
     app.question_app.pending.len() < MAX_PENDING_QUESTIONS

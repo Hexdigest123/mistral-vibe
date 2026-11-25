@@ -53,6 +53,13 @@ GUARD_TESTS = (
     "client-e2e/scenarios/session_tabs/gone_tab_removed.py",
     "vibe/cli-rust/tests/units/stream_pace.rs",
     "client-e2e/scenarios/footer/stream_pace.py",
+    "client-e2e/scenarios/session_tabs/empty_tab_dropped.py",
+    "client-e2e/scenarios/session_tabs/busy_switch.py",
+    "client-e2e/scenarios/session_tabs/busy_switch_back.py",
+    "client-e2e/scenarios/slash_command/compact_deferred.py",
+    "client-e2e/scenarios/slash_command/compact_deferred_cancel.py",
+    "client-e2e/scenarios/slash_command/model_while_busy.py",
+    "vibe/cli-rust/tests/units/command_submission.rs",
 )
 
 

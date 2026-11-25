@@ -6,14 +6,14 @@ use crossterm::event::KeyCode;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use vibe_rs::app::{App, Status};
-use vibe_rs::commands::{branch, submission, CommandEvent};
+use vibe_rs::commands::{branch, deferred, submission, CommandEvent};
 use vibe_rs::config;
 use vibe_rs::focus::Focus;
 use vibe_rs::post_ready::AccountReads;
 use vibe_rs::server::{Client, HistoryEntry, MessageContent, RpcError};
 
 use crate::feedback_support::notice_text;
-use crate::support::{key, settle};
+use crate::support::{key, queued, settle};
 
 struct Harness {
     app: App,
@@ -217,23 +217,125 @@ async fn display_settings_run_during_a_turn_and_with_a_paused_queue() {
     }
 }
 
+fn busy(app: &mut App) {
+    app.session.active_turn_id = Some("turn".into());
+    app.session.status = Status::Generating {
+        since: vibe_rs::clock::now(),
+    };
+}
+
 #[tokio::test]
-async fn integration_changes_wait_for_a_running_turn() {
-    // The harness refuses MCP, connector and plugin changes during a turn.
+async fn integration_commands_run_during_a_turn_and_the_harness_answers_for_itself() {
+    // The Harness refuses MCP, connector and plugin changes during a turn: the
+    // command still runs, and its refusal is shown, not hidden by the client.
     for command in ["/mcp", "/connectors", "/plugins", "/reload-plugins"] {
         let mut harness = Harness::ready();
-        harness.app.session.active_turn_id = Some("turn".into());
-        harness.app.session.status = Status::Generating {
-            since: vibe_rs::clock::now(),
-        };
+        busy(&mut harness.app);
 
         assert!(!harness.submit(command));
 
-        assert_eq!(harness.app.chat_input.full_text(), command);
+        assert!(harness.app.chat_input.full_text().is_empty(), "{command}");
+        assert!(harness.app.deferred_command.is_none(), "{command}");
         assert!(harness
             .notice()
-            .is_some_and(|text| text.starts_with("Slash commands cannot be queued")));
+            .is_none_or(|text| !text.contains("cannot be queued")));
     }
+}
+
+#[tokio::test]
+async fn commands_that_do_not_rewrite_history_run_at_once_during_a_turn() {
+    for command in [
+        "/model",
+        "/thinking",
+        "/mcp",
+        "/skills",
+        "/help",
+        "/cd",
+        "/agent",
+    ] {
+        let mut harness = Harness::ready();
+        busy(&mut harness.app);
+
+        assert!(!harness.submit(command));
+
+        assert!(harness.app.chat_input.full_text().is_empty(), "{command}");
+        assert!(harness.app.deferred_command.is_none(), "{command}");
+    }
+}
+
+#[tokio::test]
+async fn history_rewrites_wait_for_the_turn_and_run_once_it_ends() {
+    for command in ["/compact", "/clear", "/rewind", "/resume", "/retry"] {
+        let mut harness = Harness::ready();
+        busy(&mut harness.app);
+
+        assert!(!harness.submit(command));
+
+        assert!(harness.app.chat_input.full_text().is_empty(), "{command}");
+        assert_eq!(harness.app.deferred_command.as_deref(), Some(command));
+        let text = harness.notice().unwrap_or_default();
+        assert!(text.contains(&format!(
+            "{command} will run when the current turn finishes"
+        )));
+        let (config_tx, _rx) = mpsc::channel::<config::Loaded>(1);
+
+        // Still generating: it keeps waiting.
+        deferred::run_when_idle(&mut harness.app, &harness.client, &config_tx);
+        assert_eq!(harness.app.deferred_command.as_deref(), Some(command));
+
+        // The turn ends: it runs, and the draft typed meanwhile survives.
+        harness.app.session.status = Status::Ready;
+        harness
+            .app
+            .chat_input
+            .load_full_text("typed meanwhile".to_owned());
+        deferred::run_when_idle(&mut harness.app, &harness.client, &config_tx);
+        assert!(harness.app.deferred_command.is_none(), "{command}");
+        assert_eq!(harness.app.chat_input.full_text(), "typed meanwhile");
+    }
+}
+
+#[tokio::test]
+async fn a_second_scheduled_command_replaces_the_first_with_a_notice() {
+    let mut harness = Harness::ready();
+    busy(&mut harness.app);
+    harness.submit("/compact focus");
+    harness.submit("/clear");
+
+    assert_eq!(harness.app.deferred_command.as_deref(), Some("/clear"));
+    assert!(harness
+        .notice()
+        .unwrap()
+        .contains("/clear replaces /compact: it will run when the current turn finishes"));
+}
+
+#[tokio::test]
+async fn escape_cancels_the_scheduled_command_and_a_new_session_drops_it() {
+    let mut harness = Harness::ready();
+    busy(&mut harness.app);
+    harness.submit("/compact");
+    submission::interrupt_turn(&mut harness.app, &harness.client);
+    assert!(harness.app.deferred_command.is_none());
+    assert_eq!(harness.notice(), Some("/compact cancelled"));
+
+    let mut harness = Harness::ready();
+    busy(&mut harness.app);
+    harness.submit("/compact");
+    harness.app.set_session_id("another-session".into());
+    assert!(harness.app.deferred_command.is_none(), "wrong session");
+}
+
+#[tokio::test]
+async fn a_held_queue_still_refuses_a_history_rewrite_instead_of_waiting_forever() {
+    let mut harness = Harness::ready();
+    harness.app.queue.paused = true;
+    harness.app.queue.items.push(queued("m", "held"));
+
+    assert!(!harness.submit("/compact"));
+
+    assert!(harness.app.deferred_command.is_none());
+    assert_eq!(harness.app.chat_input.full_text(), "/compact");
+    assert!(harness.notice().unwrap().contains("held prompts"));
 }
 
 #[tokio::test]
@@ -340,34 +442,27 @@ async fn escape_on_a_running_shell_command_interrupts_that_command_only() {
 }
 
 #[tokio::test]
-async fn tab_commands_queue_while_busy_but_other_commands_still_refuse() {
+async fn tab_commands_and_the_model_picker_run_while_busy() {
     let mut harness = Harness::ready();
-    harness.app.session.status = Status::Generating {
-        since: vibe_rs::clock::now(),
-    };
+    let first = vibe_rs::session_tabs::Tab::new(Some("session".into()), "First".into());
+    harness.app.session_tabs.list.push(first);
+    busy(&mut harness.app);
     assert!(!harness.submit("/tab new"));
     assert!(
         harness.app.chat_input.full_text().is_empty(),
         "/tab dispatched instead of being rejected"
     );
-    assert_eq!(
-        harness.app.session_tabs.queued,
-        Some(vibe_rs::session_tabs::QueuedAction::New)
+    assert!(
+        vibe_rs::session_tabs::switching(&harness.app),
+        "the new tab opens at once, not when the turn ends"
     );
-    assert!(harness
-        .notice()
-        .unwrap()
-        .contains("when the current turn finishes"));
+    assert_eq!(harness.app.session_tabs.list.len(), 2);
 
     let mut harness = Harness::ready();
-    harness.app.session.status = Status::Generating {
-        since: vibe_rs::clock::now(),
-    };
+    busy(&mut harness.app);
     assert!(!harness.submit("/model"));
-    assert_eq!(
-        harness.app.chat_input.full_text(),
-        "/model",
-        "other commands stay rejected while busy"
-    );
-    assert!(harness.notice().unwrap().contains("cannot be queued"));
+    assert!(harness.app.chat_input.full_text().is_empty());
+    assert!(harness
+        .notice()
+        .is_none_or(|text| !text.contains("cannot be queued")));
 }

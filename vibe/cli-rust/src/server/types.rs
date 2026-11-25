@@ -409,6 +409,9 @@ pub struct ClientCapabilities {
     pub callback_kinds: Vec<String>,
     pub client_tools: Vec<String>,
     pub disabled_notifications: Vec<String>,
+    /// Fork feature (AGENTS.md "Fork features"): keep a running session parked when another is attached (ADR 0022).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub park_running_session: bool,
 }
 
 #[derive(Debug, Serialize)]

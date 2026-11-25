@@ -2,37 +2,36 @@
 
 from __future__ import annotations
 
-import json
-
-from e2e.app_server.config import FIXTURE_PATH
-from e2e.app_server.events import cleared_state
+from e2e.app_server.events import turn_completed, turn_started
 from e2e.app_server.scenario import Timeline, take_snapshot
+from scenarios.session_tabs._tabs import CTRL_X, FIRST_ID, SECOND_ID, START, answer, exchange
 
-_fixture = json.loads(FIXTURE_PATH.read_text())
-_START = _fixture["handshake"]["session/start"]
-_NEW_TAB = {"lastEventId": 0, "state": cleared_state()}
-
-_GONE_ID = "00000000-0000-4000-8000-000000000001"
 _GONE = {
     "error": {
         "code": "not_found",
-        "message": f"Session not found: {_GONE_ID}",
-        "data": {"harnessCode": "session_not_found", "sessionId": _GONE_ID},
+        "message": f"Session not found: {FIRST_ID}",
+        "data": {"harnessCode": "session_not_found", "sessionId": FIRST_ID},
     }
 }
 
-handshake = {"session/start": [_START, _NEW_TAB], "session/resume": _GONE}
+handshake = {
+    "session/start": [START, answer(SECOND_ID)],
+    "session/resume#" + FIRST_ID: _GONE,
+}
 request_methods = {"session/start", "session/resume"}
 # The dead tab is gone (one tab left, so the bar hides) and the notice is the
 # friendly one, not the raw server message.
 screen_contains = ("That session no longer exists.",)
 screen_excludes = ("Failed to resume session", "00000001", "Ctrl+X tabs")
 
-_CTRL_X = "\x18"
-
 timeline: Timeline = [
+    # The first tab is used, so it stays in the bar until its resume fails.
+    "hi\r",
+    turn_started(),
+    *exchange(FIRST_ID, "hi", "Hello."),
+    turn_completed(),
     "/tab new\r",
-    _CTRL_X,
+    CTRL_X,
     "1",
     take_snapshot("dead_tab_removed"),
 ]
