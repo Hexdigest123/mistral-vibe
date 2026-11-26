@@ -33,6 +33,10 @@ class FakeSession:
         self.connected = False
         self.closed = False
         self.ended = asyncio.Event()
+        self.instructions: list[str] = []
+
+    async def update(self, *, instructions: str) -> None:
+        self.instructions.append(instructions)
 
     def on(self, event: str, handler: Callable[[Any], Any]) -> Callable[[], None]:
         self.handlers[event] = handler
@@ -232,6 +236,115 @@ async def test_needs_approval_returns_early_so_the_agent_can_say_so() -> None:
 
 
 @pytest.mark.asyncio
+async def test_an_answered_approval_stops_reporting_needs_approval() -> None:
+    """The client says `running` once the user approved: a later status check no longer claims approval is pending."""
+    rig = Rig()
+    await rig.controller.start(_SESSION_ID)
+    call = asyncio.ensure_future(rig.handlers["run_task"]("search the news"))
+    await _settle()
+    [request] = rig.requests()
+    await rig.controller.task_result(_result(request.task_id, "needs_approval"))
+    assert (await call)["status"] == "needs_approval"
+    waiting = asyncio.ensure_future(rig.handlers["wait_for_task"](request.task_id))
+    await _settle()
+    await rig.controller.task_result(_result(request.task_id, "running"))
+    await _settle()
+    assert not waiting.done()
+    await rig.controller.task_result(_result(request.task_id, "done", "Two CVEs."))
+    assert (await waiting)["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_a_finished_task_is_put_in_the_instructions_for_the_next_turn() -> None:
+    """The user talked over the waiting tool call: the result still reaches the voice agent."""
+    rig = Rig()
+    await rig.controller.start(_SESSION_ID)
+    asyncio.ensure_future(rig.handlers["run_task"]("check the CVE news"))
+    await _settle()
+    [request] = rig.requests()
+    await rig.controller.task_result(
+        _result(request.task_id, "done", "Six critical CVEs.")
+    )
+    await _settle()
+    [note] = rig.session.instructions
+    assert note.startswith(module.INSTRUCTIONS) and "Six critical CVEs." in note
+    asyncio.ensure_future(rig.handlers["run_task"]("another"))
+    await _settle()
+    assert rig.session.instructions[-1] == module.INSTRUCTIONS
+
+
+@pytest.mark.asyncio
+async def test_a_failing_instruction_update_does_not_break_the_task() -> None:
+    rig = Rig()
+    await rig.controller.start(_SESSION_ID)
+
+    async def broken(*, instructions: str) -> None:
+        raise RuntimeError("agent not there")
+
+    rig.session.update = broken  # type: ignore[method-assign]
+    asyncio.ensure_future(rig.handlers["run_task"]("work"))
+    await _settle()
+    [request] = rig.requests()
+    await rig.controller.task_result(_result(request.task_id, "done", "ok"))
+    await _settle()
+    assert rig.controller.active
+
+
+def _say(rig: Rig, content: str, *, final: bool = True) -> None:
+    rig.session.handlers["transcript"](
+        SimpleNamespace(role="user", content=content, final=final)
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_user_speaking_ends_the_wait_so_the_agent_can_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent sat in a silent wait loop and left five questions unanswered."""
+    monkeypatch.setattr(module, "SPEECH_GRACE_SECONDS", 0.0)
+    rig = Rig()
+    await rig.controller.start(_SESSION_ID)
+    call = asyncio.ensure_future(rig.handlers["run_task"]("long search"))
+    await _settle()
+    _say(rig, "Wie weit bist du?", final=False)
+    await _settle()
+    assert not call.done()
+    _say(rig, "Wie weit bist du?")
+    result = await asyncio.wait_for(call, 1)
+    assert result["status"] == "running" and result["note"] == module.SPOKE_NOTE
+
+
+@pytest.mark.asyncio
+async def test_the_request_being_transcribed_does_not_end_its_own_wait() -> None:
+    rig = Rig()
+    await rig.controller.start(_SESSION_ID)
+    call = asyncio.ensure_future(rig.handlers["run_task"]("long search"))
+    await _settle()
+    _say(rig, "search for the Portainer version")
+    await _settle()
+    assert not call.done()
+    [request] = rig.requests()
+    await rig.controller.task_result(_result(request.task_id, "done", "2.45.4"))
+    assert "note" not in await call
+
+
+@pytest.mark.asyncio
+async def test_a_finished_task_wins_over_the_user_speaking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module, "SPEECH_GRACE_SECONDS", 0.0)
+    rig = Rig()
+    await rig.controller.start(_SESSION_ID)
+    call = asyncio.ensure_future(rig.handlers["run_task"]("work"))
+    await _settle()
+    [request] = rig.requests()
+    _say(rig, "hallo")
+    await rig.controller.task_result(_result(request.task_id, "done", "ok"))
+    result = await call
+    assert result["status"] == "done" and "note" not in result
+
+
+@pytest.mark.asyncio
 async def test_a_second_task_while_one_runs_is_busy() -> None:
     rig = Rig()
     await rig.controller.start(_SESSION_ID)
@@ -286,3 +399,48 @@ async def test_dispatch_routes_and_rejects_unknown_methods() -> None:
     assert stopped.response.ok  # type: ignore[attr-defined]
     with pytest.raises(RequestFailure):
         await rig.controller.dispatch("conversation/nope", {"sessionId": _SESSION_ID})
+
+
+@pytest.mark.parametrize(
+    ("reported", "sent"), [(53, 53), (900, 500), (500, 500), (-20, 0)]
+)
+def test_the_echo_delay_stays_in_the_range_the_canceller_accepts(
+    reported: int, sent: int
+) -> None:
+    """A slow output device made the canceller refuse the delay and end the conversation."""
+
+    class Base:
+        def _current_echo_delay_ms(self) -> int:
+            return reported
+
+    assert module._clamped_audio_interface(Base)._current_echo_delay_ms() == sent
+
+
+def test_the_real_audio_interface_is_clamped_against_the_installed_sdk() -> None:
+    """The override targets a private SDK method: it must still exist and clamp a huge reported latency."""
+    pytest.importorskip("mistralai.extra.voice_agents")
+    from mistralai.extra.voice_agents import DefaultAudioInterface
+
+    interface = module._clamped_audio_interface(DefaultAudioInterface)
+    interface._last_output_delay_ms = 4_000_000
+    assert interface._current_echo_delay_ms() == module.MAX_ECHO_DELAY_MS
+
+
+def test_no_tool_sends_an_empty_filler_text() -> None:
+    """The backend refuses ``filler.static.text == ""``: a silent tool sends no filler."""
+    pytest.importorskip("mistralai.extra.voice_agents")
+    from mistralai.extra.voice_agents import function_tool
+
+    async def handler(**_: Any) -> str:
+        return ""
+
+    tools = module._build_tools(
+        function_tool,
+        {"run_task": handler, "wait_for_task": handler, "cancel_task": handler},
+    )
+    wire = {t.name: t.to_wire() if hasattr(t, "to_wire") else t for t in tools}
+    assert set(wire) == {"run_task", "wait_for_task", "cancel_task"}
+    for name, tool in wire.items():
+        filler = tool.get("filler")
+        assert filler is None or filler["text"], f"{name} sends an empty filler"
+    assert "filler" not in wire["wait_for_task"]

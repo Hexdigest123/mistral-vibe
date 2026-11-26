@@ -414,12 +414,30 @@ Contract:
   round-trip through the client (`conversation/taskRequest` out,
   `conversation/taskResult` back): the prompt runs through the TUI's ordinary
   queue, so approvals and smart-approve apply; a tool answers within 20 s or says
-  `running`, and `needs_approval` returns early.
+  `running`, and `needs_approval` returns early. The client reports `needs_approval`
+  once per wait and `running` again when the user answered the last pending approval
+  or question (`conversation::on_answered`), so a status check never claims an
+  approval that was given. The SDK cannot push a message to the agent: a finished
+  task also goes into the live session's instructions (`session.update`, at the
+  next turn), so a result that missed its waiting tool call (the user talked over
+  it) is told at the next turn; the next `run_task` resets the instructions.
+- A waiting tool call ends as soon as the user finishes an utterance (a final user
+  transcript more than `SPEECH_GRACE_SECONDS` after the wait began) and returns the
+  status with `note`: the voice agent is blocked while a tool runs, so it left
+  questions unanswered during a long task. Waits last `WAIT_SECONDS` (12 s). An
+  explicit language request ("only English") outranks the language the user speaks.
+- The microphone uses the SDK's `DefaultAudioInterface` with its echo delay clamped
+  to 0-500 ms (`_clamped_audio_interface`): the SDK feeds the output device's
+  reported latency to the echo canceller, which refuses anything above 500 ms
+  ("Failed to set stream delay") and used to end the conversation at once.
 - All rows of a conversation come through the notification channel (the "on" row
   is the first `listening` state), so goldens stay deterministic.
 - `make build` runs `pyinstaller/build_features.py select` first; `make features`
   or `FEATURES=a,b|all|none` skip the question; `voice-agents` is the project
   extra `mistralai[voice-agents]` (livekit, numpy, pyaudio + system PortAudio).
+  It is marked WIP / heavily unreliable in the chooser and `default=False`, so a
+  fresh build does not bundle it unless it is explicitly selected (a saved
+  `.build-features.json` still wins; `FEATURES=all` bundles it too).
 
 Map: `vibe/app_server/_conversation_controller.py`, `protocol.py` (`conversation/*`,
 `ApprovalPolicySwitchParams.opt_in`), `core/agents/manager.py`

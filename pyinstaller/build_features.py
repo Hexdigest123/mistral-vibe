@@ -37,13 +37,17 @@ class Feature:
 FEATURES: tuple[Feature, ...] = (
     Feature(
         id="voice-agents",
-        title="Conversation mode",
+        title="Conversation mode (WIP)",
         description="Hands-free voice talk with a Mistral voice agent (Ctrl+X t)",
         extras=("voice-agents",),
         collect_all=("livekit", "mistralai.extra.voice_agents"),
         hidden_imports=("pyaudio", "numpy"),
         needs="system PortAudio (Arch: portaudio, Debian: libportaudio2 portaudio19-dev)",
-        default=True,
+        default=False,
+        extra_notes=(
+            "WIP - heavily unreliable: dropped sessions, broken audio and crashes are expected",
+            "not bundled by default; opt in explicitly",
+        ),
     ),
 )
 
@@ -94,6 +98,8 @@ def _ask(current: set[str]) -> set[str]:
             )
             if feature.needs:
                 print(f"         needs {feature.needs}", file=sys.stderr)
+            for note in feature.extra_notes:
+                print(f"         {note}", file=sys.stderr)
         print(
             "\nNumber toggles, a all, n none, Enter builds: ",
             end="",
@@ -150,6 +156,8 @@ def main(argv: list[str]) -> None:
                 print(
                     f"{'x' if feature.id in have else ' '} {feature.id}: {feature.title}"
                 )
+                for note in feature.extra_notes:
+                    print(f"    {note}")
         case _:
             raise SystemExit(__doc__)
 

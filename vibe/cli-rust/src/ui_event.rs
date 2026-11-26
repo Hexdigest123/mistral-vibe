@@ -95,8 +95,14 @@ pub fn apply(app: &mut App, client: &Arc<Client>, event: UiEvent) {
                 feedback::maybe_show(app, client, Some(session));
             }
         }
-        UiEvent::Approval(event) => approval::apply_event(app, event),
-        UiEvent::Question(event) => question_app::apply_event(app, event),
+        UiEvent::Approval(event) => {
+            approval::apply_event(app, event);
+            crate::conversation::on_answered(app, client);
+        }
+        UiEvent::Question(event) => {
+            question_app::apply_event(app, event);
+            crate::conversation::on_answered(app, client);
+        }
         UiEvent::PasteImage(event) => paste_image::apply_event(app, event),
         UiEvent::Subagents(event) => subagents::apply_event(app, event),
         UiEvent::OlderHistory(event) => older_history::apply_event(app, event),

@@ -74,6 +74,7 @@ GUARD_TESTS = (
     "client-e2e/scenarios/conversation_mode/setting_off.py",
     "client-e2e/scenarios/conversation_mode/refused.py",
     "client-e2e/scenarios/conversation_mode/task_roundtrip.py",
+    "client-e2e/scenarios/conversation_mode/approval_answered.py",
 )
 
 

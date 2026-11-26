@@ -12,7 +12,7 @@ approvals and the session's approval policy apply as they do for a typed prompt.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from uuid import uuid4
@@ -48,8 +48,14 @@ CONVERSATION_METHODS = frozenset({
 
 # A tool call answers within this, or says the task still runs; the agent then
 # says so aloud and asks again. Under the tools' own 30 s timeout.
-WAIT_SECONDS = 20.0
+WAIT_SECONDS = 12.0
 CANCEL_SECONDS = 5.0
+# The utterance that started the task is transcribed about now: it must not end the first wait.
+SPEECH_GRACE_SECONDS = 1.5
+SPOKE_NOTE = (
+    "The user spoke while you waited. Say something right now, even just that the task "
+    "is still running, then call wait_for_task again."
+)
 
 MISSING_FEATURE = (
     "Conversation mode needs a build with the voice-agents feature: run `make features`, "
@@ -65,6 +71,23 @@ output aloud; summarise it. If run_task says the task is still running, say so
 briefly and call wait_for_task again. If the status is needs_approval, tell the user
 the coding agent waits for their approval on the keyboard, then keep waiting. Use
 cancel_task when the user asks you to stop. Answer plain conversation yourself.
+Speak the language the user speaks to you, unless they asked for one ("only English",
+"sprich Deutsch"): that choice wins over the language they speak, for every reply
+and result, until they ask for another. Pass the user's request to run_task in their
+own words, whatever the language.
+Never stay silent after the user spoke: while a task runs, "still working on it" is a
+good answer, and so is "I'm waiting for your approval". When the user asks for progress or the result, call wait_for_task: never answer from
+memory, the status changes while you talk. Approval is only pending while the tool
+says needs_approval; a running status means the user already approved. If the
+instructions below name a finished task result, tell the user that result at your
+next turn, in the conversation's language, unless you already did.
+"""
+
+RESULT_NOTE = """
+
+The coding agent finished task {task_id} ({status}). Its result, to tell the user
+now in one or two short spoken sentences:
+{text}
 """
 
 
@@ -75,6 +98,7 @@ class VoiceSession(Protocol):
     async def connect(self) -> None: ...
     async def wait(self) -> None: ...
     async def close(self) -> None: ...
+    async def update(self, *, instructions: str) -> Any: ...
 
 
 type TaskHandler = Callable[..., Awaitable[dict[str, Any]]]
@@ -92,6 +116,41 @@ class _Task:
     status: str = "running"
     text: str = ""
     changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+def _build_tools(function_tool: Any, handlers: Mapping[str, Any]) -> list[Any]:
+    """The voice agent's tools; a tool without a filler sends none (the backend refuses an empty text)."""
+    return [
+        function_tool(
+            name=name,
+            description=(handler.__doc__ or "").strip(),
+            # The backend rejects an empty filler text: no filler is None.
+            filler={"text": filler} if filler else None,
+            timeout_ms=30000,
+        )(handler)
+        for name, filler, handler in (
+            ("run_task", "On it.", handlers["run_task"]),
+            ("wait_for_task", None, handlers["wait_for_task"]),
+            ("cancel_task", "Stopping.", handlers["cancel_task"]),
+        )
+    ]
+
+
+MAX_ECHO_DELAY_MS = 500
+
+
+def _clamped_audio_interface(base: type) -> Any:
+    """The SDK's audio interface with an echo delay the canceller accepts (0-500 ms).
+
+    A slow output device (Bluetooth, a deep audio-server buffer) reports more than 500 ms
+    and the canceller then refuses it, which ended the conversation at once.
+    """
+
+    class ClampedAudioInterface(base):  # type: ignore[misc, valid-type]
+        def _current_echo_delay_ms(self) -> int:
+            return max(0, min(super()._current_echo_delay_ms(), MAX_ECHO_DELAY_MS))
+
+    return ClampedAudioInterface()
 
 
 async def _open_real_session(
@@ -119,25 +178,13 @@ async def _open_real_session(
     http = VibeAsyncHTTPClient(verify=build_ssl_context())
     http.follow_redirects = snapshot.follows_redirects
     client = Mistral(api_key="", server_url=provider.api_base, async_client=http)
-    tools = [
-        function_tool(
-            name=name,
-            description=(handler.__doc__ or "").strip(),
-            filler={"text": filler},
-            timeout_ms=30000,
-        )(handler)
-        for name, filler, handler in (
-            ("run_task", "On it.", handlers["run_task"]),
-            ("wait_for_task", "", handlers["wait_for_task"]),
-            ("cancel_task", "Stopping.", handlers["cancel_task"]),
-        )
-    ]
+    tools = _build_tools(function_tool, handlers)
     session = await client.audio.sessions.init(
         llm={"model": config.conversation_model},
         tts={"voice_id": config.conversation_voice_id},
         instructions=INSTRUCTIONS,
         tools=tools,
-        audio_interface=DefaultAudioInterface(),
+        audio_interface=_clamped_audio_interface(DefaultAudioInterface),
         http_headers=dict(snapshot.headers),
     )
     return cast(VoiceSession, session)
@@ -162,6 +209,10 @@ class ConversationController:
         self._session_id: str | None = None
         self._watcher: asyncio.Task[None] | None = None
         self._task: _Task | None = None
+        self._noted = False
+        self._noting: asyncio.Task[None] | None = None
+        self._waiting_since: float | None = None
+        self._spoke = False
 
     @property
     def active(self) -> bool:
@@ -222,6 +273,12 @@ class ConversationController:
     def _on_transcript(self, event: Any) -> None:
         if self._session_id is None or event.role not in {"user", "assistant"}:
             return
+        if (
+            event.role == "user"
+            and getattr(event, "final", True)
+            and str(event.content).strip()
+        ):
+            self._user_spoke()
         asyncio.ensure_future(
             self._push(
                 CONVERSATION_TRANSCRIPT_METHOD,
@@ -261,6 +318,10 @@ class ConversationController:
         session, self._session = self._session, None
         watcher, self._watcher = self._watcher, None
         task, self._task = self._task, None
+        self._noted = False
+        if self._noting is not None:
+            self._noting.cancel()
+            self._noting = None
         if task is not None:
             task.status = "interrupted"
             task.changed.set()
@@ -296,26 +357,62 @@ class ConversationController:
     def _report(self, task: _Task) -> dict[str, Any]:
         return {"task_id": task.id, "status": task.status, "result": task.text}
 
+    def _user_spoke(self) -> None:
+        """The user said something: end the wait in flight so the agent can answer at once."""
+        since, task = self._waiting_since, self._task
+        if since is None or task is None:
+            return
+        if asyncio.get_running_loop().time() - since >= SPEECH_GRACE_SECONDS:
+            self._spoke = True
+            task.changed.set()
+
     async def _settle(self, task: _Task, seconds: float) -> dict[str, Any]:
-        """Wait until the task ends, needs approval or `seconds` pass; then say where it stands."""
-        deadline = asyncio.get_running_loop().time() + seconds
-        while task.status not in _SETTLED:
-            left = deadline - asyncio.get_running_loop().time()
-            if left <= 0:
-                break
-            task.changed.clear()
-            try:
-                await asyncio.wait_for(task.changed.wait(), left)
-            except TimeoutError:
-                break
-            if task.status == "needs_approval":
-                break
-        return self._report(task)
+        """Wait until the task ends, needs approval, the user speaks or `seconds` pass; then say where it stands."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
+        self._waiting_since, self._spoke = loop.time(), False
+        try:
+            while task.status not in _SETTLED:
+                left = deadline - loop.time()
+                if left <= 0:
+                    break
+                task.changed.clear()
+                try:
+                    await asyncio.wait_for(task.changed.wait(), left)
+                except TimeoutError:
+                    break
+                if task.status == "needs_approval" or self._spoke:
+                    break
+        finally:
+            self._waiting_since = None
+        report = self._report(task)
+        if self._spoke and task.status not in _SETTLED:
+            report["note"] = SPOKE_NOTE
+        return report
+
+    async def _note(self, instructions: str) -> None:
+        """Best effort: the live session takes new instructions at its next turn."""
+        session = self._session
+        if session is None:
+            return
+        try:
+            await session.update(instructions=instructions)
+        except Exception:
+            logger.warning("Failed to update the voice instructions", exc_info=True)
+
+    def _announce(self, task: _Task) -> None:
+        """A finished result no waiting tool call may carry (the user talked over it): put it in the instructions."""
+        note = RESULT_NOTE.format(task_id=task.id, status=task.status, text=task.text)
+        self._noted = True
+        self._noting = asyncio.ensure_future(self._note(INSTRUCTIONS + note))
 
     async def _run_task(self, request: str) -> dict[str, Any]:
         """Give the coding agent a coding or repository request in plain words, e.g. "run the tests and fix failures". Returns when it finishes, needs approval, or after about 20 seconds with status running."""
         if self._task is not None and self._task.status not in _SETTLED:
             return {**self._report(self._task), "status": "busy"}
+        if self._noted:
+            self._noted = False
+            await self._note(INSTRUCTIONS)
         self._task = task = _Task(id=uuid4().hex[:8])
         await self._state("working")
         await self._ask_client(task, "run", request)
@@ -347,6 +444,7 @@ class ConversationController:
             task.changed.set()
             if params.status in _SETTLED and self._session is not None:
                 await self._state("thinking")
+                self._announce(task)
         return ConversationTaskResultResponse(ok=True)
 
     # -- Routing ────────────────────────────────────────────────────

@@ -403,6 +403,8 @@ conversation/wrapped_image_attachment_link f017ea2887ed
 
 conversation/write_file_highlight 253ce39d7c9e
 
+conversation_mode/approval_answered e26bb92312f0
+
 conversation_mode/refused f4d5f1815239
 
 conversation_mode/setting_off 9ae611e2ba55

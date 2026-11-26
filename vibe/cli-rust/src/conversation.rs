@@ -292,6 +292,17 @@ pub fn on_approval(app: &mut App, client: &Arc<Client>) {
     }
 }
 
+/// The last waiting approval or question was answered: the task runs again, tell the voice agent.
+pub fn on_answered(app: &mut App, client: &Arc<Client>) {
+    let waiting = app.approval.active.is_some()
+        || app.approval.has_pending()
+        || crate::question_app::callback_active(app);
+    if app.conversation.approval_reported && !waiting {
+        app.conversation.approval_reported = false;
+        report(app, client, "running", String::new());
+    }
+}
+
 /// Follow the `conversation_mode_enabled` setting of a runtime snapshot.
 pub fn apply_runtime(app: &mut App, runtime: &Value) {
     if let Some(config) = crate::server::RuntimeSnapshot::config(runtime) {
