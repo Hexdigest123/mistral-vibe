@@ -15,9 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[[providers]]` entries take `discover = true` to list every model their `/models` endpoint offers; the lists are fetched once per boot and cached in `/tmp/vibe-<uid>/discovered-models.json`, so later starts send no request, and keep the endpoint's display name, image input and context window
 - `/model refresh` re-lists the `discover = true` providers' models past the boot cache
 - Clipboard image paste (`Ctrl+V` and `/paste-image`) works on Linux via `wl-paste` (Wayland) or `xclip` (X11), takes JPEG, WebP and GIF as well as PNG, attaches image files copied in a file manager, and reads the X11 or Wayland clipboard natively when neither tool is installed
+- Conversation mode (WIP, heavily unreliable): turn it on in `/voice`, then `Ctrl+X` `t` starts a hands-free voice conversation with a Mistral voice agent that hands tasks to the coding agent and tells you what happened; it runs under smart-approve (anything flagged waits for your keyboard) and the previous approval policy comes back when it ends. The voice session is hosted by the app server and starts only when you enter the mode; it needs a build with the `voice-agents` feature
+- `make build` asks which optional features to bundle (`voice-agents` today, marked WIP and left out unless you opt in); `make features` or `FEATURES=a,b|all|none` decide without asking, and new optional features are one entry in `pyinstaller/build_features.py`
+- More `Ctrl+X` chord keys: `m` opens the model picker, `c` the settings, `s` stashes the draft and `p` pops it, `t` toggles conversation mode; they work with session tabs off too
+- Prompt stash: `/stash <text>`, `/stash list` and `/pop` keep prompts on one last-in-first-out stack (newest first in the list); `Ctrl+X` `s` stashes the draft and `Ctrl+X` `p` pops it at the cursor
 
 ### Changed
 
+- Session tabs close with `Ctrl+X` `w` (was `c`, now the settings), and the status rail's jump letters after `Ctrl+X` are `o` loops, `a` agents, `b` tasks, `r` PRs, `g` goal, `d` todo list, so they never collide with the chord keys
 - Model discovery runs only for providers flagged `discover = true` (it replaces `discover_only`, and a `[[model]]` block no longer triggers it); a session start no longer refetches in the background
 - On Linux, child processes Vibe starts (MCP stdio servers, hooks, background processes, the background worker) now carry `PR_SET_PDEATHSIG`, so the kernel kills them when the app-server dies — even on `SIGKILL` or a hard shutdown deadline — instead of leaving orphaned `node` and shell processes behind
 

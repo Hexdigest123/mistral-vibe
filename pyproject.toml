@@ -130,6 +130,10 @@ dependencies = [
     "websockets==16.0",
 ]
 
+[project.optional-dependencies]
+# Fork feature: conversation mode (Ctrl+X t). `make build` offers it in its feature chooser.
+voice-agents = ["mistralai[voice-agents]==3.5.0"]
+
 [project.urls]
 Homepage = "https://github.com/mistralai/mistral-vibe"
 Repository = "https://github.com/mistralai/mistral-vibe"

@@ -37,7 +37,7 @@ fn reopened_settings_show_the_saved_server_values() {
     vibe_rs::voice_app::apply_saved(&mut app, &runtime(true, true), false, false);
     vibe_rs::voice_app::open(&mut app);
 
-    assert_eq!(app.voice_app.values, [true, true]);
+    assert_eq!(app.voice_app.values, [true, true, false]);
     assert!(home.path().join("ui_startup_config.json").exists());
 }
 
@@ -82,7 +82,7 @@ async fn the_narrator_turns_on_only_once_the_server_accepts_it() {
     }
     assert_eq!(
         app.voice_app.values,
-        [false, true],
+        [false, true, false],
         "the draft holds the pick"
     );
     assert!(!app.session.startup_config.narrator_enabled);

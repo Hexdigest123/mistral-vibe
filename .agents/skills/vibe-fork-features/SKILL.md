@@ -378,6 +378,78 @@ third segment, `Slot::Pace` last in the `LADDER`), `src/ui/bottom_bar.rs`.
 Guards: `vibe/cli-rust/tests/units/stream_pace.rs`, scenario
 `client-e2e/scenarios/footer/stream_pace.py`, `tests/test_fork_features.py`.
 
+## 9. Ctrl+X chord keys and the prompt stash (Rust TUI)
+
+Contract:
+- `Ctrl+X` on the free composer arms a one-key chord: `m` opens the model picker,
+  `c` the settings, `s` stashes the draft (the prompt is cleared), `p` pops the
+  latest stash at the cursor as a paste, `t` toggles conversation mode,
+  `1-9`/`n`/`w` drive session tabs. Any other key falls through to the status
+  rail, as `Ctrl+X` always did. With `enable_session_tabs` off the chord still
+  works (`ctrl_x.armed`) and the rail still shows its letters.
+- The rail's jump letters moved so they never collide: `o` loops, `a` agents,
+  `b` tasks, `r` PRs, `g` goal, `d` todo list (`h`/`l` stay the rail's vim steps).
+- `/stash <text>` stashes text, `/stash list` lists newest first (one line each),
+  `/pop` takes the latest back; one in-memory LIFO stack per process shared by
+  all tabs. `Ctrl+S` keeps its own single-slot swap and never touches the stack.
+
+Map: `vibe/cli-rust/src/{ctrl_x,prompt_stash}.rs`, hooks in `event_loop/keys.rs`,
+`input.rs` and `session_tabs/keys.rs`, `rail.rs` (`Item::letter`), the `/stash`
+and `/pop` rows of `commands/commands.rs`.
+
+Guards: `vibe/cli-rust/tests/units/{prompt_stash,ctrl_x_chord}.rs`, client-e2e
+`stash/*` and `ctrl_x/*`.
+
+## 10. Conversation mode and the `make build` feature chooser
+
+Contract:
+- `conversation_mode_enabled` (a third toggle in `/voice`, off by default) allows
+  `Ctrl+X t`. Starting asks `session/approvalPolicy/update` for `smart-approve`
+  with `optIn` (the startup `--smart-approve` bypass of the rollout gate), then
+  `conversation/start`; a failed start restores the previous policy at once, and
+  ending the conversation restores it too.
+- The app server hosts the voice session (`_conversation_controller.py`) and
+  imports the voice SDK only inside `_open_real_session`; `conversation/stop`
+  closes it. The voice agent's `run_task`/`wait_for_task`/`cancel_task` tools
+  round-trip through the client (`conversation/taskRequest` out,
+  `conversation/taskResult` back): the prompt runs through the TUI's ordinary
+  queue, so approvals and smart-approve apply; a tool answers within 20 s or says
+  `running`, and `needs_approval` returns early. The client reports `needs_approval`
+  once per wait and `running` again when the user answered the last pending approval
+  or question (`conversation::on_answered`), so a status check never claims an
+  approval that was given. The SDK cannot push a message to the agent: a finished
+  task also goes into the live session's instructions (`session.update`, at the
+  next turn), so a result that missed its waiting tool call (the user talked over
+  it) is told at the next turn; the next `run_task` resets the instructions.
+- A waiting tool call ends as soon as the user finishes an utterance (a final user
+  transcript more than `SPEECH_GRACE_SECONDS` after the wait began) and returns the
+  status with `note`: the voice agent is blocked while a tool runs, so it left
+  questions unanswered during a long task. Waits last `WAIT_SECONDS` (12 s). An
+  explicit language request ("only English") outranks the language the user speaks.
+- The microphone uses the SDK's `DefaultAudioInterface` with its echo delay clamped
+  to 0-500 ms (`_clamped_audio_interface`): the SDK feeds the output device's
+  reported latency to the echo canceller, which refuses anything above 500 ms
+  ("Failed to set stream delay") and used to end the conversation at once.
+- All rows of a conversation come through the notification channel (the "on" row
+  is the first `listening` state), so goldens stay deterministic.
+- `make build` runs `pyinstaller/build_features.py select` first; `make features`
+  or `FEATURES=a,b|all|none` skip the question; `voice-agents` is the project
+  extra `mistralai[voice-agents]` (livekit, numpy, pyaudio + system PortAudio).
+  It is marked WIP / heavily unreliable in the chooser and `default=False`, so a
+  fresh build does not bundle it unless it is explicitly selected (a saved
+  `.build-features.json` still wins; `FEATURES=all` bundles it too).
+
+Map: `vibe/app_server/_conversation_controller.py`, `protocol.py` (`conversation/*`,
+`ApprovalPolicySwitchParams.opt_in`), `core/agents/manager.py`
+(`aswitch_policy(opt_in=)`), `vibe_schema.py` (`conversation_*`),
+`vibe/cli-rust/src/conversation.rs` and its hooks (`event_handler.rs`,
+`ui/composer_title.rs`, `voice_app.rs`), `pyinstaller/build_features.py`,
+`Makefile`, `vibe-app-server.spec`, `pyproject.toml` extra.
+
+Guards: `tests/app_server/test_conversation.py`,
+`vibe/cli-rust/tests/units/conversation.rs`, client-e2e `conversation_mode/*`,
+`tests/test_fork_features.py`.
+
 ## Adding a fork feature
 
 Add its row to the AGENTS.md "Fork features" table, its section here

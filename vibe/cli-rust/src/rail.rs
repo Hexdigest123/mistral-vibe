@@ -28,15 +28,16 @@ pub enum Item {
 }
 
 impl Item {
-    /// The letter that jumps to the item while the rail has focus.
+    /// The letter that jumps to the item while the rail has focus; none collides with the
+    /// `Ctrl+X` chord keys (`crate::ctrl_x`: m, c, s, p, t, w, n, 1-9).
     pub fn letter(self) -> char {
         match self {
             Item::Loops => 'o',
-            Item::Agents => 's',
+            Item::Agents => 'a',
             Item::Goal => 'g',
-            Item::Plan => 't',
+            Item::Plan => 'd',
             Item::Tasks => 'b',
-            Item::Prs => 'p',
+            Item::Prs => 'r',
         }
     }
 }

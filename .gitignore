@@ -225,3 +225,6 @@ tests/playground/*
 client-e2e/reports/
 client-e2e/goldens/_live/
 .flaky-logs/
+
+# Choice made in `make build`'s feature chooser
+.build-features.json

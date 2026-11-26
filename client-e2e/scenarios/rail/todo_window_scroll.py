@@ -16,7 +16,7 @@ timeline: Timeline = [
         todo_item(str(index), f"Step number {index}", "pending") for index in range(14)
     ]),
     CTRL_X,
-    "t",
+    "d",
     *["j"] * 20,
 ]
 

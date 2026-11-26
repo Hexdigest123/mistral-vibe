@@ -565,8 +565,12 @@ class AgentManager:
         await apply_session_layers_async(self._orchestrator, agent, self.active_policy)
         self.active_agent = agent
 
-    async def aswitch_policy(self, name: str) -> None:
-        policy = self.get_policy(name)
+    async def aswitch_policy(self, name: str, *, opt_in: bool = False) -> None:
+        # Fork feature (AGENTS.md "Fork features"): conversation mode asks for
+        # smart-approve outright, as `--smart-approve` does, past the rollout gate.
+        policy = (
+            self._policy_for(name, opt_in=True) if opt_in else self.get_policy(name)
+        )
         self._check_installable(policy)
         await apply_session_layers_async(self._orchestrator, self.active_agent, policy)
         self.active_policy = policy

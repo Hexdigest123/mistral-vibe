@@ -1,0 +1,24 @@
+[
+ {
+  "method": "session/approvalPolicy/update",
+  "params": {
+   "approvalPolicy": "smart-approve",
+   "optIn": true,
+   "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ },
+ {
+  "method": "conversation/start",
+  "params": {
+   "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ },
+ {
+  "method": "session/approvalPolicy/update",
+  "params": {
+   "approvalPolicy": "accept-edits",
+   "optIn": false,
+   "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ }
+]

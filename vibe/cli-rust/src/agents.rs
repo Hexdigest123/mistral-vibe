@@ -238,6 +238,7 @@ fn switch(app: &mut App, client: &Arc<Client>, approval_policy: String) {
         let params = ApprovalPolicySwitchParams {
             session_id,
             approval_policy: approval_policy.clone(),
+            opt_in: false,
         };
         let params = serde_json::to_value(params).unwrap_or_default();
         let runtime = client

@@ -1,5 +1,5 @@
 //! The Ctrl+X chord on the composer: Ctrl+X, then 1-9 switches to that tab,
-//! n opens a new one, c closes the active one; any other key cancels the chord.
+//! n opens a new one, w closes the active one; any other key cancels the chord.
 
 use std::sync::Arc;
 
@@ -58,7 +58,7 @@ pub fn chord_key(app: &mut App, client: &Arc<Client>, key: &KeyEvent) -> bool {
                 new_tab(app, client);
                 return true;
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('w') => {
                 let active = app.session_tabs.active;
                 close(app, client, active);
                 return true;

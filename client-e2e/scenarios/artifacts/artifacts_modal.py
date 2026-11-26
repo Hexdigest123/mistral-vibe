@@ -1,4 +1,4 @@
-"""Two PRs: the rail paints a count; Ctrl+X then `p` opens the PR window in the input box's place.
+"""Two PRs: the rail paints a count; Ctrl+X then `r` opens the PR window in the input box's place.
 
 The window lists the PRs latest first. Esc closes it, Ctrl+X `p` reopens it,
 Down moves to the older PR, and Enter opens that PR's link.

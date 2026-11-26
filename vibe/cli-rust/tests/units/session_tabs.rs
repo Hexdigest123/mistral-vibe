@@ -219,11 +219,11 @@ fn chord_n_opens_a_new_tab() {
 }
 
 #[test]
-fn chord_c_closes_the_active_tab() {
+fn chord_w_closes_the_active_tab() {
     let client = Arc::new(Client::stub());
     let mut app = two_tabs();
     app.session_tabs.active = 1;
-    assert!(chord(&mut app, &client, KeyCode::Char('c')));
+    assert!(chord(&mut app, &client, KeyCode::Char('w')));
     // The active tab switches away first; once that lands, it is removed.
     assert!(session_tabs::switching(&app));
     app.set_session_id("00000000-0000-4000-8000-000000000001".into());
@@ -332,7 +332,7 @@ fn closing_the_busy_active_tab_does_not_wait_for_its_turn() {
     let client = Arc::new(Client::stub());
     let mut app = two_tabs();
     app.set_status(busy());
-    assert!(chord(&mut app, &client, KeyCode::Char('c')));
+    assert!(chord(&mut app, &client, KeyCode::Char('w')));
     assert!(session_tabs::switching(&app));
     app.set_session_id(SECOND.into());
     assert_eq!(app.session_tabs.list.len(), 1);

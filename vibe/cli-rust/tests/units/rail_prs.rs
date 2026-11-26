@@ -29,10 +29,10 @@ fn prs_sit_before_the_todo() {
 }
 
 #[tokio::test]
-async fn ctrl_x_p_opens_the_pr_window_and_esc_returns_to_the_rail() {
+async fn ctrl_x_r_opens_the_pr_window_and_esc_returns_to_the_rail() {
     let mut app = with_prs();
     send_key(&mut app, ctrl('x'));
-    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Char('r'));
     assert_eq!(app.focus(), Focus::RailWindow);
     assert_eq!(rail::open_item(&app), Some(Item::Prs));
     assert!(!app.rail.letters);

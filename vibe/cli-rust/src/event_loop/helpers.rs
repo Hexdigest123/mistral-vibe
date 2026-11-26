@@ -57,12 +57,14 @@ pub(super) fn apply_command(app: &mut App, client: &Arc<Client>, command: Comman
             event_handler::apply_runtime_value(app, &runtime);
             local::add_status(&mut app.view.transcript, &id, &text);
         }
+        CommandEvent::Conversation(event) => crate::conversation::apply_event(app, *event),
         CommandEvent::VoiceSettings {
             runtime,
             previous_enabled,
             enabling_audio,
         } => {
             crate::voice_app::apply_saved(app, &runtime, previous_enabled, enabling_audio);
+            crate::conversation::sync(app, client);
         }
         CommandEvent::ProxySettings(result) => crate::proxy_setup::apply_read(app, result),
         CommandEvent::PostReady { model, reads } => {

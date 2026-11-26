@@ -25,4 +25,4 @@ screen_contains = (
     "Esc/Ctrl+C to interrupt",
     "◐ 1 agent · ▪ 2 tasks · ▶ goal 4m · ≡ 1/3",
 )
-screen_excludes = ("Todo 1/3", "t 1/3")
+screen_excludes = ("Todo 1/3", "d 1/3")

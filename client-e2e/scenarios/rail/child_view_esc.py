@@ -9,7 +9,7 @@ __all__ = ["handshake"]
 
 _DOWN = "\x1b[B"
 
-timeline: Timeline = [*SETUP, CTRL_X, "s", _DOWN, "\r", RIGHT, ESCAPE, "g"]
+timeline: Timeline = [*SETUP, CTRL_X, "a", _DOWN, "\r", RIGHT, ESCAPE, "g"]
 
 screen_contains = ("> g",)
 screen_excludes = ("▶ Goal active", "Background tasks")

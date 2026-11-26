@@ -194,6 +194,7 @@ from vibe.app_server._continue_target import (
     TerminalSeat,
     continue_target,
 )
+from vibe.app_server._conversation_controller import ConversationController
 from vibe.app_server._deferred_config import DeferredConfiguration
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
 from vibe.app_server._effect_output_cap import capped_effect_entry
@@ -1636,6 +1637,7 @@ _TURN_INDEPENDENT_CONFIG_PATHS: Final = frozenset({
     "/theme",
     "/voice_mode_enabled",
     "/narrator_enabled",
+    "/conversation_mode_enabled",
     "/log_level",
     "/keep_awake",
 })
@@ -9150,6 +9152,11 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             telemetry=_VoiceTelemetry(self._telemetry),
             notify=self._notify_client,
         )
+        self._conversation_controller = ConversationController(
+            require_session=self._require_session,
+            config_getter=lambda: self._context.config_orchestrator.config,
+            notify=self._notify_client,
+        )
         self._experiments_task: asyncio.Task[None] | None = None
         # Whether the eval this session opened with is decided, held or not: a
         # move to a worktree keeps it either way.
@@ -10063,6 +10070,8 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
                 response = await self._dispatch_narration(raw_params)
             case _ if method.startswith("voice/"):
                 return await self._voice_controller.dispatch(method, raw_params)
+            case _ if method.startswith("conversation/"):
+                return await self._conversation_controller.dispatch(method, raw_params)
             case _ if method.startswith("feedback/"):
                 return await self._feedback_controller.dispatch(method, raw_params)
             case "workspace/prompt/prepare":
@@ -10993,7 +11002,9 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
             agents = self._context.agents
             previous = agents.active_policy.name
             try:
-                await agents.aswitch_policy(params.approval_policy)
+                await agents.aswitch_policy(
+                    params.approval_policy, opt_in=params.opt_in
+                )
             except ValueError as exc:
                 raise _selection_refused(exc) from exc
             try:
@@ -16343,8 +16354,11 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         with contextlib.suppress(Exception):
             await self._host_shell.controller.close()
         # Release the microphone and speakers the session's voice features hold.
-        with contextlib.suppress(Exception):
-            await self._voice_controller.close()
+        await asyncio.gather(
+            self._voice_controller.close(),
+            self._conversation_controller.close(),
+            return_exceptions=True,
+        )
         await self._stop_background_work()
         # Cancel the in-flight eval before announcing the close, so its ``after``
         # callback can never emit new_session/ready after session_closed. The

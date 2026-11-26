@@ -29,6 +29,8 @@ pub(super) fn run_command(
         "/config" => config::open(app, client, config_tx),
         "/release-notes" | "/whatsnew" => crate::release_notes::open(app),
         "/voice" => crate::voice_app::open(app),
+        "/stash" => crate::prompt_stash::command(app, command_args(value)),
+        "/pop" => crate::prompt_stash::pop(app),
         "/proxy-setup" => crate::proxy_setup::open(app, client),
         "/theme" => theme_picker::open(app),
         "/model" => match command_args(value) {

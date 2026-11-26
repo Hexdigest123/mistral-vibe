@@ -13,7 +13,7 @@ _SHIFT_TAB = "\x1b[Z"
 timeline: Timeline = [
     *SETUP,
     CTRL_X,
-    "s",
+    "a",
     _TAB,
     take_snapshot("tasks"),
     _SHIFT_TAB,

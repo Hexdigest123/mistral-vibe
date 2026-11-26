@@ -60,6 +60,21 @@ GUARD_TESTS = (
     "client-e2e/scenarios/slash_command/compact_deferred_cancel.py",
     "client-e2e/scenarios/slash_command/model_while_busy.py",
     "vibe/cli-rust/tests/units/command_submission.rs",
+    "vibe/cli-rust/tests/units/prompt_stash.rs",
+    "vibe/cli-rust/tests/units/ctrl_x_chord.rs",
+    "vibe/cli-rust/tests/units/conversation.rs",
+    "tests/app_server/test_conversation.py",
+    "client-e2e/scenarios/stash/chord_stash_pop.py",
+    "client-e2e/scenarios/stash/stash_list.py",
+    "client-e2e/scenarios/stash/pop_lifo.py",
+    "client-e2e/scenarios/ctrl_x/chord_model.py",
+    "client-e2e/scenarios/ctrl_x/chord_config.py",
+    "client-e2e/scenarios/ctrl_x/chord_tabs_off.py",
+    "client-e2e/scenarios/conversation_mode/start_stop.py",
+    "client-e2e/scenarios/conversation_mode/setting_off.py",
+    "client-e2e/scenarios/conversation_mode/refused.py",
+    "client-e2e/scenarios/conversation_mode/task_roundtrip.py",
+    "client-e2e/scenarios/conversation_mode/approval_answered.py",
 )
 
 
@@ -81,6 +96,9 @@ def test_the_rust_guard_tests_are_registered() -> None:
         "paste_image",
         "config_dangerous",
         "stream_pace",
+        "prompt_stash",
+        "ctrl_x_chord",
+        "conversation",
     ):
         assert f"mod {module};" in units, _dropped(f"Rust units module {module}")
 
@@ -175,3 +193,54 @@ def test_the_telemetry_kill_switch_stays() -> None:
         "disable_all_telemetry": True,
     })
     assert not telemetry_active(config), _dropped("the kill switch gates telemetry")
+
+
+def test_conversation_mode_stays_off_by_default_and_lazy() -> None:
+    field = VibeConfigSchema.model_fields.get("conversation_mode_enabled")
+    assert field is not None and field.default is False, _dropped(
+        "conversation_mode_enabled (off by default)"
+    )
+    for method in (
+        "conversation/start",
+        "conversation/stop",
+        "conversation/taskResult",
+    ):
+        assert method in SERVER_METHODS, _dropped(method)
+    source = (REPO / "vibe/app_server/_conversation_controller.py").read_text(
+        encoding="utf-8"
+    )
+    head = source.split("async def _open_real_session", 1)[0]
+    assert "mistralai.extra.voice_agents" not in head, _dropped(
+        "the voice SDK is imported only when a conversation starts"
+    )
+
+
+def test_conversation_mode_forces_smart_approve_through_an_explicit_opt_in() -> None:
+    from vibe.app_server.protocol import ApprovalPolicySwitchParams
+
+    assert "opt_in" in ApprovalPolicySwitchParams.model_fields, _dropped(
+        "the approval policy switch opt-in conversation mode relies on"
+    )
+
+
+def test_make_build_offers_the_optional_feature_chooser() -> None:
+    makefile = (REPO / "Makefile").read_text(encoding="utf-8")
+    assert "pyinstaller/build_features.py" in makefile, _dropped(
+        "make build asks which optional features to bundle"
+    )
+    build = makefile.split("\nbuild:", 1)[1].split("\ninstall:", 1)[0]
+    assert "$(FEATURES_CLI) select" in build, _dropped("make build runs the chooser")
+    spec = (REPO / "vibe-app-server.spec").read_text(encoding="utf-8")
+    assert "selected_features" in spec, _dropped(
+        "the PyInstaller spec bundles the chosen features"
+    )
+    import sys
+
+    sys.path.insert(0, str(REPO / "pyinstaller"))
+    try:
+        import build_features
+    finally:
+        sys.path.remove(str(REPO / "pyinstaller"))
+    assert "voice-agents" in {feature.id for feature in build_features.FEATURES}, (
+        _dropped("the voice-agents build feature")
+    )

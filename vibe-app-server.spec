@@ -13,6 +13,8 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files
 # executable; the build fails when they cannot be collected.
 sys.path.insert(0, os.path.join(SPECPATH, "pyinstaller"))
 from unified_runtime import collect_unified_runtime
+# Fork feature (AGENTS.md "Fork features"): the optional features `make build` chose.
+from build_features import selected as selected_features
 
 _core_builtins_datas, core_builtins_binaries, core_builtins_hidden_imports = (
     collect_all("vibe.core.tools.builtins")
@@ -32,6 +34,15 @@ for item in core_builtins_hidden_imports + harness_hidden_imports:
         hidden_imports.append(item)
 
 binaries = core_builtins_binaries + harness_binaries
+
+_feature_datas = []
+for _feature in selected_features():
+    hidden_imports.extend(_feature.hidden_imports)
+    for _package in _feature.collect_all:
+        _pkg_datas, _pkg_binaries, _pkg_hidden = collect_all(_package)
+        _feature_datas += _pkg_datas
+        binaries += _pkg_binaries
+        hidden_imports.extend(_pkg_hidden)
 
 # gh and glab release binaries staged by scripts/ci/download-cli-binaries.sh.
 # They land in _internal/vibe/bin/, where the session artifact detector looks
@@ -54,6 +65,7 @@ datas += [("vibe/core/tools/builtins/*.py", "vibe/core/tools/builtins")]
 # Built-in plugins are discovered on disk next to vibe.plugins.builtins.
 datas += collect_data_files("vibe.plugins.builtins")
 datas += _harness_datas
+datas += _feature_datas
 
 a = Analysis(
     ["vibe/app_server/entrypoint.py"],

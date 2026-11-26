@@ -71,7 +71,7 @@ async fn a_child_view_opened_from_the_rail_ignores_rail_keys_and_esc_lands_on_th
         );
     };
     press(&mut app, KeyCode::Char('x'), KeyModifiers::CONTROL);
-    press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+    press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
     press(&mut app, KeyCode::Down, KeyModifiers::NONE);
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(app.subagents.viewed_subagent_id.as_deref(), Some("child"));

@@ -88,6 +88,9 @@ pub struct AgentSwitchParams {
 pub struct ApprovalPolicySwitchParams {
     pub session_id: String,
     pub approval_policy: String,
+    /// Ask for a policy that ships dark (smart-approve) outright, as `--smart-approve` does.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub opt_in: bool,
 }
 
 #[derive(Debug, Serialize)]

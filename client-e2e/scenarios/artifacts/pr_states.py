@@ -1,4 +1,4 @@
-"""Ctrl+X then `p` opens the PR window: one row per PR with its number, title and state colored by lifecycle, nothing else."""
+"""Ctrl+X then `r` opens the PR window: one row per PR with its number, title and state colored by lifecycle, nothing else."""
 
 from __future__ import annotations
 

@@ -875,6 +875,12 @@ pub struct App {
     pub sessions_page: crate::sessions_page::SessionsPage,
     /// Fork feature (AGENTS.md "Fork features"): the session tabs above the conversation.
     pub session_tabs: crate::session_tabs::SessionTabs,
+    /// Conversation mode: the hands-free voice session and its task.
+    pub conversation: crate::conversation::State,
+    /// The Ctrl+X chord keys beyond tabs, armed here when tabs are off.
+    pub ctrl_x: crate::ctrl_x::CtrlX,
+    /// Prompts set aside with `/stash` or Ctrl+X s, popped last in, first out.
+    pub prompt_stash: crate::prompt_stash::PromptStash,
     pub loops: crate::loops::LoopsApp,
     /// The `/storage` panel.
     pub storage: crate::storage_panel::State,

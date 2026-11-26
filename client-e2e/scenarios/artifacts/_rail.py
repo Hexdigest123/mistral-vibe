@@ -1,4 +1,4 @@
-"""The PR chip on the idle rail: Ctrl+X then `p` opens the PR window, or a click on the chip."""
+"""The PR chip on the idle rail: Ctrl+X then `r` opens the PR window, or a click on the chip."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from e2e.app_server.config import COLUMNS, ROWS
 
 CTRL_X = "\x18"
 ESCAPE = "\x1b[27u"
-OPEN_PRS = [CTRL_X, "p"]
+OPEN_PRS = [CTRL_X, "r"]
 # The rail sits right above the input box and the bar; SGR rows are 1-indexed.
 RAIL_ROW = ROWS - 6
 FOOTER = "/test/workdir".ljust(COLUMNS - len("ctx        0/600k")) + "ctx        0/600k"

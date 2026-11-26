@@ -403,6 +403,22 @@ conversation/wrapped_image_attachment_link f017ea2887ed
 
 conversation/write_file_highlight 253ce39d7c9e
 
+conversation_mode/approval_answered e26bb92312f0
+
+conversation_mode/refused f4d5f1815239
+
+conversation_mode/setting_off 9ae611e2ba55
+
+conversation_mode/start_stop b6f04969cea1
+
+conversation_mode/task_roundtrip d29c8af69e8f
+
+ctrl_x/chord_config ad6c56a8f95d
+
+ctrl_x/chord_model 548783c2c48c
+
+ctrl_x/chord_tabs_off 4777c59292b9
+
 dangerous_directory/home_warning f017ea2887ed
 
 dangerous_directory/home_warning_disabled f017ea2887ed
@@ -763,7 +779,7 @@ loops/rail_chip d9d13da7dfe5
 
 loops/rail_chip_narrow c774d4977819
 
-loops/rail_chip_opens 690fbf900987
+loops/rail_chip_opens 8a785f87411b
 
 markdown/autolink 5f07415eade4
 
@@ -1267,7 +1283,7 @@ rail/child_view_esc c774d4977819
 
 rail/click_chip_closes c774d4977819
 
-rail/click_window e8409d04f772
+rail/click_window 389f79fce437
 
 rail/copy_notice_above 0391848162d5
 
@@ -1279,7 +1295,7 @@ rail/ctrl_x_toggles c774d4977819
 
 rail/ctrl_x_twice_hides_letters c774d4977819
 
-rail/focus_mistral_dark f04a30c84997
+rail/focus_mistral_dark 244f867d7100
 
 rail/goal_panel c774d4977819
 
@@ -1303,13 +1319,13 @@ rail/hover 9e106f8cc621
 
 rail/items 3104fbaf206c
 
-rail/keyboard 8a479276b99d
+rail/keyboard a89b7528374c
 
 rail/letters c774d4977819
 
 rail/narrow_shrinks c774d4977819
 
-rail/switch_window 881a7e0580c2
+rail/switch_window 5a8a588f136e
 
 rail/tab_windows 31c04b402fbf
 
@@ -1435,7 +1451,7 @@ session_tabs/busy_switch 10ac83c67eed
 
 session_tabs/busy_switch_back d778d238fc46
 
-session_tabs/chord_new_single_tab 9dc4dc87750a
+session_tabs/chord_new_single_tab 7c1e6b010ce3
 
 session_tabs/disabled f017ea2887ed
 
@@ -1791,7 +1807,7 @@ slash_command/skill_invocation f184b5e7d3c7
 
 slash_command/skill_queued_while_busy 071400a1d3a5
 
-slash_command/slash_command_caret_filter f2d768417b07
+slash_command/slash_command_caret_filter f7d38e93cd47
 
 slash_command/slash_command_click f017ea2887ed
 
@@ -1899,6 +1915,12 @@ startup/whats_new_since_last_visit 13965ebb80fa
 
 startup/workdir 2e6ebd97bca3
 
+stash/chord_stash_pop a96d0609b384
+
+stash/pop_lifo 4b56b4e611cb
+
+stash/stash_list 726733dbbad3
+
 sticky_prompt/click 6f56078c058f
 
 sticky_prompt/disabled 05832806d1ee
@@ -1965,7 +1987,7 @@ storage/details_worktrees 77a17b4f9ed5
 
 storage/first_scan ba73d1400e70
 
-storage/flag_off 8c54d601c41d
+storage/flag_off 8a1cf263c3e7
 
 storage/flag_off_low_disk 3d58d5441bc9
 

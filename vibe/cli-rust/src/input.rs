@@ -377,9 +377,13 @@ fn handle_key_inner(
     // Fork feature (AGENTS.md "Fork features"): Ctrl+X then 1-9/n/c drives session
     // tabs; the chord takes the next key before the composer edits with it, and
     // while the feature is on it owns Ctrl+X before the rail toggle.
+    if crate::ctrl_x::chord_key(app, client, config_tx, &key) {
+        return false;
+    }
     if crate::session_tabs::handle_key(app, client, &key) {
         return false;
     }
+    crate::ctrl_x::arm(app, &key);
     if enters_rail(app, &key) && crate::rail::enter(app) {
         return false;
     }

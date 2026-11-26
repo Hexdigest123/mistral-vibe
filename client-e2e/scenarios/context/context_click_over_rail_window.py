@@ -32,7 +32,7 @@ timeline: Timeline = [
     stats_updated(),
     turn_completed(),
     _CTRL_X,
-    "t",
+    "d",
     _CLICK,
 ]
 screen_contains = ("auto-compact at",)

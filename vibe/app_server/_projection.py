@@ -138,6 +138,7 @@ def project_config_view(
         ask_confirmation_on_exit=config.ask_confirmation_on_exit,
         voice_mode_enabled=config.voice_mode_enabled,
         narrator_enabled=config.narrator_enabled,
+        conversation_mode_enabled=config.conversation_mode_enabled,
         show_thinking_nodes=config.show_thinking_nodes,
         show_subagent_status_list=config.show_subagent_status_list,
         worktree_limit=config.worktree_limit,
