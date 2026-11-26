@@ -397,6 +397,28 @@ def runtime_updated(
     )
 
 
+def conversation_state(state: str, error: str | None = None) -> AppServerEvent:
+    """Build a `conversation/state` notification (fork feature: conversation mode)."""
+    params: dict[str, Any] = {"sessionId": SESSION_ID, "state": state}
+    if error is not None:
+        params["error"] = error
+    return _event("conversation/state", params)
+
+
+def conversation_transcript(role: str, content: str, *, final: bool = True) -> AppServerEvent:
+    """Build a `conversation/transcript` notification: one spoken line."""
+    params = {"sessionId": SESSION_ID, "role": role, "content": content, "final": final}
+    return _event("conversation/transcript", params)
+
+
+def conversation_task_request(
+    action: str, task_id: str, prompt: str = ""
+) -> AppServerEvent:
+    """Build a `conversation/taskRequest`: the voice agent hands the coding agent a task."""
+    params = {"sessionId": SESSION_ID, "taskId": task_id, "action": action, "prompt": prompt}
+    return _event("conversation/taskRequest", params)
+
+
 def reasoning(text: str, *, generation_status: str = "completed") -> AppServerEvent:
     return _added(
         _entry("reasoning", generation_status=generation_status, text=text, summary=[])

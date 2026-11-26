@@ -82,6 +82,20 @@ pub fn title(app: &App, width: u16) -> Title {
     }
 }
 
+/// The bottom-left label while a conversation runs: `─ ● Conversation · listening ─`.
+pub fn conversation_status(app: &App) -> Line<'static> {
+    let phase = app.conversation.phase;
+    if !crate::conversation::active(app) {
+        return Line::default();
+    }
+    Line::from(vec![
+        Span::styled("─ ", theme::border_style()),
+        Span::styled("● ", theme::text(theme::success())),
+        Span::styled("Conversation", theme::text(theme::foreground())),
+        Span::styled(format!(" · {} ", phase.label()), theme::muted_style()),
+    ])
+}
+
 /// The bottom-border hint shown while Ctrl+S holds a stashed draft and can restore it.
 pub fn stash_hint(app: &App) -> Line<'static> {
     if app.chat_input.stash.is_none() || !crate::composer_stash::key_reaches_stash(app) {

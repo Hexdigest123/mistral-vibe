@@ -1,4 +1,4 @@
-"""Ctrl+X then `s` focuses the subagent list with its button lit; ←→ walk to the next item's window and light it."""
+"""Ctrl+X then `a` focuses the subagent list with its button lit; ←→ walk to the next item's window and light it."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ __all__ = ["handshake"]
 timeline: Timeline = [
     *SETUP,
     CTRL_X,
-    "s",
+    "a",
     take_snapshot("subagents"),
     "\x1b[C",
     take_snapshot("tasks"),

@@ -7,7 +7,7 @@ from scenarios.rail._fixtures import CTRL_X, ESCAPE, SETUP, handshake
 
 __all__ = ["handshake"]
 
-timeline: Timeline = [*SETUP, CTRL_X, "t", ESCAPE, CTRL_X]
+timeline: Timeline = [*SETUP, CTRL_X, "d", ESCAPE, CTRL_X]
 
-screen_contains = ("s 1 agent · b 2 tasks · g goal 4m · t 1/3",)
+screen_contains = ("a 1 agent · b 2 tasks · g goal 4m · d 1/3",)
 screen_excludes = ("Todo 1/3",)

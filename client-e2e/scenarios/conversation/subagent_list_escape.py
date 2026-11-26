@@ -14,7 +14,7 @@ from e2e.app_server.scenario import Timeline
 _PROMPT = "delegate the investigation"
 
 screen_contains = ("◐ 1 agent",)
-screen_excludes = ("Main conversation", "s 1 agent")
+screen_excludes = ("Main conversation", "a 1 agent")
 screen_cursor = (35, 2)
 
 timeline: Timeline = [

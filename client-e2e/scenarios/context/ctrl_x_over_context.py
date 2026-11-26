@@ -34,5 +34,5 @@ timeline: Timeline = [
     _CLICK_CTX,
     _CTRL_X,
 ]
-screen_contains = ("t 0/1",)
+screen_contains = ("d 0/1",)
 screen_excludes = ("auto-compact at",)

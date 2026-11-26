@@ -7,7 +7,7 @@ from scenarios.rail._fixtures import CTRL_X, LEFT, RIGHT, SETUP, handshake
 
 __all__ = ["handshake"]
 
-timeline: Timeline = [*SETUP, "ab", LEFT, RIGHT, RIGHT, "c", CTRL_X, CTRL_X, "d"]
+timeline: Timeline = [*SETUP, "ab", LEFT, RIGHT, RIGHT, "c", CTRL_X, CTRL_X, "e"]
 
-screen_contains = ("> abcd",)
-screen_excludes = ("t 1/3",)
+screen_contains = ("> abce",)
+screen_excludes = ("d 1/3",)

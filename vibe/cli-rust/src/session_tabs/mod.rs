@@ -80,7 +80,7 @@ pub struct SessionTabs {
     pending_close: Option<usize>,
     /// That tab goes because it was empty, not because the user closed it.
     pending_empty: bool,
-    /// Ctrl+X was pressed: the next key is a tab command (1-9 switch, n new, c close).
+    /// Ctrl+X was pressed: the next key is a tab command (1-9 switch, n new, w close).
     pub chord: bool,
     /// Painted tab cells of the last frame, for mouse clicks.
     pub areas: Vec<Rect>,

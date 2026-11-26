@@ -148,7 +148,11 @@ Other keys in the main view:
 | `Shift+Tab` | Cycle the approval policy |
 | `Shift+Up/Down` | Scroll the transcript |
 | `Ctrl+O` | Expand or collapse every tool group and result |
-| `Ctrl+X` | Focus the status rail (see the rail under Built-in Slash Commands) |
+| `Ctrl+X` | Focus the status rail (see the rail under Built-in Slash Commands), or start a chord |
+| `Ctrl+X` then `m` / `c` | Open the model picker / the `/config` settings |
+| `Ctrl+X` then `s` / `p` | Stash the draft / pop the latest stashed prompt back at the cursor (last in, first out) |
+| `Ctrl+X` then `t` | Start or stop conversation mode (see `/voice`) |
+| `Ctrl+X` then `1-9` / `n` / `w` | Switch to a tab / open a new tab / close the active tab (`enable_session_tabs`) |
 | `Ctrl+T` | Start or stop voice recording (with voice mode on) |
 | `Cmd+\`, `Alt+\` | Dock the todo list on the right |
 | `Ctrl+\` | Toggle the debug console |
@@ -373,6 +377,9 @@ include_project_context = true    # Include project context (git info, cwd) in s
 # Voice features
 voice_mode_enabled = false
 narrator_enabled = false
+conversation_mode_enabled = false  # Allow Ctrl+X then t: a hands-free voice conversation with a Mistral voice agent that hands tasks to the coding agent under smart-approve (toggle in /voice; needs a build with the voice-agents feature)
+conversation_model = "mistral-small-latest"  # The Mistral model that holds the spoken conversation
+conversation_voice_id = "gb_jane_neutral"  # The Voxtral voice the conversation speaks with
 active_transcribe_model = "voxtral-realtime"
 active_tts_model = "voxtral-tts"
 ```
@@ -1377,7 +1384,7 @@ session's model.
   command; with nothing to retry, it says so.
 - `/pr` - List the session's pull requests and merge requests (needs
   `enable_pr_monitoring`, on by default) in the rail's PR window, like
-  `Ctrl+X` then `p`. Opening it refreshes their status.
+  `Ctrl+X` then `r`. Opening it refreshes their status.
   Enter opens the highlighted one, `c` its first failing CI check, `f` drafts a
   prompt asking the agent to fix what blocks it (shown only when it needs action).
 - `/status` - Display agent statistics
@@ -1400,7 +1407,9 @@ session's model.
   for the current session only; also works while a turn runs.
 - `/paste-image` - Paste an image from the OS clipboard into the prompt.
   **macOS and Linux only** — the command is not registered on Windows. On Linux it reads `wl-paste`/`xclip`, file-manager copies, or the native X11/Wayland clipboard.
-- `/voice` - Configure voice settings. With voice mode on, `Ctrl+T` starts or stops recording
+- `/stash [list|<text>]` - Set a prompt aside in a last-in, first-out stack kept for the life of the process. `/stash <text>` stashes the text; `Ctrl+X` then `s` stashes the draft in the prompt; `/stash list` shows every stashed prompt, newest first. `Ctrl+S` keeps its own single-slot swap.
+- `/pop` - Put the latest stashed prompt back at the cursor (also `Ctrl+X` then `p`); the most recently stashed prompt always comes first.
+- `/voice` - Configure voice settings: voice mode, the narrator and conversation mode. With voice mode on, `Ctrl+T` starts or stops recording. With conversation mode on, `Ctrl+X` then `t` starts a hands-free conversation with a Mistral voice agent: you talk, it hands coding tasks to the coding agent, then tells you what happened. It runs under smart-approve for as long as it lasts, so anything smart-approve flags waits for your keyboard, and the previous approval policy comes back when it ends. `Ctrl+X` then `t` again ends it. It needs a build with the `voice-agents` feature: `make features` (or `make build`, which asks) offers it, and `FEATURES=voice-agents` / `FEATURES=none` skip the question. Audio is hosted by the app server and starts only when you enter the mode
 - `/mcp` (or `/connectors`) - Display MCP servers and connector status. The
   browser opens on the first item; press Up or Left to move into the fuzzy-search
   bar, and Up again to wrap to the last item. Pass a server or connector name to
@@ -1544,8 +1553,8 @@ session's model.
     thing to go on a narrow row. Once you use the rail (`Ctrl+X` or a chip
     click), the hint stays hidden for 7 days, across sessions
     (`~/.vibe/cache.toml`).
-    `Ctrl+X` focuses the rail and letters its items (`o` loops, `s` subagents, `b`
-    background tasks, `p` PRs/MRs, `g` goal, `t` todo): a letter opens that item's window
+    `Ctrl+X` focuses the rail and letters its items (`o` loops, `a` subagents, `b`
+    background tasks, `r` PRs/MRs, `g` goal, `d` todo list): a letter opens that item's window
     in place of the input box, `←→` (or `Tab`/`Shift+Tab`) and `Enter` do the same step by step, `Esc` goes
     back. The letters show only until the next key: any key, even an arrow or
     `Ctrl+X` again, hides them; `Ctrl+X` once they are gone shows them again. With a window open its button stays lit, `←→` (or `Tab`/`Shift+Tab`) move to

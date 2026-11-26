@@ -74,6 +74,9 @@ POPULAR_SETTINGS: frozenset[str] = frozenset({
 FORK_SETTINGS: frozenset[str] = frozenset({
     "disable_all_telemetry",
     "enable_session_tabs",
+    "conversation_mode_enabled",
+    "conversation_model",
+    "conversation_voice_id",
 })
 
 # Section keys for the non-popular fields, by field name; anything unlisted

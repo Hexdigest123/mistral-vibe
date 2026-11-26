@@ -137,6 +137,8 @@ const COMMANDS: &[Command] = &[
     cmd(&["/sessions"], "Open the Sessions page: every session, grouped by project (or press ← on an empty prompt)", true),
     cmd(&["/storage"], "See how much disk Vibe uses and archive or delete old sessions", true)
         .flagged(Feature::StorageUsage),
+    cmd(&["/stash"], "Stash a prompt (or the draft with Ctrl+X s); /stash list shows the stash", true).args("[list|<text>]"),
+    cmd(&["/pop"], "Put the latest stashed prompt back in the prompt (also Ctrl+X p)", true),
     cmd(&["/rename"], "Rename the current session", true).args("<title>"),
     cmd(&["/goal"], "Set or view a goal Vibe keeps working on", true).args("[<objective>|edit|pause|resume|clear]"),
     cmd(&["/pr"], "Show this session's pull requests and merge requests", true)

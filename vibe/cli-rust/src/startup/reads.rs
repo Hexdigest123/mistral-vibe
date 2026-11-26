@@ -11,6 +11,7 @@ use crate::voice::TranscriptionConfig;
 /// What the UI needs from the one startup `config/read`.
 pub struct ConfigRead {
     pub voice_mode_enabled: bool,
+    pub conversation_mode_enabled: bool,
     pub transcription: Option<TranscriptionConfig>,
     pub log_level: Option<String>,
     pub crash_reports_enabled: bool,
@@ -22,6 +23,7 @@ impl Default for ConfigRead {
     fn default() -> Self {
         Self {
             voice_mode_enabled: false,
+            conversation_mode_enabled: false,
             transcription: None,
             log_level: None,
             // Absent on an older server: stay silent rather than assume consent.
@@ -53,6 +55,7 @@ pub(super) async fn read_config(client: &Arc<Client>, cwd: Option<String>) -> Co
     };
     ConfigRead {
         voice_mode_enabled: config.voice_mode_enabled.unwrap_or(false),
+        conversation_mode_enabled: config.conversation_mode_enabled,
         transcription: config.transcription.map(transcription),
         log_level: config.log_level,
         crash_reports_enabled: config.crash_reports_enabled,

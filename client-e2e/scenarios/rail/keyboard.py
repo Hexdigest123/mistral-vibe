@@ -16,4 +16,4 @@ timeline: Timeline = [
 ]
 
 screen_contains = ("◐ 1 agent · ▪ 2 tasks · ▶ goal 4m · ≡ 1/3",)
-screen_excludes = ("s 1 agent",)
+screen_excludes = ("a 1 agent",)

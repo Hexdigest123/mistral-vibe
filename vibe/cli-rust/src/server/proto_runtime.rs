@@ -98,6 +98,9 @@ pub struct ConfigView {
     pub voice_mode_enabled: Option<bool>,
     #[serde(default)]
     pub narrator_enabled: bool,
+    /// Fork feature (AGENTS.md "Fork features"): conversation mode (`Ctrl+X t`).
+    #[serde(default)]
+    pub conversation_mode_enabled: bool,
     #[serde(default = "yes")]
     pub show_thinking_nodes: bool,
     #[serde(default = "yes")]

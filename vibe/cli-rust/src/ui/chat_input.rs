@@ -49,7 +49,7 @@ fn draw_box(app: &App, f: &mut Frame, area: Rect, title: Line<'static>) -> Optio
             Span::styled("─", border),
             Span::styled(" INSERT ", theme::text(theme::foreground())),
         ]),
-        false => Line::default(),
+        false => composer_title::conversation_status(app),
     };
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)

@@ -266,7 +266,12 @@ pub(crate) fn dispatch_key(
         // Fork feature (AGENTS.md "Fork features"): a priority key cancels an
         // armed tab chord the same way.
         app.session_tabs.chord = false;
+        crate::ctrl_x::disarm(app);
         return exit;
+    }
+    // The Ctrl+X chord keys beyond tabs (m model, c config, s stash, p pop, t talk).
+    if crate::ctrl_x::chord_key(app, client, config_tx, &key) {
+        return false;
     }
     // Fork feature (AGENTS.md "Fork features"): an armed tab chord takes the next
     // key before the composer-level bindings below (Left opening the Sessions

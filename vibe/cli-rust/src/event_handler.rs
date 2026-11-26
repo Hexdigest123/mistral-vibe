@@ -257,6 +257,7 @@ fn apply_ready(
     app.session.usage_baseline = Some(session_exit::current_usage(app));
     app.completion.skills = startup::read_skills(&runtime);
     app.voice.mode_enabled = config.voice_mode_enabled;
+    app.conversation.enabled = config.conversation_mode_enabled;
     app.voice.transcription = config.transcription;
     crate::narrator_manager::apply_runtime(app, &runtime);
     model_picker::apply_runtime(app, &runtime);
@@ -362,6 +363,7 @@ pub fn process_initial_prompt(app: &mut App, client: &Arc<Client>) {
 /// `runtime/updated` and the `config/write` response committed from the model picker.
 pub fn apply_runtime_value(app: &mut App, runtime: &Value) {
     crate::terminal_notifier::configure(app, runtime);
+    crate::conversation::apply_runtime(app, runtime);
     app.subagents.status_list_enabled = startup::read_show_subagent_status_list(runtime);
     app.artifacts_modal.enabled = startup::read_pr_monitoring(runtime);
     app.view.sticky_prompt_enabled = startup::read_enable_sticky_prompt(runtime);
@@ -642,6 +644,9 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
         crate::replay_fence::note();
         return true;
     }
+    if event.method == server_method::CALLBACK_CALL {
+        crate::conversation::on_approval(app, client);
+    }
     if event.method == server_method::CALLBACK_CALL
         && event.params["callback"]["detail"]["kind"] == "approval"
     {
@@ -810,6 +815,7 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
             app.view.transcript.settle_reasoning();
             app.view.transcript.settle_compactions(None);
             app.session.active_turn_id = None;
+            crate::conversation::on_turn_completed(app, client, status);
             crate::rewind::turn_settled(app, client, turn.id.as_deref(), status);
             if retry::auto_continue_incomplete_stream(app, client, &turn) {
                 return true;
@@ -906,6 +912,15 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
         }
         notification::SESSION_COMPACTED => {
             compact::apply_compacted_notification(app, &event.params);
+        }
+        notification::CONVERSATION_STATE => {
+            crate::conversation::on_state(app, client, &event.params)
+        }
+        notification::CONVERSATION_TRANSCRIPT => {
+            crate::conversation::on_transcript(app, &event.params);
+        }
+        notification::CONVERSATION_TASK_REQUEST => {
+            crate::conversation::on_task_request(app, client, &event.params);
         }
         // A child session update upserts the child, announces the ready
         // transition, and coalesce the viewed child's transcript refresh.

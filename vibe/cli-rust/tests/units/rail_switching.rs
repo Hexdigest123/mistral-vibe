@@ -33,11 +33,11 @@ fn a_click_opens_a_window_that_closes_back_to_the_prompt() {
 }
 
 #[test]
-fn ctrl_x_s_focuses_the_subagent_list_and_arrows_walk_the_windows() {
+fn ctrl_x_a_focuses_the_subagent_list_and_arrows_walk_the_windows() {
     let mut app = with_items(true);
     with_tasks(&mut app, &["kubectl get jobs -w"]);
     send_key(&mut app, ctrl('x'));
-    press(&mut app, KeyCode::Char('s'));
+    press(&mut app, KeyCode::Char('a'));
     assert_eq!(app.focus(), Focus::SubagentList);
     assert_eq!(
         rail::open_item(&app),
@@ -63,7 +63,7 @@ fn ctrl_x_s_focuses_the_subagent_list_and_arrows_walk_the_windows() {
 fn ctrl_x_after_closing_a_window_shows_the_letters_again() {
     let mut app = with_items(true);
     send_key(&mut app, ctrl('x'));
-    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Char('d'));
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.focus(), Focus::Rail);
     assert!(!app.rail.letters);
@@ -175,7 +175,7 @@ fn the_subagent_list_closes_when_its_last_row_leaves() {
 fn leaving_the_letters_over_a_window_keeps_the_rail_under_it() {
     let mut app = with_items(true);
     send_key(&mut app, ctrl('x'));
-    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Char('d'));
     send_key(&mut app, ctrl('x'));
     press(&mut app, KeyCode::Esc);
     assert_eq!(app.focus(), Focus::RailWindow);

@@ -12,15 +12,23 @@ use crate::config_write;
 use crate::server::{method, Client, TelemetryRecordParams};
 use crate::transcript::local;
 
-pub const LABELS: [&str; 2] = ["Voice mode", "Narrator (experimental)"];
-const PATHS: [&str; 2] = ["/voice_mode_enabled", "/narrator_enabled"];
+pub const LABELS: [&str; 3] = [
+    "Voice mode",
+    "Narrator (experimental)",
+    "Conversation mode (Ctrl+X t)",
+];
+const PATHS: [&str; 3] = [
+    "/voice_mode_enabled",
+    "/narrator_enabled",
+    "/conversation_mode_enabled",
+];
 
 #[derive(Default)]
 pub struct VoiceApp {
     pub open: bool,
     pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
-    pub values: [bool; 2],
-    changes: [bool; 2],
+    pub values: [bool; 3],
+    changes: [bool; 3],
 }
 
 pub fn open(app: &mut App) {
@@ -29,6 +37,7 @@ pub fn open(app: &mut App) {
         values: [
             app.voice.mode_enabled,
             app.session.startup_config.narrator_enabled,
+            app.conversation.enabled,
         ],
         ..VoiceApp::default()
     };
@@ -78,6 +87,7 @@ fn close(app: &mut App, client: &Arc<Client>) {
         .changes
         .iter()
         .zip(app.voice_app.values)
+        .take(2)
         .any(|(changed, value)| *changed && value);
     let client = client.clone();
     crate::work::spawn(async move {

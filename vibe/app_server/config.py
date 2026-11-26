@@ -128,6 +128,8 @@ class ConfigView(ProtocolModel):
     ask_confirmation_on_exit: bool
     voice_mode_enabled: bool
     narrator_enabled: bool
+    # Preserve the conversation switch when reading an older app-server response (ADR 0014).
+    conversation_mode_enabled: bool = False
     show_thinking_nodes: bool
     show_subagent_status_list: bool
     worktree_limit: int

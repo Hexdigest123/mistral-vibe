@@ -181,6 +181,11 @@ pub mod method {
     pub const FEEDBACK_RECORD: &str = "feedback/record";
     /// Record client-side feature telemetry through the server-owned resource.
     pub const TELEMETRY_RECORD: &str = "telemetry/record";
+    /// Fork feature (AGENTS.md "Fork features"): start or stop the conversation-mode voice session.
+    pub const CONVERSATION_START: &str = "conversation/start";
+    pub const CONVERSATION_STOP: &str = "conversation/stop";
+    /// Where the task the voice agent asked for stands.
+    pub const CONVERSATION_TASK_RESULT: &str = "conversation/taskResult";
     /// Ask the narration resource for the spoken summary of a finished turn.
     pub const NARRATION_SUMMARIZE: &str = "narration/summarize";
     /// Remove a managed worktree (app-server `WorkspaceWorktreeRemoveParams`).
@@ -255,6 +260,10 @@ pub mod notification {
     pub const SESSION_LEASE_ENDED: &str = "session/lease/ended";
     /// Sessionless: a storage scan started (`refreshing`) or ended with its result.
     pub const STORAGE_USAGE_UPDATED: &str = "storage/usage/updated";
+    /// Fork feature: the conversation's phase, a spoken line, or a task for the coding agent.
+    pub const CONVERSATION_STATE: &str = "conversation/state";
+    pub const CONVERSATION_TRANSCRIPT: &str = "conversation/transcript";
+    pub const CONVERSATION_TASK_REQUEST: &str = "conversation/taskRequest";
     /// A session artifact (PR/MR) was detected or discovered.
     pub const ARTIFACTS_CREATED: &str = "artifacts/created";
     /// A session artifact changed (markViewed, provider sync).

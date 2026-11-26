@@ -27,6 +27,8 @@ Mistral Vibe is an open-source coding agent for your terminal. Describe what you
   - Also auto-discovers Mistral's model catalog, since `mistral-large-4` is still listed with a 400k max context window, which is simply false
 - FZF search in every long list: `/model`, `/config`, `/resume`, `/mcp` and `/plugins` (see [FZF search](#fzf-search))
 - Session tabs (see [Session tabs](#session-tabs)): several sessions in one window, switched with `Ctrl+X` then `1-9`, a click on the tab bar, or `/tab`, even while a turn runs
+- More `Ctrl+X` chord keys (see [Ctrl+X chords and prompt stash](#ctrlx-chords-and-prompt-stash)): `m` model picker, `c` settings, `s` stash the draft, `p` pop it, `t` conversation mode
+- Prompt stash (see [Ctrl+X chords and prompt stash](#ctrlx-chords-and-prompt-stash)): `/stash`, `/stash list` and `/pop`, last in first out, like OpenCode
 - TTFT and tok/s in the bottom bar (see [TTFT and TPS](#ttft-and-tps)): time to first token and tokens per second next to the usage and context gauges, like OpenCode's TUI
 - On Linux, child processes Vibe starts (MCP stdio servers, hooks, background processes) carry `PR_SET_PDEATHSIG`, so the kernel kills them if the app-server dies — no more orphaned `node`/shell processes after a `SIGKILL`
 - Builds to `vibes` instead of `vibe` (for my personal testing)
@@ -80,12 +82,26 @@ api_key_env_var = "MISTRAL_API_KEY"
 discover = true  # also auto-discovers Mistral's model catalog
 ```
 
+**Ctrl+X chords and prompt stash**
+
+`Ctrl+X` starts a chord on the prompt; the next key picks the action (any other key falls through to the status rail, whose jump letters are now `o` loops, `a` agents, `b` tasks, `r` PRs, `g` goal, `d` todo list):
+
+- `m` opens the model picker, `c` opens the settings (`/config`)
+- `s` stashes the draft (the prompt is cleared), `p` pops the latest stashed prompt at the cursor
+- `t` starts or stops conversation mode
+- `1-9`, `n`, `w` switch, open and close session tabs (needs `enable_session_tabs`, on by default); with tabs off the other chord keys still work
+
+The stash is a last-in, first-out stack kept for the life of the process (shared by all tabs):
+
+- `/stash <text>` stashes the text, `/stash list` shows every stash newest first, `/pop` takes the latest one back (also at the cursor when the prompt has text)
+- `Ctrl+S` keeps its own single-slot swap and does not touch this stack
+
 **Session tabs**
 
 Open several sessions side by side in one window. When more than one tab is open, a tab bar shows above the conversation:
 
 - `/tab new` opens a fresh session in a new tab (opening a session from `/sessions` opens it as a new tab too)
-- `Ctrl+X` then `1-9` jumps to a numbered tab, `n` opens a new tab, `c` closes the active one; a click on a tab switches to it, a middle click closes it
+- `Ctrl+X` then `1-9` jumps to a numbered tab, `n` opens a new tab, `w` closes the active one; a click on a tab switches to it, a middle click closes it
 - `/tab next|prev|close [N]|N` does the same from the prompt
 - Each tab keeps its conversation, scroll position and draft while another tab is active (only the active tab is attached)
 - Tab actions run at once, even while a turn runs: the turn keeps running in the background and the tab shows `●` while it runs, `!` while it waits for your answer and `✓` once it ended while you were away (the mark clears when you switch back; the background tabs are polled every few seconds, and only while one of them runs). Switching back to a tab whose turn still runs re-attaches it live

@@ -1400,6 +1400,24 @@ class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config re
     )
     voice_mode_enabled: Annotated[bool, WithReplaceMerge()] = False
     narrator_enabled: Annotated[bool, WithReplaceMerge()] = False
+    # Fork feature (AGENTS.md "Fork features"): conversation mode, Ctrl+X t.
+    conversation_mode_enabled: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description=(
+            "Allow conversation mode: Ctrl+X then t starts a hands-free voice "
+            "conversation with a Mistral voice agent that talks to the coding agent "
+            "for you, with smart-approve while it runs. Needs a build with the "
+            "voice-agents feature."
+        ),
+    )
+    conversation_model: Annotated[str, WithReplaceMerge()] = Field(
+        default="mistral-small-latest",
+        description="The Mistral model that holds the spoken conversation.",
+    )
+    conversation_voice_id: Annotated[str, WithReplaceMerge()] = Field(
+        default="gb_jane_neutral",
+        description="The Voxtral voice the conversation speaks with.",
+    )
     show_thinking_nodes: Annotated[bool, WithReplaceMerge()] = True
     show_subagent_status_list: Annotated[bool, WithReplaceMerge()] = Field(
         default=True,

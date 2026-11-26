@@ -167,6 +167,7 @@ fn approval_policy_switch_params_serialize_camel_case() {
     let params = ApprovalPolicySwitchParams {
         session_id: "s".into(),
         approval_policy: "ask".into(),
+        opt_in: false,
     };
     let value: Value = serde_json::to_value(&params).unwrap();
     assert_eq!(value, json!({"sessionId": "s", "approvalPolicy": "ask"}));

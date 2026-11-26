@@ -290,6 +290,9 @@ SERVER_METHODS: tuple[str, ...] = (
     "voice/transcribeCancel",
     "voice/narrate",
     "voice/narrateCancel",
+    "conversation/start",
+    "conversation/stop",
+    "conversation/taskResult",
     "session/turn/enqueue",
     "session/turn/queue/edit/cancel",
     "session/turn/queue/edit/abandon",
@@ -1900,6 +1903,8 @@ class AgentSwitchParams(ProtocolModel):
 class ApprovalPolicySwitchParams(ProtocolModel):
     session_id: str
     approval_policy: str
+    # Ask for a policy that ships dark (smart-approve) outright, as a startup flag does.
+    opt_in: bool = False
 
 
 type NonNegativeStrictInt = Annotated[StrictInt, Field(ge=0)]
@@ -3624,6 +3629,69 @@ class VoiceNarrationDoneParams(ProtocolModel):
 class VoiceNarrationErrorParams(ProtocolModel):
     error: str
 
+
+class _ConversationCommandParams(ProtocolModel):
+    """Every ``conversation/*`` request names the session it runs on."""
+
+    session_id: str
+
+
+class ConversationStartParams(_ConversationCommandParams): ...
+
+
+class ConversationStartResponse(ProtocolModel):
+    ok: bool
+    error: str | None = None
+
+
+class ConversationStopParams(_ConversationCommandParams): ...
+
+
+class ConversationStopResponse(ProtocolModel):
+    ok: bool
+
+
+class ConversationTaskResultParams(_ConversationCommandParams):
+    """The client's answer to a ``conversation/taskRequest``: where the task stands."""
+
+    task_id: str
+    status: Literal["running", "needs_approval", "done", "failed", "interrupted"]
+    text: str = ""
+
+
+class ConversationTaskResultResponse(ProtocolModel):
+    ok: bool
+
+
+class ConversationStateParams(ProtocolModel):
+    """Pushed whenever the conversation changes state; ``stopped`` carries why when it failed."""
+
+    session_id: str
+    state: Literal[
+        "connecting", "listening", "thinking", "speaking", "working", "stopped"
+    ]
+    error: str | None = None
+
+
+class ConversationTranscriptParams(ProtocolModel):
+    session_id: str
+    role: Literal["user", "assistant"]
+    content: str
+    final: bool = True
+
+
+class ConversationTaskRequestParams(ProtocolModel):
+    """The voice agent asks the client to run, or stop, work in the coding agent."""
+
+    session_id: str
+    task_id: str
+    action: Literal["run", "cancel"]
+    prompt: str = ""
+
+
+CONVERSATION_STATE_METHOD = "conversation/state"
+CONVERSATION_TRANSCRIPT_METHOD = "conversation/transcript"
+CONVERSATION_TASK_REQUEST_METHOD = "conversation/taskRequest"
 
 VOICE_TRANSCRIPTION_DELTA_METHOD = "voice/transcriptionDelta"
 VOICE_NARRATION_PREP_METHOD = "voice/narrationPrep"

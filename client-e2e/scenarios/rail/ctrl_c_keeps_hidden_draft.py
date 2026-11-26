@@ -7,7 +7,7 @@ from scenarios.rail._fixtures import CTRL_X, SETUP, handshake
 
 __all__ = ["handshake"]
 
-timeline: Timeline = [*SETUP, "secret draft", CTRL_X, "t", "\x03"]
+timeline: Timeline = [*SETUP, "secret draft", CTRL_X, "d", "\x03"]
 
 screen_contains = ("secret draft",)
 screen_excludes = ("Todo 1/3",)

@@ -92,7 +92,7 @@ fn ctrl_x_over_the_subagent_list_opens_another_item() {
     send_key(&mut app, ctrl('x'));
     assert_eq!(app.focus(), Focus::Rail);
 
-    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Char('d'));
     assert!(!app.subagents.list.focused, "the list closes");
     assert_eq!(rail::window(&app), Some(Item::Plan));
 }
@@ -103,7 +103,7 @@ fn letters_show_only_from_ctrl_x_until_an_item_opens() {
     send_key(&mut app, ctrl('x'));
     assert!(app.session_tabs.chord, "Ctrl+X arms the tab chord");
 
-    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Char('d'));
     // Not a tab key: the chord cancels, the rail takes the key and opens Plan.
     assert_eq!(rail::window(&app), Some(Item::Plan));
     assert!(!app.rail.letters);

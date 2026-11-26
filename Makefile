@@ -35,7 +35,7 @@ QUIET ?=
 QUIET_FLAGS = $(if $(QUIET),-q,)
 NEXTEST_QUIET = $(if $(QUIET),--status-level none --final-status-level fail,)
 
-.PHONY: start run build build_rs install build_test build_debug release fmt fmt_check lint lint_test check clean sweep test test_rust test_golden store_golden profile-stress view-stress
+.PHONY: start run build features build_rs install build_test build_debug release fmt fmt_check lint lint_test check clean sweep test test_rust test_golden store_golden profile-stress view-stress
 
 # The golden snapshot pytest run, shared by `test` and `test_golden`.
 GOLDEN_CMD = uv run --no-project --with "pyte==0.8.2" --with "rich==15.0.0" --with pytest --with pytest-timeout --with pytest-xdist \
@@ -62,8 +62,14 @@ release:        ## Optimized build + run via cargo
 # command line, so it propagates through the build -> install sub-makes.
 VIBES_WRAPPER_ARGS ?=
 
-build:          ## Standalone build (vibe-rs + PyInstaller app-server), then offer to install it as ~/.local/bin/vibes
-	uv sync --no-dev --group build
+FEATURES_CLI = uv run --no-project python pyinstaller/build_features.py
+
+features:       ## Choose the optional features `make build` bundles (or FEATURES=a,b|all|none)
+	$(FEATURES_CLI) select
+
+build:          ## Optional-feature chooser, then standalone build (vibe-rs + PyInstaller app-server), then offer to install it as ~/.local/bin/vibes
+	$(FEATURES_CLI) select
+	uv sync --no-dev --group build $$($(FEATURES_CLI) extras)
 	$(PYINSTALLER) --noconfirm $(SPEC)
 	cargo build $(M) --release --bin vibe-rs $(CARGO_BUILD_FLAGS)
 	@printf 'Install this build as %s/vibes? [Y/n] ' "$(LOCAL_BIN_DIR)"; \

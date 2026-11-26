@@ -133,7 +133,8 @@ pub mod action {
     pub const SWITCH_FIELD: &str = "switch field";
     pub const SWITCH_TAB: &str = "switch tab";
     pub const TABS: &str = "tabs";
-    pub const TAB_CHORD: &str = "1-9 switch, n new, c close";
+    pub const TAB_CHORD: &str =
+        "1-9 tab, n new, w close · m model, c config, s stash, p pop, t talk";
     pub const OPEN_CHECK: &str = "open check";
     pub const FIX: &str = "ask agent to fix";
     pub const DETAILS: &str = "details";

@@ -22,4 +22,4 @@ handshake = {
 
 timeline: Timeline = [*SETUP, CTRL_X, take_snapshot()]
 
-screen_contains = ("s 1 agent · b 2 tasks · g goal 4m · t 1/3",)
+screen_contains = ("a 1 agent · b 2 tasks · g goal 4m · d 1/3",)

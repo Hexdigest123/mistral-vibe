@@ -36,6 +36,8 @@ pub enum CommandEvent {
     },
     Error(String),
     Runtime(Value, String),
+    /// Fork feature: a conversation-mode start or stop settled.
+    Conversation(Box<crate::conversation::Event>),
     VoiceSettings {
         runtime: Value,
         previous_enabled: bool,

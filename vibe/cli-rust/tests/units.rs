@@ -125,6 +125,8 @@ mod context_app;
 mod context_bar;
 #[path = "units/context_footer_click.rs"]
 mod context_footer_click;
+#[path = "units/conversation.rs"]
+mod conversation;
 #[path = "units/copy_light.rs"]
 mod copy_light;
 #[path = "units/count_format.rs"]
@@ -135,6 +137,8 @@ mod credentials;
 mod cron_effect;
 #[path = "units/crossterm_keys.rs"]
 mod crossterm_keys;
+#[path = "units/ctrl_x_chord.rs"]
+mod ctrl_x_chord;
 #[path = "units/cwd_follow.rs"]
 mod cwd_follow;
 #[path = "units/debug_console.rs"]
@@ -397,6 +401,8 @@ mod plugins;
 mod plugins_detail;
 #[path = "units/pointer_shape.rs"]
 mod pointer_shape;
+#[path = "units/prompt_stash.rs"]
+mod prompt_stash;
 #[path = "units/provider_auth.rs"]
 mod provider_auth;
 #[path = "units/proxy_setup.rs"]
