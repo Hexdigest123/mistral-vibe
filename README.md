@@ -48,7 +48,7 @@ Mistral Vibe is an open-source coding agent for your terminal. Describe what you
 
 **Vision fallback for image reads**
 
-When the active model has no vision support but reads an image with `read_file`, the `builtin:image_describe` hook replaces the image bytes with the `vision_model`'s description (subagents inherit it). The `vision_model` may sit on another provider than the active model:
+When the active model has no vision support but reads an image with `read_file`, the `builtin:image_describe` hook replaces the image bytes with the `vision_model`'s description (subagents inherit it). It fixes the case where the agent — or a subagent — decides on its own to read an image, e.g. a Playwright screenshot it saved or an image it found with `find`/`ls`: upstream only describes pasted/`@`-mentioned images, so such a read would otherwise come back as an `[Image]` placeholder, mojibake or a binary-read error. The `vision_model` may sit on another provider than the active model:
 
 ```toml
 # ~/.vibe/config.toml
